@@ -276,6 +276,7 @@ tls_connection_t* open_remote_connection(const char* hostname, i32 portno, void*
 	mbedtls_ssl_conf_ca_chain( &connection->conf, &connection->cacert, NULL );
 	mbedtls_ssl_conf_rng( &connection->conf, mbedtls_ctr_drbg_random, &connection->ctr_drbg );
 	mbedtls_ssl_conf_dbg( &connection->conf, my_debug, stdout );
+	mbedtls_ssl_conf_read_timeout( &connection->conf, 250 );
 
 	if( ( ret = mbedtls_ssl_setup( &connection->ssl, &connection->conf ) ) != 0 )
 	{
@@ -289,7 +290,8 @@ tls_connection_t* open_remote_connection(const char* hostname, i32 portno, void*
 		goto exit;
 	}
 
-	mbedtls_ssl_set_bio( &connection->ssl, &connection->server_fd, mbedtls_net_send, mbedtls_net_recv, NULL );
+	mbedtls_ssl_set_bio( &connection->ssl, &connection->server_fd, mbedtls_net_send,
+	                     mbedtls_net_recv, mbedtls_net_recv_timeout );
 
 	/*
 	 * 4. Handshake
@@ -298,6 +300,11 @@ tls_connection_t* open_remote_connection(const char* hostname, i32 portno, void*
 
 	while( ( ret = mbedtls_ssl_handshake( &connection->ssl ) ) != 0 )
 	{
+		if( ret == MBEDTLS_ERR_SSL_TIMEOUT &&
+		    get_seconds_elapsed(connection->start_clock, get_clock()) <= 30.0f )
+		{
+			continue;
+		}
 		if( ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE )
 		{
 			console_print_error( " failed\n  ! mbedtls_ssl_handshake returned -0x%x\n\n", (unsigned int) -ret );
@@ -769,12 +776,22 @@ void remote_connection_close_and_free(tls_connection_t* connection) {
     free(connection);
 }
 
-http_response_t* remote_connection_request_with_headers(tls_connection_t* connection, const char* host,
-                                                        const char* path, const char* accept,
-                                                        const char* extra_headers,
-                                                        bool close_after_request) {
+static bool remote_request_was_cancelled(const remote_request_options_t* options) {
+	return options && options->cancellation_generation &&
+	       *options->cancellation_generation != options->expected_generation;
+}
+
+http_response_t* remote_connection_request_with_headers_and_options(
+	tls_connection_t* connection, const char* host, const char* path, const char* accept,
+	const char* extra_headers, bool close_after_request,
+	const remote_request_options_t* options) {
     ASSERT(connection);
 
+    u32 read_poll_timeout_ms = options && options->read_poll_timeout_ms
+                               ? options->read_poll_timeout_ms : 250;
+    float total_timeout_seconds = options && options->total_timeout_seconds > 0.0f
+                                  ? options->total_timeout_seconds : 30.0f;
+    i64 request_start_clock = get_clock();
     char request[4096];
     i32 request_len = remote_build_get_request_with_headers(request, sizeof(request), host, path,
                                                             accept, extra_headers, close_after_request);
@@ -785,6 +802,10 @@ http_response_t* remote_connection_request_with_headers(tls_connection_t* connec
     i32 ret = 1;
     i32 bytes_written = 0;
     while (bytes_written < request_len) {
+        if (remote_request_was_cancelled(options) ||
+            get_seconds_elapsed(request_start_clock, get_clock()) > total_timeout_seconds) {
+            return NULL;
+        }
         ret = connection->use_tls
               ? mbedtls_ssl_write(&connection->ssl, (const u8*)request + bytes_written,
                                   request_len - bytes_written)
@@ -816,11 +837,18 @@ http_response_t* remote_connection_request_with_headers(tls_connection_t* connec
 
     u8 read_buffer[KILOBYTES(16)];
     while (!context.message_complete) {
+        if (remote_request_was_cancelled(options) ||
+            get_seconds_elapsed(request_start_clock, get_clock()) > total_timeout_seconds) {
+            http_response_destroy(response);
+            return NULL;
+        }
         ret = connection->use_tls
               ? mbedtls_ssl_read(&connection->ssl, read_buffer, sizeof(read_buffer))
-              : mbedtls_net_recv(&connection->server_fd, read_buffer, sizeof(read_buffer));
+              : mbedtls_net_recv_timeout(&connection->server_fd, read_buffer,
+                                         sizeof(read_buffer), read_poll_timeout_ms);
 
-        if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
+            ret == MBEDTLS_ERR_SSL_TIMEOUT) {
             continue;
         }
         if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || ret == 0) {
@@ -843,6 +871,14 @@ http_response_t* remote_connection_request_with_headers(tls_connection_t* connec
     response->status_code = parser.status_code;
     memrw_putc(0, &response->buffer);
     return response;
+}
+
+http_response_t* remote_connection_request_with_headers(tls_connection_t* connection, const char* host,
+                                                        const char* path, const char* accept,
+                                                        const char* extra_headers,
+                                                        bool close_after_request) {
+    return remote_connection_request_with_headers_and_options(
+        connection, host, path, accept, extra_headers, close_after_request, NULL);
 }
 
 http_response_t* remote_connection_request(tls_connection_t* connection, const char* host, const char* path, const char* api_token, const char* cookie_header, bool close_after_request) {

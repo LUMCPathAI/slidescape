@@ -29,6 +29,13 @@ typedef struct http_response_t {
 
 typedef struct tls_connection_t tls_connection_t;
 
+typedef struct remote_request_options_t {
+	u32 read_poll_timeout_ms;
+	float total_timeout_seconds;
+	volatile i32* cancellation_generation;
+	i32 expected_generation;
+} remote_request_options_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -52,6 +59,10 @@ http_response_t* remote_connection_request_with_headers(tls_connection_t* connec
                                                         const char* path, const char* accept,
                                                         const char* extra_headers,
                                                         bool close_after_request);
+http_response_t* remote_connection_request_with_headers_and_options(
+	tls_connection_t* connection, const char* host, const char* path, const char* accept,
+	const char* extra_headers, bool close_after_request,
+	const remote_request_options_t* options);
 void http_response_destroy(http_response_t* response);
 
 #if DO_DEBUG

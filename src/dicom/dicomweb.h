@@ -51,6 +51,15 @@ typedef struct dicomweb_instance_ref_t {
 	char study_instance_uid[65];
 	char series_instance_uid[65];
 	char sop_instance_uid[65];
+	char sop_class_uid[65];
+	char image_flavor[17];
+	char instance_number[17];
+	char number_of_frames[17];
+	char concatenation_uid[65];
+	char in_concatenation_number[17];
+	char in_concatenation_total_number[17];
+	char total_pixel_matrix_columns[17];
+	char total_pixel_matrix_rows[17];
 } dicomweb_instance_ref_t;
 
 typedef struct dicomweb_study_ref_t {
@@ -86,10 +95,13 @@ bool dicomweb_parse_instance_metadata(const char* json, size_t json_size,
 void dicomweb_instance_metadata_destroy(dicomweb_instance_metadata_t* metadata);
 i32 dicomweb_parse_instance_refs(const char* json, size_t json_size,
                                  dicomweb_instance_ref_t* out, i32 capacity);
+i32 dicomweb_count_instance_refs(const char* json, size_t json_size);
 i32 dicomweb_parse_study_refs(const char* json, size_t json_size,
                               dicomweb_study_ref_t* out, i32 capacity);
+i32 dicomweb_count_study_refs(const char* json, size_t json_size);
 i32 dicomweb_parse_series_refs(const char* json, size_t json_size,
                                dicomweb_series_ref_t* out, i32 capacity);
+i32 dicomweb_count_series_refs(const char* json, size_t json_size);
 bool dicomweb_parse_multipart_frame(const u8* body, size_t body_size,
                                     const char* response_content_type,
                                     dicomweb_frame_t* out);

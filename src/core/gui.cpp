@@ -45,6 +45,338 @@ static void    imgui_free_wrapper(void* ptr, void* user_data)        { IM_UNUSED
 
 static char imgui_ini_filename[512];
 
+typedef enum dicomweb_browser_load_state_t {
+	DICOMWEB_BROWSER_IDLE = 0,
+	DICOMWEB_BROWSER_LOADING,
+	DICOMWEB_BROWSER_READY,
+	DICOMWEB_BROWSER_ERROR,
+} dicomweb_browser_load_state_t;
+
+typedef struct dicomweb_browser_state_t {
+	dicomweb_async_context_t async;
+	bool initialized;
+	char archive_url[1024];
+	char username[256];
+	char password[256];
+	char filter[256];
+	char status[512];
+	dicomweb_browser_load_state_t load_state;
+	dicomweb_async_query_kind_t pending_kind;
+	i32 pending_generation;
+	dicomweb_study_ref_t* studies;
+	i32 study_count;
+	dicomweb_series_ref_t* series;
+	i32 series_count;
+	dicomweb_instance_ref_t* instances;
+	i32 instance_count;
+	i32 selected_study;
+	i32 selected_series;
+} dicomweb_browser_state_t;
+
+static dicomweb_browser_state_t dicomweb_browser;
+
+static bool ascii_contains_case_insensitive(const char* text, const char* pattern) {
+	if (!pattern || !pattern[0]) return true;
+	if (!text) return false;
+	for (const char* start = text; *start; ++start) {
+		const char* a = start;
+		const char* b = pattern;
+		while (*a && *b && tolower((u8)*a) == tolower((u8)*b)) {
+			++a;
+			++b;
+		}
+		if (!*b) return true;
+	}
+	return false;
+}
+
+static void dicomweb_browser_clear_instances(void) {
+	free(dicomweb_browser.instances);
+	dicomweb_browser.instances = NULL;
+	dicomweb_browser.instance_count = 0;
+}
+
+static void dicomweb_browser_clear_series(void) {
+	free(dicomweb_browser.series);
+	dicomweb_browser.series = NULL;
+	dicomweb_browser.series_count = 0;
+	dicomweb_browser.selected_series = -1;
+	dicomweb_browser_clear_instances();
+}
+
+static void dicomweb_browser_start_query(dicomweb_async_query_kind_t kind) {
+	if (!dicomweb_browser.initialized) {
+		dicomweb_async_context_init(&dicomweb_browser.async);
+		dicomweb_browser.initialized = dicomweb_browser.async.initialized;
+	}
+	if (!dicomweb_browser.initialized) {
+		dicomweb_browser.load_state = DICOMWEB_BROWSER_ERROR;
+		copy_cstring(dicomweb_browser.status, "Could not initialize the DICOMweb worker.",
+		             sizeof(dicomweb_browser.status));
+		return;
+	}
+	const char* study_uid = dicomweb_browser.selected_study >= 0
+	                        ? dicomweb_browser.studies[dicomweb_browser.selected_study].study_instance_uid
+	                        : NULL;
+	const char* series_uid = dicomweb_browser.selected_series >= 0
+	                         ? dicomweb_browser.series[dicomweb_browser.selected_series].series_instance_uid
+	                         : NULL;
+	i32 generation = dicomweb_async_query(
+		&dicomweb_browser.async, kind, dicomweb_browser.archive_url,
+		dicomweb_browser.username, dicomweb_browser.password, study_uid, series_uid);
+	if (!generation) {
+		dicomweb_browser.load_state = DICOMWEB_BROWSER_ERROR;
+		copy_cstring(dicomweb_browser.status, "Could not schedule the DICOMweb request.",
+		             sizeof(dicomweb_browser.status));
+		return;
+	}
+	dicomweb_browser.pending_kind = kind;
+	dicomweb_browser.pending_generation = generation;
+	dicomweb_browser.load_state = DICOMWEB_BROWSER_LOADING;
+	copy_cstring(dicomweb_browser.status, "Loading...", sizeof(dicomweb_browser.status));
+}
+
+static void dicomweb_browser_connect(const char* archive_url,
+                                     const char* username, const char* password) {
+	copy_cstring(dicomweb_browser.archive_url, archive_url,
+	             sizeof(dicomweb_browser.archive_url));
+	copy_cstring(dicomweb_browser.username, username ? username : "",
+	             sizeof(dicomweb_browser.username));
+	copy_cstring(dicomweb_browser.password, password ? password : "",
+	             sizeof(dicomweb_browser.password));
+	free(dicomweb_browser.studies);
+	dicomweb_browser.studies = NULL;
+	dicomweb_browser.study_count = 0;
+	dicomweb_browser.selected_study = -1;
+	dicomweb_browser_clear_series();
+	show_dicomweb_archive_window = true;
+	dicomweb_browser_start_query(DICOMWEB_ASYNC_QUERY_STUDIES);
+}
+
+static void dicomweb_browser_open_series_url(const char* series_url,
+                                             const char* username, const char* password) {
+	if (!dicomweb_browser.initialized) {
+		dicomweb_async_context_init(&dicomweb_browser.async);
+		dicomweb_browser.initialized = dicomweb_browser.async.initialized;
+	}
+	if (!dicomweb_browser.initialized) return;
+	copy_cstring(dicomweb_browser.archive_url, series_url,
+	             sizeof(dicomweb_browser.archive_url));
+	copy_cstring(dicomweb_browser.username, username ? username : "",
+	             sizeof(dicomweb_browser.username));
+	copy_cstring(dicomweb_browser.password, password ? password : "",
+	             sizeof(dicomweb_browser.password));
+	show_dicomweb_archive_window = true;
+	i32 generation = dicomweb_async_open_series_url(
+		&dicomweb_browser.async, series_url,
+		dicomweb_browser.username, dicomweb_browser.password);
+	if (!generation) {
+		dicomweb_browser.load_state = DICOMWEB_BROWSER_ERROR;
+		copy_cstring(dicomweb_browser.status,
+		             "Expected a DICOMweb URL ending in /studies/{uid}/series/{uid}.",
+		             sizeof(dicomweb_browser.status));
+		return;
+	}
+	dicomweb_browser.pending_kind = DICOMWEB_ASYNC_OPEN_SERIES;
+	dicomweb_browser.pending_generation = generation;
+	dicomweb_browser.load_state = DICOMWEB_BROWSER_LOADING;
+	copy_cstring(dicomweb_browser.status, "Opening slide...",
+	             sizeof(dicomweb_browser.status));
+}
+
+static void dicomweb_browser_poll(app_state_t* app_state) {
+	if (!dicomweb_browser.initialized) return;
+	dicomweb_async_result_t* result = NULL;
+	while (dicomweb_async_poll(&dicomweb_browser.async, &result)) {
+		if (result->generation != dicomweb_browser.pending_generation ||
+		    result->kind != dicomweb_browser.pending_kind) {
+			dicomweb_async_result_destroy(result);
+			continue;
+		}
+		copy_cstring(dicomweb_browser.status, result->message,
+		             sizeof(dicomweb_browser.status));
+		if (result->cancelled) {
+			dicomweb_browser.load_state = DICOMWEB_BROWSER_IDLE;
+		} else if (!result->succeeded) {
+			dicomweb_browser.load_state = DICOMWEB_BROWSER_ERROR;
+		} else {
+			dicomweb_browser.load_state = DICOMWEB_BROWSER_READY;
+			if (result->kind == DICOMWEB_ASYNC_QUERY_STUDIES) {
+				free(dicomweb_browser.studies);
+				dicomweb_browser.studies = result->studies;
+				dicomweb_browser.study_count = result->count;
+				result->items = NULL;
+			} else if (result->kind == DICOMWEB_ASYNC_QUERY_SERIES) {
+				free(dicomweb_browser.series);
+				dicomweb_browser.series = result->series;
+				dicomweb_browser.series_count = result->count;
+				result->items = NULL;
+			} else if (result->kind == DICOMWEB_ASYNC_QUERY_INSTANCES) {
+				free(dicomweb_browser.instances);
+				dicomweb_browser.instances = result->instances;
+				dicomweb_browser.instance_count = result->count;
+				result->items = NULL;
+			} else if (result->kind == DICOMWEB_ASYNC_OPEN_SERIES) {
+				if (dicomweb_async_commit_open(app_state, result)) {
+					copy_cstring(dicomweb_browser.status, "Slide opened.",
+					             sizeof(dicomweb_browser.status));
+				}
+			}
+		}
+		dicomweb_async_result_destroy(result);
+	}
+}
+
+static void gui_draw_dicomweb_archive_window(app_state_t* app_state) {
+	dicomweb_browser_poll(app_state);
+	ImGui::SetNextWindowPos(ImVec2(150, 90), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSize(ImVec2(900, 650), ImGuiCond_FirstUseEver);
+	if (!ImGui::Begin("DICOMweb Archive", &show_dicomweb_archive_window)) {
+		ImGui::End();
+		return;
+	}
+
+	ImGui::TextWrapped("%s", dicomweb_browser.archive_url);
+	if (ImGui::Button("Refresh")) {
+		dicomweb_browser.selected_study = -1;
+		dicomweb_browser_clear_series();
+		dicomweb_browser_start_query(DICOMWEB_ASYNC_QUERY_STUDIES);
+	}
+	if (dicomweb_browser.load_state == DICOMWEB_BROWSER_LOADING) {
+		ImGui::SameLine();
+		if (ImGui::Button("Cancel")) {
+			dicomweb_async_cancel(&dicomweb_browser.async);
+			dicomweb_browser.load_state = DICOMWEB_BROWSER_IDLE;
+			copy_cstring(dicomweb_browser.status, "Request cancelled.",
+			             sizeof(dicomweb_browser.status));
+		}
+		ImGui::SameLine();
+		ImGui::TextUnformatted("Loading...");
+	}
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(280.0f);
+	ImGui::InputTextWithHint("##dicomweb_filter", "Filter studies and slides",
+	                         dicomweb_browser.filter, sizeof(dicomweb_browser.filter));
+	if (dicomweb_browser.status[0]) {
+		if (dicomweb_browser.load_state == DICOMWEB_BROWSER_ERROR) {
+			ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f), "%s",
+			                   dicomweb_browser.status);
+		} else {
+			ImGui::TextDisabled("%s", dicomweb_browser.status);
+		}
+	}
+	ImGui::Separator();
+
+	ImGui::BeginChild("dicomweb_studies", ImVec2(330, 0), true);
+	ImGui::TextUnformatted("Studies");
+	ImGui::Separator();
+	for (i32 i = 0; i < dicomweb_browser.study_count; ++i) {
+		dicomweb_study_ref_t* study = dicomweb_browser.studies + i;
+		if (!ascii_contains_case_insensitive(study->description, dicomweb_browser.filter) &&
+		    !ascii_contains_case_insensitive(study->study_date, dicomweb_browser.filter) &&
+		    !ascii_contains_case_insensitive(study->study_instance_uid, dicomweb_browser.filter)) {
+			continue;
+		}
+		char label[320];
+		snprintf(label, sizeof(label), "%s%s%s##archive_study_%d",
+		         study->study_date,
+		         study->description[0] ? " - " : "",
+		         study->description[0] ? study->description : study->study_instance_uid, i);
+		if (ImGui::Selectable(label, dicomweb_browser.selected_study == i)) {
+			dicomweb_browser.selected_study = i;
+			dicomweb_browser_clear_series();
+			dicomweb_browser_start_query(DICOMWEB_ASYNC_QUERY_SERIES);
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", study->study_instance_uid);
+	}
+	ImGui::EndChild();
+	ImGui::SameLine();
+	ImGui::BeginChild("dicomweb_slides", ImVec2(0, 0), true);
+	ImGui::TextUnformatted("Slides");
+	ImGui::Separator();
+	for (i32 i = 0; i < dicomweb_browser.series_count; ++i) {
+		dicomweb_series_ref_t* series = dicomweb_browser.series + i;
+		if (!ascii_contains_case_insensitive(series->description, dicomweb_browser.filter) &&
+		    !ascii_contains_case_insensitive(series->series_number, dicomweb_browser.filter) &&
+		    !ascii_contains_case_insensitive(series->series_instance_uid, dicomweb_browser.filter)) {
+			continue;
+		}
+		char label[320];
+		snprintf(label, sizeof(label), "%s %s%s%s##archive_series_%d",
+		         series->modality, series->series_number,
+		         series->description[0] ? " - " : "", series->description, i);
+		if (ImGui::Selectable(label, dicomweb_browser.selected_series == i,
+		                      ImGuiSelectableFlags_AllowDoubleClick)) {
+			dicomweb_browser.selected_series = i;
+			dicomweb_browser_clear_instances();
+			dicomweb_browser_start_query(DICOMWEB_ASYNC_QUERY_INSTANCES);
+			if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+				dicomweb_browser_start_query(DICOMWEB_ASYNC_OPEN_SERIES);
+			}
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", series->series_instance_uid);
+	}
+	if (dicomweb_browser.selected_series >= 0) {
+		ImGui::Separator();
+		if (ImGui::TreeNode("Technical details")) {
+			i32 volume_count = 0;
+			i32 associated_count = 0;
+			i32 concatenation_part_count = 0;
+			for (i32 i = 0; i < dicomweb_browser.instance_count; ++i) {
+				dicomweb_instance_ref_t* instance = dicomweb_browser.instances + i;
+				if (strcmp(instance->image_flavor, "VOLUME") == 0) ++volume_count;
+				if (strcmp(instance->image_flavor, "LABEL") == 0 ||
+				    strcmp(instance->image_flavor, "OVERVIEW") == 0 ||
+				    strcmp(instance->image_flavor, "THUMBNAIL") == 0) {
+					++associated_count;
+				}
+				if (instance->concatenation_uid[0]) ++concatenation_part_count;
+			}
+			ImGui::Text("Pyramid level instances: %d", volume_count);
+			ImGui::Text("Associated images: %d", associated_count);
+			ImGui::Text("Concatenation parts: %d", concatenation_part_count);
+			ImGui::Text("SOP instances: %d", dicomweb_browser.instance_count);
+			ImGui::Separator();
+			for (i32 i = 0; i < dicomweb_browser.instance_count; ++i) {
+				dicomweb_instance_ref_t* instance = dicomweb_browser.instances + i;
+				const char* flavor = instance->image_flavor[0]
+				                     ? instance->image_flavor : "OTHER";
+				char label[256];
+				snprintf(label, sizeof(label), "%s %sx%s, %s frame%s##instance_detail_%d",
+				         flavor,
+				         instance->total_pixel_matrix_columns[0]
+				         ? instance->total_pixel_matrix_columns : "?",
+				         instance->total_pixel_matrix_rows[0]
+				         ? instance->total_pixel_matrix_rows : "?",
+				         instance->number_of_frames[0] ? instance->number_of_frames : "?",
+				         strcmp(instance->number_of_frames, "1") == 0 ? "" : "s", i);
+				if (ImGui::TreeNode(label)) {
+					ImGui::TextWrapped("SOP Instance UID: %s", instance->sop_instance_uid);
+					if (instance->sop_class_uid[0]) {
+						ImGui::TextWrapped("SOP Class UID: %s", instance->sop_class_uid);
+					}
+					if (instance->instance_number[0]) {
+						ImGui::Text("Instance number: %s", instance->instance_number);
+					}
+					if (instance->concatenation_uid[0]) {
+						ImGui::TextWrapped("Concatenation UID: %s",
+						                   instance->concatenation_uid);
+						ImGui::Text("Part: %s of %s",
+						            instance->in_concatenation_number[0]
+						            ? instance->in_concatenation_number : "?",
+						            instance->in_concatenation_total_number[0]
+						            ? instance->in_concatenation_total_number : "?");
+					}
+					ImGui::TreePop();
+				}
+			}
+			ImGui::TreePop();
+		}
+	}
+	ImGui::EndChild();
+	ImGui::End();
+}
+
 static void draw_dicom_slides_window(app_state_t* app_state) {
 	if (!show_dicom_slides_window || arrlen(app_state->loaded_images) == 0) return;
 	image_t* image = app_state->loaded_images[0];
@@ -1191,87 +1523,6 @@ void gui_draw_open_uri_window(app_state_t* app_state) {
 	                     ImGuiInputTextFlags_Password);
 	    ImGui::TreePop();
     }
-    static dicomweb_study_ref_t studies[DICOMWEB_MAX_STUDIES];
-    static dicomweb_series_ref_t series[DICOMWEB_MAX_SERIES];
-    static dicomweb_instance_ref_t instances[DICOMWEB_MAX_INSTANCES];
-    static i32 study_count;
-    static i32 series_count;
-    static i32 instance_count;
-    static i32 selected_study = -1;
-    static i32 selected_series = -1;
-    if (ImGui::Button("Browse DICOMweb archive")) {
-	    study_count = dicomweb_query_studies(remote_uri, dicomweb_username, dicomweb_password,
-	                                         studies, COUNT(studies));
-	    pressed_connect = true;
-	    snprintf(open_uri_status, sizeof(open_uri_status), "%s", dicomweb_get_last_status());
-	    series_count = 0;
-	    instance_count = 0;
-	    selected_study = -1;
-	    selected_series = -1;
-    }
-    if (study_count > 0 && ImGui::TreeNodeEx("Archive browser", ImGuiTreeNodeFlags_DefaultOpen)) {
-	    ImGui::Columns(3, "dicomweb_browser_columns", true);
-	    ImGui::TextUnformatted("Studies");
-	    ImGui::NextColumn();
-	    ImGui::TextUnformatted("Series");
-	    ImGui::NextColumn();
-	    ImGui::TextUnformatted("Instances");
-	    ImGui::NextColumn();
-	    ImGui::Separator();
-	    for (i32 i = 0; i < study_count; ++i) {
-		    char label[256];
-		    snprintf(label, sizeof(label), "%s%s%s##study%d",
-		             studies[i].study_date,
-		             studies[i].description[0] ? " - " : "",
-		             studies[i].description[0] ? studies[i].description : studies[i].study_instance_uid, i);
-		    if (ImGui::Selectable(label, selected_study == i)) {
-			    selected_study = i;
-			    selected_series = -1;
-			    instance_count = 0;
-			    series_count = dicomweb_query_series(remote_uri, dicomweb_username,
-			                                          dicomweb_password,
-			                                          studies[i].study_instance_uid,
-			                                          series, COUNT(series));
-		    }
-		    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", studies[i].study_instance_uid);
-	    }
-	    ImGui::NextColumn();
-	    for (i32 i = 0; i < series_count; ++i) {
-		    char label[256];
-		    const char* detail = series[i].description[0] ? series[i].description
-		                                                 : series[i].series_instance_uid;
-		    snprintf(label, sizeof(label), "%s %s%s%s##series%d",
-		             series[i].modality,
-		             series[i].series_number,
-		             detail[0] ? " - " : "",
-		             detail, i);
-		    if (ImGui::Selectable(label, selected_series == i)) {
-			    selected_series = i;
-			    instance_count = dicomweb_query_instances(
-				    remote_uri, dicomweb_username, dicomweb_password,
-				    studies[selected_study].study_instance_uid,
-				    series[i].series_instance_uid, instances, COUNT(instances));
-		    }
-		    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", series[i].series_instance_uid);
-	    }
-	    ImGui::NextColumn();
-	    for (i32 i = 0; i < instance_count; ++i) {
-		    ImGui::TextWrapped("%s", instances[i].sop_instance_uid);
-	    }
-	    ImGui::Columns(1);
-	    if (selected_study >= 0 && selected_series >= 0 &&
-	        ImGui::Button("Open selected series")) {
-		    char series_url[1024];
-		    if (dicomweb_build_series_url(series_url, sizeof(series_url), remote_uri,
-		                                  studies[selected_study].study_instance_uid,
-		                                  series[selected_series].series_instance_uid)) {
-			    copy_cstring(remote_uri, series_url, sizeof(remote_uri));
-			    dicomweb_open_series(app_state, remote_uri, dicomweb_username, dicomweb_password);
-			    snprintf(open_uri_status, sizeof(open_uri_status), "%s", dicomweb_get_last_status());
-		    }
-	    }
-	    ImGui::TreePop();
-    }
     if (entered || ImGui::Button("Connect")) {
         pressed_connect = true;
         if (save_api_key && is_api_key_dirty) {
@@ -1281,22 +1532,19 @@ void gui_draw_open_uri_window(app_state_t* app_state) {
         bool is_dicomweb_series_url = strstr(remote_uri, "/studies/") &&
 	                                  strstr(remote_uri, "/series/");
         if (is_dicomweb_series_url) {
-	        dicomweb_open_series(app_state, remote_uri, dicomweb_username, dicomweb_password);
-	        snprintf(open_uri_status, sizeof(open_uri_status), "%s", dicomweb_get_last_status());
-        } else if (!slide_score_try_open_uri(app_state, remote_uri, token_buf)) {
-            http_response_t* response = open_remote_uri(app_state, remote_uri, token_buf);
-            if (response) {
-                debug_slide_score_api_handle_response((const char *) (response->buffer.data), response->content_length, SLIDE_SCORE_API_GET_IMAGE_METADATA);
-                http_response_destroy(response);
-            }
-        }
-        if (!is_dicomweb_series_url) {
+	        dicomweb_browser_open_series_url(remote_uri, dicomweb_username,
+	                                         dicomweb_password);
+	        snprintf(open_uri_status, sizeof(open_uri_status),
+	                 "Opening DICOMweb slide asynchronously.");
+        } else if (slide_score_try_open_uri(app_state, remote_uri, token_buf)) {
 	        const char* slide_score_status = slide_score_get_last_status();
-	        if (slide_score_status && slide_score_status[0]) {
-	            snprintf(open_uri_status, sizeof(open_uri_status), "%s", slide_score_status);
-	        } else {
-	            snprintf(open_uri_status, sizeof(open_uri_status), "Use the console (F3) to view connection results.");
-	        }
+	        snprintf(open_uri_status, sizeof(open_uri_status), "%s",
+	                 slide_score_status && slide_score_status[0]
+	                 ? slide_score_status : "Opening Slide Score image.");
+        } else {
+	        dicomweb_browser_connect(remote_uri, dicomweb_username, dicomweb_password);
+	        snprintf(open_uri_status, sizeof(open_uri_status),
+	                 "Opened the DICOMweb archive browser.");
         }
     }
     if (pressed_connect) {
@@ -1465,6 +1713,7 @@ void gui_draw(app_state_t* app_state, input_t* input, i32 client_width, i32 clie
 
 	if (show_menu_bar) gui_draw_main_menu_bar(app_state);
     if (show_open_uri_window) gui_draw_open_uri_window(app_state);
+    if (show_dicomweb_archive_window) gui_draw_dicomweb_archive_window(app_state);
 
 	if (show_open_remote_window) {
 		ImGui::SetNextWindowPos(ImVec2(120, 100), ImGuiCond_FirstUseEver);

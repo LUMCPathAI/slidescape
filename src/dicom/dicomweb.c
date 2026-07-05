@@ -42,6 +42,14 @@ static struct json_array_s* attribute_values(struct json_object_s* dataset, cons
 	return (struct json_array_s*)values_value->payload;
 }
 
+static struct json_value_s* value_at(struct json_object_s* dataset, const char* tag, i32 index) {
+	struct json_array_s* values = attribute_values(dataset, tag);
+	if (!values || index < 0) return NULL;
+	struct json_array_element_s* element = values->start;
+	for (i32 i = 0; element && i < index; ++i) element = element->next;
+	return element ? element->value : NULL;
+}
+
 static const char* scalar_string(struct json_value_s* value) {
 	if (!value) return NULL;
 	if (value->type == json_type_string) return ((struct json_string_s*)value->payload)->string;
@@ -51,6 +59,14 @@ static const char* scalar_string(struct json_value_s* value) {
 
 static bool copy_tag_string(struct json_object_s* dataset, const char* tag, char* dest, size_t dest_size) {
 	const char* value = scalar_string(first_value(dataset, tag));
+	if (!value || strlen(value) >= dest_size) return false;
+	memcpy(dest, value, strlen(value) + 1);
+	return true;
+}
+
+static bool copy_tag_string_at(struct json_object_s* dataset, const char* tag, i32 index,
+                               char* dest, size_t dest_size) {
+	const char* value = scalar_string(value_at(dataset, tag, index));
 	if (!value || strlen(value) >= dest_size) return false;
 	memcpy(dest, value, strlen(value) + 1);
 	return true;
@@ -222,7 +238,7 @@ void dicomweb_instance_metadata_destroy(dicomweb_instance_metadata_t* metadata) 
 
 i32 dicomweb_parse_instance_refs(const char* json, size_t json_size,
                                  dicomweb_instance_ref_t* out, i32 capacity) {
-	if (!json || !json_size || !out || capacity <= 0) return 0;
+	if (!json || !json_size || (capacity > 0 && !out) || capacity < 0) return 0;
 	struct json_value_s* root = json_parse_ex(json, json_size, json_parse_flags_default,
 	                                          dicomweb_json_alloc, NULL, NULL);
 	if (!root || root->type != json_type_array) {
@@ -232,7 +248,7 @@ i32 dicomweb_parse_instance_refs(const char* json, size_t json_size,
 	i32 count = 0;
 	struct json_array_s* array = (struct json_array_s*)root->payload;
 	for (struct json_array_element_s* element = array->start;
-	     element && count < capacity; element = element->next) {
+	     element; element = element->next) {
 		if (element->value->type != json_type_object) continue;
 		struct json_object_s* dataset = (struct json_object_s*)element->value->payload;
 		dicomweb_instance_ref_t ref = {0};
@@ -242,16 +258,34 @@ i32 dicomweb_parse_instance_refs(const char* json, size_t json_size,
 		                    sizeof(ref.series_instance_uid)) &&
 		    copy_tag_string(dataset, "00080018", ref.sop_instance_uid,
 		                    sizeof(ref.sop_instance_uid))) {
-			out[count++] = ref;
+			copy_tag_string(dataset, "00080016", ref.sop_class_uid,
+			                sizeof(ref.sop_class_uid));
+			copy_tag_string_at(dataset, "00080008", 2, ref.image_flavor,
+			                   sizeof(ref.image_flavor));
+			copy_tag_string(dataset, "00200013", ref.instance_number,
+			                sizeof(ref.instance_number));
+			copy_tag_string(dataset, "00280008", ref.number_of_frames,
+			                sizeof(ref.number_of_frames));
+			copy_tag_string(dataset, "00209161", ref.concatenation_uid,
+			                sizeof(ref.concatenation_uid));
+			copy_tag_string(dataset, "00209162", ref.in_concatenation_number,
+			                sizeof(ref.in_concatenation_number));
+			copy_tag_string(dataset, "00209163", ref.in_concatenation_total_number,
+			                sizeof(ref.in_concatenation_total_number));
+			copy_tag_string(dataset, "00480006", ref.total_pixel_matrix_columns,
+			                sizeof(ref.total_pixel_matrix_columns));
+			copy_tag_string(dataset, "00480007", ref.total_pixel_matrix_rows,
+			                sizeof(ref.total_pixel_matrix_rows));
+			if (count < capacity) out[count] = ref;
+			++count;
 		}
 	}
 	free(root);
-	return count;
+	return out ? MIN(count, capacity) : count;
 }
 
-static i32 parse_qido_refs(const char* json, size_t json_size, void* out, i32 capacity,
-                           bool studies) {
-	if (!json || !json_size || !out || capacity <= 0) return 0;
+i32 dicomweb_count_instance_refs(const char* json, size_t json_size) {
+	if (!json || !json_size) return 0;
 	struct json_value_s* root = json_parse_ex(json, json_size, json_parse_flags_default,
 	                                          dicomweb_json_alloc, NULL, NULL);
 	if (!root || root->type != json_type_array) {
@@ -261,7 +295,35 @@ static i32 parse_qido_refs(const char* json, size_t json_size, void* out, i32 ca
 	i32 count = 0;
 	struct json_array_s* array = (struct json_array_s*)root->payload;
 	for (struct json_array_element_s* element = array->start;
-	     element && count < capacity; element = element->next) {
+	     element; element = element->next) {
+		if (element->value->type != json_type_object) continue;
+		struct json_object_s* dataset = (struct json_object_s*)element->value->payload;
+		char study_uid[65];
+		char series_uid[65];
+		char instance_uid[65];
+		if (copy_tag_string(dataset, "0020000D", study_uid, sizeof(study_uid)) &&
+		    copy_tag_string(dataset, "0020000E", series_uid, sizeof(series_uid)) &&
+		    copy_tag_string(dataset, "00080018", instance_uid, sizeof(instance_uid))) {
+			++count;
+		}
+	}
+	free(root);
+	return count;
+}
+
+static i32 parse_qido_refs(const char* json, size_t json_size, void* out, i32 capacity,
+                           bool studies) {
+	if (!json || !json_size || (capacity > 0 && !out) || capacity < 0) return 0;
+	struct json_value_s* root = json_parse_ex(json, json_size, json_parse_flags_default,
+	                                          dicomweb_json_alloc, NULL, NULL);
+	if (!root || root->type != json_type_array) {
+		if (root) free(root);
+		return 0;
+	}
+	i32 count = 0;
+	struct json_array_s* array = (struct json_array_s*)root->payload;
+	for (struct json_array_element_s* element = array->start;
+	     element; element = element->next) {
 		if (element->value->type != json_type_object) continue;
 		struct json_object_s* dataset = (struct json_object_s*)element->value->payload;
 		if (studies) {
@@ -270,7 +332,8 @@ static i32 parse_qido_refs(const char* json, size_t json_size, void* out, i32 ca
 			                     sizeof(ref.study_instance_uid))) continue;
 			copy_tag_string(dataset, "00080020", ref.study_date, sizeof(ref.study_date));
 			copy_tag_string(dataset, "00081030", ref.description, sizeof(ref.description));
-			((dicomweb_study_ref_t*)out)[count++] = ref;
+			if (count < capacity) ((dicomweb_study_ref_t*)out)[count] = ref;
+			++count;
 		} else {
 			dicomweb_series_ref_t ref = {0};
 			if (!copy_tag_string(dataset, "0020000E", ref.series_instance_uid,
@@ -278,11 +341,12 @@ static i32 parse_qido_refs(const char* json, size_t json_size, void* out, i32 ca
 			copy_tag_string(dataset, "00200011", ref.series_number, sizeof(ref.series_number));
 			copy_tag_string(dataset, "00080060", ref.modality, sizeof(ref.modality));
 			copy_tag_string(dataset, "0008103E", ref.description, sizeof(ref.description));
-			((dicomweb_series_ref_t*)out)[count++] = ref;
+			if (count < capacity) ((dicomweb_series_ref_t*)out)[count] = ref;
+			++count;
 		}
 	}
 	free(root);
-	return count;
+	return out ? MIN(count, capacity) : count;
 }
 
 i32 dicomweb_parse_study_refs(const char* json, size_t json_size,
@@ -293,6 +357,14 @@ i32 dicomweb_parse_study_refs(const char* json, size_t json_size,
 i32 dicomweb_parse_series_refs(const char* json, size_t json_size,
                                dicomweb_series_ref_t* out, i32 capacity) {
 	return parse_qido_refs(json, json_size, out, capacity, false);
+}
+
+i32 dicomweb_count_study_refs(const char* json, size_t json_size) {
+	return parse_qido_refs(json, json_size, NULL, 0, true);
+}
+
+i32 dicomweb_count_series_refs(const char* json, size_t json_size) {
+	return parse_qido_refs(json, json_size, NULL, 0, false);
 }
 
 static const u8* find_bytes(const u8* haystack, size_t haystack_size,

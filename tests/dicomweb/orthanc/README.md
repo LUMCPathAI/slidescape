@@ -85,10 +85,11 @@ To browse instead of opening a known series, enter only the archive root:
 http://127.0.0.1:8042/dicom-web
 ```
 
-Then select **Browse DICOMweb archive**. The browser queries studies, series,
-and instances through QIDO-RS. Selecting **Open selected series** opens all
-supported WSI pyramid instances in that series. Other slide series in the same
-study are also exposed through **View → DICOM slides**.
+Then select **Connect**. The browser queries studies, series,
+and logical slide series asynchronously through QIDO-RS. Double-clicking a slide
+opens all supported WSI pyramid instances in that series. Raw SOP Instance UIDs
+are kept under the selected slide's **Technical details** panel. Other slide
+series in the same study are also exposed through **View → DICOM slides**.
 
 For command-line development, credentials can be supplied without putting them
 in the URL:

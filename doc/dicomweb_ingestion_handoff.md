@@ -79,6 +79,17 @@ As of 2026-07-05:
   short keep-alive timeout;
 - the Open URI window can browse QIDO-RS studies, series, and instances, open a
   selected series, and switch among sibling slide series within one study;
+- archive browsing now opens in a dedicated DICOMweb Archive window; study,
+  series, instance-detail, and slide-open requests run on worker threads with
+  loading, empty, error, refresh, filtering, cancellation, and stale-result
+  handling;
+- Open URI uses one Connect action: recognized Slide Score links open normally,
+  Study/Series DICOMweb links open asynchronously, and other HTTP(S) archive
+  roots open the DICOMweb Archive browser;
+- QIDO result storage is dynamically sized rather than silently capped by the
+  browser's former fixed study/series/instance arrays;
+- DICOMweb requests poll for cancellation and use a 30-second total request
+  deadline after connecting;
 - the three local UMCU slides were verified to use separate Study and Series
   Instance UIDs and no Concatenation UID; they are selected through the archive
   browser, while their files within each series are pyramid levels rather than
@@ -90,6 +101,25 @@ As of 2026-07-05:
 - the small RGB WSI and three instances from one UMCU WSI series have
   passed upload, discovery, metadata, and native frame retrieval against
   `orthancteam/orthanc:26.6.1`;
+- a pinned, loopback-only dcm4chee Archive 5 harness now exists under
+  `tests/dicomweb/dcm4chee/`, using dcm4chee 5.35.0, PostgreSQL 18.3, and
+  OpenLDAP 2.6.13 images;
+- the small RGB WSI has passed STOW-RS, QIDO-RS, metadata, explicit JPEG
+  Baseline frame retrieval, and Slidescape protocol parsing against dcm4chee;
+- all ten UMCU instances passed the same dcm4chee protocol checks and were
+  grouped as three logical slides containing 3, 3, and 4 pyramid instances;
+- Slidescape metadata and multipart parsing passed against the largest instance
+  from each of those three dcm4chee series;
+- dcm4chee rejects the UID-deficient extensionless `I5_HE` fixture with HTTP
+  409 and a DICOM processing-failure response, confirming that it remains a
+  tolerant-reader regression fixture rather than an archive-ingestion fixture;
+- dcm4chee returns `204 No Content` for an empty QIDO study search, while
+  Orthanc returns `200 OK` with `[]`; the browser accepts both as an empty
+  successful result;
+- wildcard `application/octet-stream` frame negotiation caused dcm4chee to
+  return an uncompressed frame without a per-part transfer syntax, so the
+  JPEG-only viewer now explicitly negotiates JPEG Baseline; that request was
+  verified against both dcm4chee and Orthanc;
 - Orthanc groups the three tested UMCU instances into the same study and series;
 - the extensionless `I5_HE` fixture is readable by Slidescape but Orthanc rejects
   it because required Study, Series, or SOP Instance UIDs are absent; it is
@@ -98,13 +128,14 @@ As of 2026-07-05:
 - the current interactive slice is intentionally limited to `TILED_FULL`,
   JPEG Baseline, brightfield VOLUME instances, one optical path, and one focal
   plane;
-- the next client work is connection reuse, OAuth/OIDC bearer-token acquisition,
-  sparse frame mapping, associated images, cancellation/timeouts, and dcm4chee
-  interoperability.
+- the next client work is richer logical-slide/technical-detail metadata,
+  QIDO pagination and server-side search, connect/write deadlines, associated
+  images, sparse frame mapping, and OAuth/OIDC bearer-token acquisition.
 
 This establishes the local-file reader as a regression oracle for the future
-DICOMweb backend. Orthanc now covers the first half of M0; a pinned dcm4chee
-configuration and cross-server conformance run remain.
+DICOMweb backend. Both local reference archives now have pinned harnesses and a
+first shared-fixture protocol run; the broader automated M3 conformance matrix
+remains.
 
 ## Why DICOM-Only Comes First
 

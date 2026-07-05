@@ -93,6 +93,7 @@ extern bool show_debugging_window;
 extern bool show_image_options_window;
 extern bool show_open_remote_window;
 extern bool show_open_uri_window;
+extern bool show_dicomweb_archive_window;
 extern bool show_layers_window;
 extern bool show_dicom_slides_window;
 extern bool show_annotations_window;

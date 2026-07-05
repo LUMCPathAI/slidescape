@@ -77,9 +77,15 @@ TEST_CASE("DICOMweb builds portable WADO-RS paths") {
 TEST_CASE("DICOMweb parses QIDO instance references") {
 	const char* json =
 		"[{"
+		"\"00080008\":{\"vr\":\"CS\",\"Value\":[\"ORIGINAL\",\"PRIMARY\",\"VOLUME\"]},"
+		"\"00080016\":{\"vr\":\"UI\",\"Value\":[\"1.2.840.10008.5.1.4.1.1.77.1.6\"]},"
 		"\"0020000D\":{\"vr\":\"UI\",\"Value\":[\"study\"]},"
 		"\"0020000E\":{\"vr\":\"UI\",\"Value\":[\"series\"]},"
-		"\"00080018\":{\"vr\":\"UI\",\"Value\":[\"instance-1\"]}"
+		"\"00080018\":{\"vr\":\"UI\",\"Value\":[\"instance-1\"]},"
+		"\"00200013\":{\"vr\":\"IS\",\"Value\":[7]},"
+		"\"00280008\":{\"vr\":\"IS\",\"Value\":[108]},"
+		"\"00480006\":{\"vr\":\"UL\",\"Value\":[2875]},"
+		"\"00480007\":{\"vr\":\"UL\",\"Value\":[2057]}"
 		"},{"
 		"\"0020000D\":{\"vr\":\"UI\",\"Value\":[\"study\"]},"
 		"\"0020000E\":{\"vr\":\"UI\",\"Value\":[\"series\"]},"
@@ -89,6 +95,10 @@ TEST_CASE("DICOMweb parses QIDO instance references") {
 	REQUIRE(dicomweb_parse_instance_refs(json, strlen(json), refs, COUNT(refs)) == 2);
 	CHECK(strcmp(refs[0].study_instance_uid, "study") == 0);
 	CHECK(strcmp(refs[0].series_instance_uid, "series") == 0);
+	CHECK(strcmp(refs[0].image_flavor, "VOLUME") == 0);
+	CHECK(strcmp(refs[0].instance_number, "7") == 0);
+	CHECK(strcmp(refs[0].number_of_frames, "108") == 0);
+	CHECK(strcmp(refs[0].total_pixel_matrix_columns, "2875") == 0);
 	CHECK(strcmp(refs[1].sop_instance_uid, "instance-2") == 0);
 }
 
@@ -143,4 +153,28 @@ TEST_CASE("DICOMweb parses archive study and series results") {
 	CHECK(strcmp(series[0].series_number, "3") == 0);
 	CHECK(strcmp(series[0].modality, "SM") == 0);
 	CHECK(strcmp(series[0].description, "H&E") == 0);
+}
+
+TEST_CASE("DICOMweb counts query results independently of caller capacity") {
+	const char* studies_json =
+		"["
+		"{\"0020000D\":{\"vr\":\"UI\",\"Value\":[\"study-1\"]}},"
+		"{\"0020000D\":{\"vr\":\"UI\",\"Value\":[\"study-2\"]}},"
+		"{\"0020000D\":{\"vr\":\"UI\",\"Value\":[\"study-3\"]}}"
+		"]";
+	CHECK(dicomweb_count_study_refs(studies_json, strlen(studies_json)) == 3);
+	dicomweb_study_ref_t study = {};
+	CHECK(dicomweb_parse_study_refs(studies_json, strlen(studies_json), &study, 1) == 1);
+	CHECK(strcmp(study.study_instance_uid, "study-1") == 0);
+
+	const char* instances_json =
+		"["
+		"{\"0020000D\":{\"vr\":\"UI\",\"Value\":[\"study\"]},"
+		"\"0020000E\":{\"vr\":\"UI\",\"Value\":[\"series\"]},"
+		"\"00080018\":{\"vr\":\"UI\",\"Value\":[\"instance-1\"]}},"
+		"{\"0020000D\":{\"vr\":\"UI\",\"Value\":[\"study\"]},"
+		"\"0020000E\":{\"vr\":\"UI\",\"Value\":[\"series\"]},"
+		"\"00080018\":{\"vr\":\"UI\",\"Value\":[\"instance-2\"]}}"
+		"]";
+	CHECK(dicomweb_count_instance_refs(instances_json, strlen(instances_json)) == 2);
 }
