@@ -309,6 +309,7 @@ set(SLIDESCAPE_NONGUI_BASE_FILES
         src/tiff/tif_lzw.c
         src/dicom/dicom.c
         src/dicom/dicom_dict.c
+        src/dicom/dicomweb.c
         src/dicom/dicom_wsi.c
         src/isyntax/isyntax.c
         src/isyntax/isyntax_reader.c

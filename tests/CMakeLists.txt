@@ -2,6 +2,7 @@
 add_executable(slidescape_tests
         test_main.cpp
         test_fixtures.cpp
+        test_dicomweb.cpp
         test_mathutils.cpp
         test_memrw.cpp
         test_stb_sprintf.cpp
@@ -32,3 +33,15 @@ if (WIN32)
 endif()
 
 add_test(NAME slidescape_tests COMMAND slidescape_tests)
+
+add_executable(dicomweb_probe
+        dicomweb_probe.c
+        test_stb_sprintf.cpp
+)
+target_include_directories(dicomweb_probe PRIVATE
+        ../src
+        ../src/dicom
+        ../src/third_party
+        ../src/utils
+)
+target_link_libraries(dicomweb_probe PRIVATE slidescape_nongui)

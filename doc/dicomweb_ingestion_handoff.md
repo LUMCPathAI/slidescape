@@ -62,6 +62,11 @@ As of 2026-07-05:
   `tests/dicomweb/orthanc/`;
 - the harness provides repeatable health, STOW-RS, QIDO-RS, metadata, and native
   WADO-RS frame checks;
+- the first Slidescape DICOMweb protocol module exists in `src/dicom/dicomweb.*`;
+  it parses WSI DICOM JSON metadata, constructs WADO-RS paths, and extracts a
+  native frame from `multipart/related`;
+- unit tests cover that protocol module, and `dicomweb_probe` has consumed live
+  Orthanc metadata and a JPEG Baseline frame through the local harness;
 - the small RGB WSI and two companion instances from one UMCU WSI series have
   passed upload, discovery, metadata, and native frame retrieval against
   `orthancteam/orthanc:26.6.1`;
@@ -70,7 +75,9 @@ As of 2026-07-05:
   it because required Study, Series, or SOP Instance UIDs are absent; it is
   therefore useful as a tolerant-reader regression fixture, but is not currently
   a valid STOW-RS archive-ingestion fixture;
-- no Slidescape DICOMweb transport client has been implemented yet.
+- native Slidescape HTTP/auth transport and viewer tile-scheduler integration
+  have not yet been implemented; the live protocol probe currently uses curl
+  only as its transport adapter.
 
 This establishes the local-file reader as a regression oracle for the future
 DICOMweb backend. Orthanc now covers the first half of M0; a pinned dcm4chee

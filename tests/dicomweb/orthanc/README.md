@@ -55,6 +55,18 @@ Frame retrieval requests the stored transfer syntax using
 `application/octet-stream; transfer-syntax=*`. This avoids asking the archive to
 transcode the tile and verifies the path a Slidescape client should normally use.
 
+After building `dicomweb_probe`, run the Slidescape protocol parser against live
+Orthanc metadata and frame responses:
+
+```sh
+cmake --build ../../../cmake-build-debug --target dicomweb_probe
+./client-smoke-test.sh
+```
+
+This probe validates Slidescape's DICOM JSON and multipart parsers. Its HTTP
+requests still use `curl`; native Slidescape HTTP/TLS transport integration is
+the next implementation step.
+
 ## Inspect
 
 ```sh
