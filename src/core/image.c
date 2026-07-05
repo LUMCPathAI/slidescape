@@ -337,6 +337,10 @@ bool init_image_from_slide_score(image_t* image, slide_score_remote_image_t* rem
     image->height_in_pixels = metadata->level_0_height;
     image->width_in_um = image->is_mpp_known ? image->width_in_pixels * image->mpp_x : (float)image->width_in_pixels;
     image->height_in_um = image->is_mpp_known ? image->height_in_pixels * image->mpp_y : (float)image->height_in_pixels;
+
+    image->clip_rects[0] = RECT2F(0.0f, 0.0f, image->width_in_um, image->height_in_um);
+    image->clip_rect_count = 1;
+
     snprintf(image->name, sizeof(image->name), "%s", metadata->filename[0] ? metadata->filename : "Slide Score image");
     snprintf(image->directory, sizeof(image->directory), "https://%s/i/%d", remote->client.server_name, remote->image_id);
 
