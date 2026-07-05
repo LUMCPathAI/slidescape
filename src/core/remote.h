@@ -24,6 +24,7 @@ typedef struct http_response_t {
     memrw_t buffer;
     size_t content_length;
     i32 status_code;
+    char content_type[256];
 } http_response_t;
 
 typedef struct tls_connection_t tls_connection_t;
@@ -44,8 +45,13 @@ bool open_remote_slide(app_state_t *app_state, const char *hostname, i32 portno,
 http_response_t* open_remote_uri(app_state_t *app_state, const char *uri, const char* api_token);
 http_response_t* open_remote_uri_with_extra_headers(const char *uri, const char* api_token, const char* cookie_header);
 tls_connection_t* remote_connection_open(const char* hostname, i32 portno);
+tls_connection_t* remote_connection_open_http(const char* hostname, i32 portno, bool use_tls);
 void remote_connection_close_and_free(tls_connection_t* connection);
 http_response_t* remote_connection_request(tls_connection_t* connection, const char* host, const char* path, const char* api_token, const char* cookie_header, bool close_after_request);
+http_response_t* remote_connection_request_with_headers(tls_connection_t* connection, const char* host,
+                                                        const char* path, const char* accept,
+                                                        const char* extra_headers,
+                                                        bool close_after_request);
 void http_response_destroy(http_response_t* response);
 
 #if DO_DEBUG

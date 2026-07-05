@@ -77,6 +77,7 @@ void load_tile_func(i32 logical_thread_index, void* userdata);
 i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 tiles_to_load);
 void tile_loader_set_remote_tiff_batch_callback(work_queue_callback_t* callback);
 void tile_loader_set_slide_score_batch_callback(work_queue_callback_t* callback);
+void tile_loader_set_dicomweb_batch_callback(work_queue_callback_t* callback);
 
 #ifdef __cplusplus
 }

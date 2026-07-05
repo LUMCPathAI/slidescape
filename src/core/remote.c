@@ -20,6 +20,7 @@
 #include "platform.h"
 #include "viewer.h"
 #include "remote.h"
+#include "stringutils.h"
 
 #ifdef __APPLE__
 // For loading the root certificates (requires linking against "-framework Security")
@@ -67,6 +68,7 @@
 struct tls_connection_t {
 	i64 start_clock;
 	i64 sockfd;
+	bool use_tls;
 	mbedtls_net_context server_fd;
 	mbedtls_entropy_context entropy;
 	mbedtls_ctr_drbg_context ctr_drbg;
@@ -163,7 +165,19 @@ mbedtls_x509_crt* ssl_cert_load_defaults() {
     if( chain != NULL )
         return chain;
 #elif LINUX
-    // TODO: load root certificate on Linux?
+    static const char* ca_paths[] = {
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+    };
+    mbedtls_x509_crt* chain = calloc(1, sizeof(mbedtls_x509_crt));
+    if (!chain) return NULL;
+    mbedtls_x509_crt_init(chain);
+    for (i32 i = 0; i < COUNT(ca_paths); ++i) {
+        if (mbedtls_x509_crt_parse_file(chain, ca_paths[i]) >= 0) return chain;
+    }
+    mbedtls_x509_crt_free(chain);
+    free(chain);
 #endif
     return NULL;
 }
@@ -176,6 +190,7 @@ tls_connection_t* open_remote_connection(const char* hostname, i32 portno, void*
 	unsigned char buf[1024];
 	const char *pers = "ssl_client1";
 	tls_connection_t* connection = (tls_connection_t*) alloced_mem_for_struct;
+	connection->use_tls = true;
 	connection->start_clock = get_clock();
 
 #if defined(MBEDTLS_DEBUG_C)
@@ -216,16 +231,9 @@ tls_connection_t* open_remote_connection(const char* hostname, i32 portno, void*
         memcpy(&connection->cacert, chain, sizeof(mbedtls_x509_crt));
         free(chain);
     } else {
-        ret = mbedtls_x509_crt_parse( &connection->cacert, (const unsigned char *) mbedtls_test_cas_pem,
-                                      mbedtls_test_cas_pem_len );
-        if( ret < 0 )
-        {
-            console_print_verbose( " failed\n  !  mbedtls_x509_crt_parse returned -0x%x\n\n", (unsigned int) -ret );
-            char error_buf[100];
-            mbedtls_strerror( ret, error_buf, 100 );
-            console_print_error("Last error was: %d - %s\n\n", ret, error_buf );
-            goto exit;
-        }
+        console_print_error(" failed\n  ! no trusted operating-system CA certificates could be loaded\n");
+        ret = MBEDTLS_ERR_X509_FILE_IO_ERROR;
+        goto exit;
     }
 
 	console_print_verbose( " ok (%d skipped)\n", ret );
@@ -263,9 +271,8 @@ tls_connection_t* open_remote_connection(const char* hostname, i32 portno, void*
 
 	console_print_verbose( " ok\n" );
 
-	/* OPTIONAL is not optimal for security,
-	 * but makes interop easier in this simplified example */
-	mbedtls_ssl_conf_authmode( &connection->conf, MBEDTLS_SSL_VERIFY_OPTIONAL );
+	/* Remote slide data and credentials must never cross an unverified TLS connection. */
+	mbedtls_ssl_conf_authmode( &connection->conf, MBEDTLS_SSL_VERIFY_REQUIRED );
 	mbedtls_ssl_conf_ca_chain( &connection->conf, &connection->cacert, NULL );
 	mbedtls_ssl_conf_rng( &connection->conf, mbedtls_ctr_drbg_random, &connection->ctr_drbg );
 	mbedtls_ssl_conf_dbg( &connection->conf, my_debug, stdout );
@@ -350,15 +357,19 @@ tls_connection_t* open_remote_connection(const char* hostname, i32 portno, void*
 }
 
 float close_remote_connection(tls_connection_t* connection) {
-	mbedtls_ssl_close_notify( &connection->ssl );
+	if (connection->use_tls) {
+		mbedtls_ssl_close_notify(&connection->ssl);
+	}
 
 	mbedtls_net_free( &connection->server_fd );
 
-	mbedtls_x509_crt_free( &connection->cacert );
-	mbedtls_ssl_free( &connection->ssl );
-	mbedtls_ssl_config_free( &connection->conf );
-	mbedtls_ctr_drbg_free( &connection->ctr_drbg );
-	mbedtls_entropy_free( &connection->entropy );
+	if (connection->use_tls) {
+		mbedtls_x509_crt_free(&connection->cacert);
+		mbedtls_ssl_free(&connection->ssl);
+		mbedtls_ssl_config_free(&connection->conf);
+		mbedtls_ctr_drbg_free(&connection->ctr_drbg);
+		mbedtls_entropy_free(&connection->entropy);
+	}
 
 	float seconds_elapsed = get_seconds_elapsed(connection->start_clock, get_clock());
 	return seconds_elapsed;
@@ -626,13 +637,56 @@ static i32 header_field_callback(http_parser *parser, const char *p, size_t len)
 typedef struct http_response_parse_context_t {
     http_response_t* response;
     bool message_complete;
+    bool last_was_header_value;
+    char header_name[128];
+    size_t header_name_length;
+    char header_value[512];
+    size_t header_value_length;
 } http_response_parse_context_t;
+
+static void http_response_commit_header(http_response_parse_context_t* context) {
+    context->header_name[context->header_name_length] = '\0';
+    context->header_value[context->header_value_length] = '\0';
+    if (strcasecmp(context->header_name, "Content-Type") == 0) {
+        copy_cstring(context->response->content_type, context->header_value,
+                     sizeof(context->response->content_type));
+    }
+    context->header_name_length = 0;
+    context->header_value_length = 0;
+}
 
 static i32 body_callback(http_parser *parser, const char *p, size_t len) {
     http_response_parse_context_t* context = (http_response_parse_context_t*)parser->data;
+    if (context->last_was_header_value) {
+        http_response_commit_header(context);
+        context->last_was_header_value = false;
+    }
     http_response_t* response = context->response;
     memrw_push_back(&response->buffer, (void*)p, len);
     response->content_length += len;
+    return 0;
+}
+
+static i32 response_header_field_callback(http_parser* parser, const char* p, size_t len) {
+    http_response_parse_context_t* context = (http_response_parse_context_t*)parser->data;
+    if (context->last_was_header_value) {
+        http_response_commit_header(context);
+        context->last_was_header_value = false;
+    }
+    size_t available = sizeof(context->header_name) - 1 - context->header_name_length;
+    size_t copy_length = ATMOST(len, available);
+    memcpy(context->header_name + context->header_name_length, p, copy_length);
+    context->header_name_length += copy_length;
+    return 0;
+}
+
+static i32 response_header_value_callback(http_parser* parser, const char* p, size_t len) {
+    http_response_parse_context_t* context = (http_response_parse_context_t*)parser->data;
+    size_t available = sizeof(context->header_value) - 1 - context->header_value_length;
+    size_t copy_length = ATMOST(len, available);
+    memcpy(context->header_value + context->header_value_length, p, copy_length);
+    context->header_value_length += copy_length;
+    context->last_was_header_value = true;
     return 0;
 }
 
@@ -664,6 +718,36 @@ static i32 remote_build_get_request(char* request, size_t request_size, const ch
                     close_after_request ? "close" : "keep-alive", host);
 }
 
+static i32 remote_build_get_request_with_headers(char* request, size_t request_size,
+                                                 const char* host, const char* path,
+                                                 const char* accept, const char* extra_headers,
+                                                 bool close_after_request) {
+    return snprintf(request, request_size,
+                    "GET %s HTTP/1.1\r\n"
+                    "Accept: %s\r\n"
+                    "%s"
+                    "Connection: %s\r\n"
+                    "Host: %s\r\n\r\n",
+                    path, accept ? accept : "*/*", extra_headers ? extra_headers : "",
+                    close_after_request ? "close" : "keep-alive", host);
+}
+
+static tls_connection_t* remote_connection_open_plain(const char* hostname, i32 portno) {
+    tls_connection_t* connection = (tls_connection_t*)calloc(1, sizeof(tls_connection_t));
+    if (!connection) return NULL;
+    connection->start_clock = get_clock();
+    connection->use_tls = false;
+    mbedtls_net_init(&connection->server_fd);
+    char port[32];
+    snprintf(port, sizeof(port), "%d", portno);
+    if (mbedtls_net_connect(&connection->server_fd, hostname, port, MBEDTLS_NET_PROTO_TCP) != 0) {
+        mbedtls_net_free(&connection->server_fd);
+        free(connection);
+        return NULL;
+    }
+    return connection;
+}
+
 tls_connection_t* remote_connection_open(const char* hostname, i32 portno) {
     tls_connection_t* connection = (tls_connection_t*)calloc(1, sizeof(tls_connection_t));
     if (!connection) return NULL;
@@ -674,25 +758,42 @@ tls_connection_t* remote_connection_open(const char* hostname, i32 portno) {
     return connection;
 }
 
+tls_connection_t* remote_connection_open_http(const char* hostname, i32 portno, bool use_tls) {
+    return use_tls ? remote_connection_open(hostname, portno)
+                   : remote_connection_open_plain(hostname, portno);
+}
+
 void remote_connection_close_and_free(tls_connection_t* connection) {
     if (!connection) return;
     close_remote_connection(connection);
     free(connection);
 }
 
-http_response_t* remote_connection_request(tls_connection_t* connection, const char* host, const char* path, const char* api_token, const char* cookie_header, bool close_after_request) {
+http_response_t* remote_connection_request_with_headers(tls_connection_t* connection, const char* host,
+                                                        const char* path, const char* accept,
+                                                        const char* extra_headers,
+                                                        bool close_after_request) {
     ASSERT(connection);
 
     char request[4096];
-    i32 request_len = remote_build_get_request(request, sizeof(request), host, path, api_token, cookie_header, close_after_request);
+    i32 request_len = remote_build_get_request_with_headers(request, sizeof(request), host, path,
+                                                            accept, extra_headers, close_after_request);
     if (request_len <= 0 || request_len >= sizeof(request)) {
         return NULL;
     }
 
     i32 ret = 1;
-    while ((ret = mbedtls_ssl_write(&connection->ssl, (const u8*)request, request_len)) <= 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            console_print_error("remote_connection_request(): mbedtls_ssl_write returned %d\n", ret);
+    i32 bytes_written = 0;
+    while (bytes_written < request_len) {
+        ret = connection->use_tls
+              ? mbedtls_ssl_write(&connection->ssl, (const u8*)request + bytes_written,
+                                  request_len - bytes_written)
+              : mbedtls_net_send(&connection->server_fd, (const u8*)request + bytes_written,
+                                 request_len - bytes_written);
+        if (ret > 0) {
+            bytes_written += ret;
+        } else if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            console_print_error("remote_connection_request(): network write returned %d\n", ret);
             return NULL;
         }
     }
@@ -704,7 +805,8 @@ http_response_t* remote_connection_request(tls_connection_t* connection, const c
     context.response = response;
 
     http_parser_settings settings = {};
-    settings.on_header_field = header_field_callback;
+    settings.on_header_field = response_header_field_callback;
+    settings.on_header_value = response_header_value_callback;
     settings.on_body = body_callback;
     settings.on_message_complete = message_complete_callback;
 
@@ -714,7 +816,9 @@ http_response_t* remote_connection_request(tls_connection_t* connection, const c
 
     u8 read_buffer[KILOBYTES(16)];
     while (!context.message_complete) {
-        ret = mbedtls_ssl_read(&connection->ssl, read_buffer, sizeof(read_buffer));
+        ret = connection->use_tls
+              ? mbedtls_ssl_read(&connection->ssl, read_buffer, sizeof(read_buffer))
+              : mbedtls_net_recv(&connection->server_fd, read_buffer, sizeof(read_buffer));
 
         if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
             continue;
@@ -742,6 +846,20 @@ http_response_t* remote_connection_request(tls_connection_t* connection, const c
     return response;
 }
 
+http_response_t* remote_connection_request(tls_connection_t* connection, const char* host, const char* path, const char* api_token, const char* cookie_header, bool close_after_request) {
+    char headers[6144] = "";
+    size_t used = 0;
+    if (api_token && api_token[0]) {
+        used += snprintf(headers + used, sizeof(headers) - used,
+                         "Authorization: Bearer %s\r\n", api_token);
+    }
+    if (cookie_header && cookie_header[0] && used < sizeof(headers)) {
+        snprintf(headers + used, sizeof(headers) - used, "Cookie: %s\r\n", cookie_header);
+    }
+    return remote_connection_request_with_headers(connection, host, path,
+                                                  "application/json,image/jpeg,*/*",
+                                                  headers, close_after_request);
+}
 
 http_response_t* open_remote_uri_with_extra_headers(const char *uri, const char* api_token, const char* cookie_header) {
 

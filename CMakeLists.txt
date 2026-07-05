@@ -350,6 +350,7 @@ set(VIEWER_SOURCE_FILES
         core/annotation_geojson.cpp
         core/ini.c
         core/remote.c
+        core/dicomweb_client.c
         core/slide_score.c
         core/image_registration.c
         imgui/imgui.cpp

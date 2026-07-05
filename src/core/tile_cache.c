@@ -48,7 +48,7 @@ static tile_cache_policy_t tile_cache_make_policy(image_t* image) {
 	result.discard_stale_before_decode = true;
 	result.discard_stale_before_upload = true;
 
-	if (image->backend == IMAGE_BACKEND_SLIDE_SCORE) {
+	if (image->backend == IMAGE_BACKEND_SLIDE_SCORE || image->backend == IMAGE_BACKEND_DICOMWEB) {
 		result.max_inflight_tiles = 32;
 		result.max_submit_per_tick = 8;
 		result.batch_size = 1;

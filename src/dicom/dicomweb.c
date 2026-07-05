@@ -156,6 +156,35 @@ bool dicomweb_parse_instance_metadata(const char* json, size_t json_size,
 	return valid;
 }
 
+i32 dicomweb_parse_instance_refs(const char* json, size_t json_size,
+                                 dicomweb_instance_ref_t* out, i32 capacity) {
+	if (!json || !json_size || !out || capacity <= 0) return 0;
+	struct json_value_s* root = json_parse_ex(json, json_size, json_parse_flags_default,
+	                                          dicomweb_json_alloc, NULL, NULL);
+	if (!root || root->type != json_type_array) {
+		if (root) free(root);
+		return 0;
+	}
+	i32 count = 0;
+	struct json_array_s* array = (struct json_array_s*)root->payload;
+	for (struct json_array_element_s* element = array->start;
+	     element && count < capacity; element = element->next) {
+		if (element->value->type != json_type_object) continue;
+		struct json_object_s* dataset = (struct json_object_s*)element->value->payload;
+		dicomweb_instance_ref_t ref = {0};
+		if (copy_tag_string(dataset, "0020000D", ref.study_instance_uid,
+		                    sizeof(ref.study_instance_uid)) &&
+		    copy_tag_string(dataset, "0020000E", ref.series_instance_uid,
+		                    sizeof(ref.series_instance_uid)) &&
+		    copy_tag_string(dataset, "00080018", ref.sop_instance_uid,
+		                    sizeof(ref.sop_instance_uid))) {
+			out[count++] = ref;
+		}
+	}
+	free(root);
+	return count;
+}
+
 static const u8* find_bytes(const u8* haystack, size_t haystack_size,
                             const char* needle, size_t needle_size) {
 	if (!needle_size || needle_size > haystack_size) return NULL;

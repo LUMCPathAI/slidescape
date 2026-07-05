@@ -29,6 +29,7 @@
 #include "isyntax.h"
 #include "libisyntax.h"
 #include "dicom.h"
+#include "dicomweb.h"
 #include "slide_score.h"
 
 #ifdef __cplusplus
@@ -107,6 +108,7 @@ typedef enum {
     IMAGE_BACKEND_DICOM,
     IMAGE_BACKEND_MRXS,
     IMAGE_BACKEND_SLIDE_SCORE,
+    IMAGE_BACKEND_DICOMWEB,
 } image_backend_enum;
 
 typedef struct tile_t {
@@ -177,6 +179,7 @@ typedef struct image_t {
         dicom_series_t dicom;
         mrxs_t mrxs;
         slide_score_remote_image_t slide_score;
+        dicomweb_remote_image_t dicomweb;
     };
     i32 level_count;
     u32 tile_width;
@@ -226,6 +229,7 @@ bool init_image_from_tiff(image_t* image, tiff_t tiff, bool is_overlay, image_t*
 u8* decode_associated_image_from_isyntax(isyntax_t* isyntax, isyntax_image_t* image);
 bool init_image_from_isyntax(image_t* image, isyntax_t* isyntax, bool is_overlay);
 bool init_image_from_dicom(image_t* image, dicom_series_t* dicom, bool is_overlay);
+bool init_image_from_dicomweb(image_t* image, const dicomweb_remote_image_t* remote, bool is_overlay);
 bool init_image_from_mrxs(image_t* image, mrxs_t* mrxs, bool is_overlay);
 bool init_image_from_stbi(image_t* image, simple_image_t* simple, bool is_overlay);
 void init_image_from_openslide(image_t* image, wsi_t* wsi, bool is_overlay);

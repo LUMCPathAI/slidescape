@@ -68,3 +68,21 @@ TEST_CASE("DICOMweb builds portable WADO-RS paths") {
 	CHECK_FALSE(dicomweb_build_frame_path(path, sizeof(path), "/dicom-web/",
 	                                      "study", "series", "instance", 0));
 }
+
+TEST_CASE("DICOMweb parses QIDO instance references") {
+	const char* json =
+		"[{"
+		"\"0020000D\":{\"vr\":\"UI\",\"Value\":[\"study\"]},"
+		"\"0020000E\":{\"vr\":\"UI\",\"Value\":[\"series\"]},"
+		"\"00080018\":{\"vr\":\"UI\",\"Value\":[\"instance-1\"]}"
+		"},{"
+		"\"0020000D\":{\"vr\":\"UI\",\"Value\":[\"study\"]},"
+		"\"0020000E\":{\"vr\":\"UI\",\"Value\":[\"series\"]},"
+		"\"00080018\":{\"vr\":\"UI\",\"Value\":[\"instance-2\"]}"
+		"}]";
+	dicomweb_instance_ref_t refs[2] = {};
+	REQUIRE(dicomweb_parse_instance_refs(json, strlen(json), refs, COUNT(refs)) == 2);
+	CHECK(strcmp(refs[0].study_instance_uid, "study") == 0);
+	CHECK(strcmp(refs[0].series_instance_uid, "series") == 0);
+	CHECK(strcmp(refs[1].sop_instance_uid, "instance-2") == 0);
+}

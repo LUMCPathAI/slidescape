@@ -41,8 +41,30 @@ typedef struct dicomweb_frame_t {
 	char transfer_syntax_uid[65];
 } dicomweb_frame_t;
 
+#define DICOMWEB_MAX_INSTANCES 16
+
+typedef struct dicomweb_instance_ref_t {
+	char study_instance_uid[65];
+	char series_instance_uid[65];
+	char sop_instance_uid[65];
+} dicomweb_instance_ref_t;
+
+typedef struct dicomweb_remote_image_t {
+	char hostname[256];
+	char root[512];
+	char authorization_header[6144];
+	char study_instance_uid[65];
+	char series_instance_uid[65];
+	i32 port;
+	bool use_tls;
+	i32 instance_count;
+	dicomweb_instance_metadata_t instances[DICOMWEB_MAX_INSTANCES];
+} dicomweb_remote_image_t;
+
 bool dicomweb_parse_instance_metadata(const char* json, size_t json_size,
                                       dicomweb_instance_metadata_t* out);
+i32 dicomweb_parse_instance_refs(const char* json, size_t json_size,
+                                 dicomweb_instance_ref_t* out, i32 capacity);
 bool dicomweb_parse_multipart_frame(const u8* body, size_t body_size,
                                     const char* response_content_type,
                                     dicomweb_frame_t* out);

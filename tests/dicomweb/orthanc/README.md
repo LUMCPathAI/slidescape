@@ -64,8 +64,35 @@ cmake --build ../../../cmake-build-debug --target dicomweb_probe
 ```
 
 This probe validates Slidescape's DICOM JSON and multipart parsers. Its HTTP
-requests still use `curl`; native Slidescape HTTP/TLS transport integration is
-the next implementation step.
+requests use `curl`, independently of the native viewer transport.
+
+## Open In Slidescape
+
+Upload all desired pyramid instances, then choose **File → Open URI** and enter
+the series URL:
+
+```text
+http://127.0.0.1:8042/dicom-web/studies/{StudyInstanceUID}/series/{SeriesInstanceUID}
+```
+
+Enter the local development username and password shown above. Slidescape allows
+unencrypted DICOMweb only for a loopback host; non-local archives must use
+verified HTTPS.
+
+For command-line development, credentials can be supplied without putting them
+in the URL:
+
+```sh
+SLIDESCAPE_DICOMWEB_USERNAME=slidescape \
+SLIDESCAPE_DICOMWEB_PASSWORD=slidescape-local \
+./Slidescape.app/Contents/MacOS/Slidescape \
+  "http://127.0.0.1:8042/dicom-web/studies/{StudyInstanceUID}/series/{SeriesInstanceUID}"
+```
+
+The current viewer slice supports `TILED_FULL` brightfield VOLUME instances with
+JPEG Baseline frames. It discovers all instances in the series, builds the
+pyramid from their Total Pixel Matrix dimensions, and retrieves native frames
+on demand.
 
 ## Inspect
 

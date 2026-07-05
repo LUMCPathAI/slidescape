@@ -50,6 +50,7 @@
 #include "dicom_wsi.h"
 #include "jpeg_decoder.h"
 #include "remote.h"
+#include "dicomweb_client.h"
 #include "gui.h"
 #include "annotation.h"
 #include "ini.h"
@@ -199,6 +200,7 @@ void init_app_state(app_state_t* app_state, app_command_t command) {
 
 	tile_loader_set_remote_tiff_batch_callback(tiff_load_tile_batch_func);
 	tile_loader_set_slide_score_batch_callback(slide_score_load_tile_batch_func);
+	tile_loader_set_dicomweb_batch_callback(dicomweb_load_tile_batch_func);
 
 	app_state->command = command;
 	app_state->headless = command.headless;

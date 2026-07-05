@@ -112,7 +112,7 @@ extern float global_progress_bar_test_progress;
 extern char remote_hostname[64] INIT(= "localhost");
 extern char remote_port[64] INIT(= "2000");
 extern char remote_filename[128] INIT(= "sample.tiff");
-extern char remote_uri[256];
+extern char remote_uri[1024];
 #ifdef __cplusplus
 extern ImFont* global_main_font;
 extern ImFont* global_fixed_width_font;

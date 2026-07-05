@@ -67,17 +67,28 @@ As of 2026-07-05:
   native frame from `multipart/related`;
 - unit tests cover that protocol module, and `dicomweb_probe` has consumed live
   Orthanc metadata and a JPEG Baseline frame through the local harness;
-- the small RGB WSI and two companion instances from one UMCU WSI series have
+- a native DICOMweb viewer backend now discovers a series through QIDO-RS,
+  retrieves instance metadata, constructs a remote pyramid, and loads native
+  WADO-RS frames through the existing tile cache;
+- the native backend was interactively verified against the complete three-
+  instance local Orthanc UMCU pyramid: initial display, missing intermediate
+  levels, and zoom-driven frame loading worked;
+- the transport supports Basic authentication headers, verified HTTPS, and
+  unencrypted HTTP only for loopback development;
+- the small RGB WSI and three instances from one UMCU WSI series have
   passed upload, discovery, metadata, and native frame retrieval against
   `orthancteam/orthanc:26.6.1`;
-- Orthanc groups the two tested UMCU instances into the same study and series;
+- Orthanc groups the three tested UMCU instances into the same study and series;
 - the extensionless `I5_HE` fixture is readable by Slidescape but Orthanc rejects
   it because required Study, Series, or SOP Instance UIDs are absent; it is
   therefore useful as a tolerant-reader regression fixture, but is not currently
   a valid STOW-RS archive-ingestion fixture;
-- native Slidescape HTTP/auth transport and viewer tile-scheduler integration
-  have not yet been implemented; the live protocol probe currently uses curl
-  only as its transport adapter.
+- the current interactive slice is intentionally limited to `TILED_FULL`,
+  JPEG Baseline, brightfield VOLUME instances, one optical path, and one focal
+  plane;
+- the next client work is connection reuse, OAuth/OIDC bearer-token acquisition,
+  sparse frame mapping, associated images, cancellation/timeouts, and dcm4chee
+  interoperability.
 
 This establishes the local-file reader as a regression oracle for the future
 DICOMweb backend. Orthanc now covers the first half of M0; a pinned dcm4chee

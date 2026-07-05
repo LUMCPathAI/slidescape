@@ -43,6 +43,8 @@ const char* get_image_backend_name(image_t* image) {
         result = "MRXS";
     } else if (image->backend == IMAGE_BACKEND_SLIDE_SCORE) {
         result = "Slide Score";
+    } else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
+        result = "DICOMweb";
     } else if (image->backend == IMAGE_BACKEND_STBI) {
         result = "stb_image";
     }
@@ -64,6 +66,8 @@ const char* get_image_descriptive_type_name(image_t* image) {
             result = "WSI (MRXS)";
         } else if (image->backend == IMAGE_BACKEND_SLIDE_SCORE) {
             result = "WSI (Slide Score)";
+        } else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
+            result = "WSI (DICOMweb)";
         } else if (image->backend == IMAGE_BACKEND_STBI) {
             result = "Simple image";
         }
@@ -686,6 +690,85 @@ bool init_image_from_dicom(image_t* image, dicom_series_t* dicom, bool is_overla
     return image->is_valid;
 }
 
+bool init_image_from_dicomweb(image_t* image, const dicomweb_remote_image_t* remote, bool is_overlay) {
+	(void)is_overlay;
+	if (!image || !remote || remote->instance_count <= 0) return false;
+	const dicomweb_instance_metadata_t* base = remote->instances;
+	if (!base->rows || !base->columns || !base->total_pixel_matrix_columns ||
+	    !base->total_pixel_matrix_rows || !base->is_tiled_full) return false;
+
+	image->type = IMAGE_TYPE_WSI;
+	image->backend = IMAGE_BACKEND_DICOMWEB;
+	image->dicomweb = *remote;
+	image->is_local = false;
+	image->is_freshly_loaded = true;
+	image->mpp_x = base->is_mpp_known ? base->mpp_x : 1.0f;
+	image->mpp_y = base->is_mpp_known ? base->mpp_y : 1.0f;
+	image->is_mpp_known = base->is_mpp_known;
+	image->tile_width = base->columns;
+	image->tile_height = base->rows;
+	image->width_in_pixels = base->total_pixel_matrix_columns;
+	image->height_in_pixels = base->total_pixel_matrix_rows;
+	image->width_in_um = image->width_in_pixels * image->mpp_x;
+	image->height_in_um = image->height_in_pixels * image->mpp_y;
+	image->clip_rects[0] = RECT2F(0.0f, 0.0f, image->width_in_um, image->height_in_um);
+	image->clip_rect_count = 1;
+	snprintf(image->name, sizeof(image->name), "DICOMweb %.64s", remote->series_instance_uid);
+	snprintf(image->directory, sizeof(image->directory), "%s://%s:%d%s",
+	         remote->use_tls ? "https" : "http", remote->hostname, remote->port, remote->root);
+
+	i32 max_level = 0;
+	for (i32 i = 0; i < remote->instance_count; ++i) {
+		const dicomweb_instance_metadata_t* instance = remote->instances + i;
+		double ratio = (double)base->total_pixel_matrix_columns /
+		               (double)instance->total_pixel_matrix_columns;
+		i32 level = (i32)floor(log2(ratio) + 0.5);
+		if (level >= 0 && level < IMAGE_PYRAMID_MAX_LEVELS) max_level = MAX(max_level, level);
+	}
+	image->level_count = max_level + 1;
+	for (i32 level = 0; level < image->level_count; ++level) {
+		level_image_t* level_image = image->level_images + level;
+		level_image->downsample_factor = exp2f((float)level);
+		level_image->tile_width = image->tile_width;
+		level_image->tile_height = image->tile_height;
+		level_image->um_per_pixel_x = image->mpp_x * level_image->downsample_factor;
+		level_image->um_per_pixel_y = image->mpp_y * level_image->downsample_factor;
+		level_image->x_tile_side_in_um = level_image->um_per_pixel_x * image->tile_width;
+		level_image->y_tile_side_in_um = level_image->um_per_pixel_y * image->tile_height;
+		level_image->pyramid_image_index = -1;
+	}
+	for (i32 i = 0; i < remote->instance_count; ++i) {
+		const dicomweb_instance_metadata_t* instance = remote->instances + i;
+		if (strcmp(instance->image_flavor, "VOLUME") != 0 || !instance->is_tiled_full ||
+		    instance->rows != image->tile_height || instance->columns != image->tile_width) continue;
+		double ratio = (double)base->total_pixel_matrix_columns /
+		               (double)instance->total_pixel_matrix_columns;
+		i32 level = (i32)floor(log2(ratio) + 0.5);
+		if (level < 0 || level >= image->level_count) continue;
+		level_image_t* level_image = image->level_images + level;
+		level_image->exists = true;
+		level_image->pyramid_image_index = i;
+		level_image->width_in_pixels = instance->total_pixel_matrix_columns;
+		level_image->height_in_pixels = instance->total_pixel_matrix_rows;
+		level_image->width_in_tiles = (instance->total_pixel_matrix_columns + instance->columns - 1) /
+		                              instance->columns;
+		level_image->height_in_tiles = (instance->total_pixel_matrix_rows + instance->rows - 1) /
+		                               instance->rows;
+		level_image->tile_count = level_image->width_in_tiles * level_image->height_in_tiles;
+		if ((i64)level_image->tile_count != instance->number_of_frames) return false;
+		level_image->tiles = (tile_t*)calloc(level_image->tile_count, sizeof(tile_t));
+		if (!level_image->tiles) return false;
+		for (i32 tile_index = 0; tile_index < level_image->tile_count; ++tile_index) {
+			tile_t* tile = level_image->tiles + tile_index;
+			tile->tile_index = tile_index;
+			tile->tile_x = tile_index % level_image->width_in_tiles;
+			tile->tile_y = tile_index / level_image->width_in_tiles;
+		}
+	}
+	image->is_valid = image->level_images[0].exists;
+	return image->is_valid;
+}
+
 bool init_image_from_mrxs(image_t* image, mrxs_t* mrxs, bool is_overlay) {
 	image->type = IMAGE_TYPE_WSI;
 	image->backend = IMAGE_BACKEND_MRXS;
@@ -1142,6 +1225,7 @@ bool image_read_region(image_t* image, i32 level, i32 x, i32 y, i32 w, i32 h, vo
         } break;
         case IMAGE_BACKEND_TIFF:
         case IMAGE_BACKEND_DICOM:
+        case IMAGE_BACKEND_DICOMWEB:
         case IMAGE_BACKEND_MRXS:
         case IMAGE_BACKEND_STBI: {
 			level_image_t* level_image = image->level_images + level;
@@ -1555,6 +1639,9 @@ void image_destroy(image_t* image) {
 				mrxs_destroy(&image->mrxs);
 			} else if (image->backend == IMAGE_BACKEND_SLIDE_SCORE) {
 				DUMMY_STATEMENT;
+			} else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
+				memset(image->dicomweb.authorization_header, 0,
+				       sizeof(image->dicomweb.authorization_header));
 			} else if (image->backend == IMAGE_BACKEND_STBI) {
 				if (image->simple.pixels) {
 					stbi_image_free(image->simple.pixels);

@@ -25,6 +25,7 @@
 
 static work_queue_callback_t* remote_tiff_load_tile_batch_func;
 static work_queue_callback_t* slide_score_load_tile_batch_func;
+static work_queue_callback_t* dicomweb_load_tile_batch_func;
 
 void tile_loader_set_remote_tiff_batch_callback(work_queue_callback_t* callback) {
 	remote_tiff_load_tile_batch_func = callback;
@@ -32,6 +33,10 @@ void tile_loader_set_remote_tiff_batch_callback(work_queue_callback_t* callback)
 
 void tile_loader_set_slide_score_batch_callback(work_queue_callback_t* callback) {
 	slide_score_load_tile_batch_func = callback;
+}
+
+void tile_loader_set_dicomweb_batch_callback(work_queue_callback_t* callback) {
+	dicomweb_load_tile_batch_func = callback;
 }
 
 static void tile_loader_get_tile_xy(image_t* image, i32 level, i32 tile_index, i32* out_tile_x, i32* out_tile_y) {
@@ -58,7 +63,9 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 	i32 tile_loads_submitted = 0;
 
 	if (tiles_to_load > 0) {
-		bool use_remote_batch = (image->backend == IMAGE_BACKEND_TIFF && image->tiff.is_remote) || image->backend == IMAGE_BACKEND_SLIDE_SCORE;
+		bool use_remote_batch = (image->backend == IMAGE_BACKEND_TIFF && image->tiff.is_remote) ||
+		                        image->backend == IMAGE_BACKEND_SLIDE_SCORE ||
+		                        image->backend == IMAGE_BACKEND_DICOMWEB;
 		if (use_remote_batch) {
 			work_queue_callback_t* load_func = NULL;
 			u32 intermittent_interval = 1;
@@ -67,6 +74,8 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 				intermittent_interval = 5; // reduce load on remote server; can be tweaked
 			} else if (image->backend == IMAGE_BACKEND_SLIDE_SCORE) {
 				load_func = slide_score_load_tile_batch_func;
+			} else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
+				load_func = dicomweb_load_tile_batch_func;
 			}
 
 			if (!load_func) {
