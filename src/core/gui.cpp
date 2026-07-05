@@ -48,28 +48,58 @@ static char imgui_ini_filename[512];
 static void draw_dicom_slides_window(app_state_t* app_state) {
 	if (!show_dicom_slides_window || arrlen(app_state->loaded_images) == 0) return;
 	image_t* image = app_state->loaded_images[0];
-	if (image->backend != IMAGE_BACKEND_DICOM || arrlen(image->dicom.slides) <= 1) {
+	bool is_local_dicom = image->backend == IMAGE_BACKEND_DICOM;
+	bool is_dicomweb = image->backend == IMAGE_BACKEND_DICOMWEB;
+	i32 slide_count = is_local_dicom ? arrlen(image->dicom.slides)
+	                                : is_dicomweb ? image->dicomweb.available_series_count : 0;
+	if (slide_count <= 1) {
 		show_dicom_slides_window = false;
 		return;
 	}
 
 	ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_FirstUseEver);
 	if (ImGui::Begin("DICOM slides", &show_dicom_slides_window, ImGuiWindowFlags_AlwaysAutoResize)) {
-		ImGui::TextUnformatted("Select a slide from this directory:");
+		ImGui::TextUnformatted(is_dicomweb ? "Select a slide series from this study:"
+		                                  : "Select a slide from this directory:");
 		ImGui::Separator();
-		for (i32 i = 0; i < arrlen(image->dicom.slides); ++i) {
-			dicom_slide_t* slide = image->dicom.slides + i;
-			const char* label = one_past_last_slash(slide->representative_filename,
-			                                       strlen(slide->representative_filename));
-			bool selected = i == image->dicom.selected_slide_index;
+		for (i32 i = 0; i < slide_count; ++i) {
+			dicom_slide_t* slide = is_local_dicom ? image->dicom.slides + i : NULL;
+			dicomweb_series_ref_t* remote_series =
+				is_dicomweb ? image->dicomweb.available_series + i : NULL;
+			char remote_label[256];
+			const char* label = NULL;
+			if (is_local_dicom) {
+				label = one_past_last_slash(slide->representative_filename,
+				                           strlen(slide->representative_filename));
+			} else {
+				const char* primary = remote_series->series_number[0]
+				                      ? remote_series->series_number
+				                      : remote_series->description[0]
+				                        ? remote_series->description
+				                        : remote_series->series_instance_uid;
+				snprintf(remote_label, sizeof(remote_label), "%s%s%s##remote_series_%d",
+				         primary,
+				         remote_series->description[0] ? " - " : "",
+				         remote_series->description[0] &&
+				         strcmp(primary, remote_series->description) != 0
+				         ? remote_series->description : "", i);
+				label = remote_label;
+			}
+			bool selected = is_local_dicom ? i == image->dicom.selected_slide_index
+			                              : i == image->dicomweb.selected_series_index;
 			if (ImGui::Selectable(label, selected) && !selected) {
-				char filename[512];
-				copy_cstring(filename, slide->representative_filename, sizeof(filename));
-				load_generic_file(app_state, filename, FILETYPE_HINT_BASE_IMAGE);
+				if (is_local_dicom) {
+					char filename[512];
+					copy_cstring(filename, slide->representative_filename, sizeof(filename));
+					load_generic_file(app_state, filename, FILETYPE_HINT_BASE_IMAGE);
+				} else {
+					dicomweb_open_related_series(app_state, image, i);
+				}
 				break;
 			}
 			if (ImGui::IsItemHovered()) {
-				ImGui::SetTooltip("%s", slide->series_instance_uid.value);
+				ImGui::SetTooltip("%s", is_local_dicom ? slide->series_instance_uid.value
+				                                      : remote_series->series_instance_uid);
 			}
 		}
 	}
@@ -413,8 +443,10 @@ static void gui_draw_main_menu_bar(app_state_t* app_state) {
 			if (ImGui::MenuItem("Image options...", NULL, &show_image_options_window)) {}
 			if (ImGui::MenuItem("Layers...", "L", &show_layers_window)) {}
 			bool has_dicom_slides = has_image_loaded &&
-			                        app_state->loaded_images[0]->backend == IMAGE_BACKEND_DICOM &&
-			                        arrlen(app_state->loaded_images[0]->dicom.slides) > 1;
+			                        ((app_state->loaded_images[0]->backend == IMAGE_BACKEND_DICOM &&
+			                          arrlen(app_state->loaded_images[0]->dicom.slides) > 1) ||
+			                         (app_state->loaded_images[0]->backend == IMAGE_BACKEND_DICOMWEB &&
+			                          app_state->loaded_images[0]->dicomweb.available_series_count > 1));
 			if (ImGui::MenuItem("DICOM slides...", NULL, &show_dicom_slides_window, has_dicom_slides)) {}
 			ImGui::Separator();
 			bool* show_scale_bar = has_image_loaded ? &scene->scale_bar.enabled : NULL;
@@ -1101,7 +1133,7 @@ void save_changes_modal(app_state_t* app_state, annotation_set_t* annotation_set
 
 void gui_draw_open_uri_window(app_state_t* app_state) {
     ImGui::SetNextWindowPos(ImVec2(120, 100), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(806, 382), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(806, 650), ImGuiCond_FirstUseEver);
 
     ImGui::Begin("Open URI", &show_open_uri_window);
 
@@ -1143,10 +1175,101 @@ void gui_draw_open_uri_window(app_state_t* app_state) {
     static bool pressed_connect;
     static char dicomweb_username[256] = "";
     static char dicomweb_password[256] = "";
+    static bool dicomweb_credentials_initialized;
+    if (!dicomweb_credentials_initialized) {
+	    const char* username = app_state->command.dicomweb_username;
+	    const char* password = app_state->command.dicomweb_password;
+	    if (!username) username = getenv("SLIDESCAPE_DICOMWEB_USERNAME");
+	    if (!password) password = getenv("SLIDESCAPE_DICOMWEB_PASSWORD");
+	    if (username) copy_cstring(dicomweb_username, username, sizeof(dicomweb_username));
+	    if (password) copy_cstring(dicomweb_password, password, sizeof(dicomweb_password));
+	    dicomweb_credentials_initialized = true;
+    }
     if (ImGui::TreeNodeEx("DICOMweb authentication", ImGuiTreeNodeFlags_DefaultOpen)) {
 	    ImGui::InputText("Username##dicomweb", dicomweb_username, sizeof(dicomweb_username));
 	    ImGui::InputText("Password##dicomweb", dicomweb_password, sizeof(dicomweb_password),
 	                     ImGuiInputTextFlags_Password);
+	    ImGui::TreePop();
+    }
+    static dicomweb_study_ref_t studies[DICOMWEB_MAX_STUDIES];
+    static dicomweb_series_ref_t series[DICOMWEB_MAX_SERIES];
+    static dicomweb_instance_ref_t instances[DICOMWEB_MAX_INSTANCES];
+    static i32 study_count;
+    static i32 series_count;
+    static i32 instance_count;
+    static i32 selected_study = -1;
+    static i32 selected_series = -1;
+    if (ImGui::Button("Browse DICOMweb archive")) {
+	    study_count = dicomweb_query_studies(remote_uri, dicomweb_username, dicomweb_password,
+	                                         studies, COUNT(studies));
+	    pressed_connect = true;
+	    snprintf(open_uri_status, sizeof(open_uri_status), "%s", dicomweb_get_last_status());
+	    series_count = 0;
+	    instance_count = 0;
+	    selected_study = -1;
+	    selected_series = -1;
+    }
+    if (study_count > 0 && ImGui::TreeNodeEx("Archive browser", ImGuiTreeNodeFlags_DefaultOpen)) {
+	    ImGui::Columns(3, "dicomweb_browser_columns", true);
+	    ImGui::TextUnformatted("Studies");
+	    ImGui::NextColumn();
+	    ImGui::TextUnformatted("Series");
+	    ImGui::NextColumn();
+	    ImGui::TextUnformatted("Instances");
+	    ImGui::NextColumn();
+	    ImGui::Separator();
+	    for (i32 i = 0; i < study_count; ++i) {
+		    char label[256];
+		    snprintf(label, sizeof(label), "%s%s%s##study%d",
+		             studies[i].study_date,
+		             studies[i].description[0] ? " - " : "",
+		             studies[i].description[0] ? studies[i].description : studies[i].study_instance_uid, i);
+		    if (ImGui::Selectable(label, selected_study == i)) {
+			    selected_study = i;
+			    selected_series = -1;
+			    instance_count = 0;
+			    series_count = dicomweb_query_series(remote_uri, dicomweb_username,
+			                                          dicomweb_password,
+			                                          studies[i].study_instance_uid,
+			                                          series, COUNT(series));
+		    }
+		    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", studies[i].study_instance_uid);
+	    }
+	    ImGui::NextColumn();
+	    for (i32 i = 0; i < series_count; ++i) {
+		    char label[256];
+		    const char* detail = series[i].description[0] ? series[i].description
+		                                                 : series[i].series_instance_uid;
+		    snprintf(label, sizeof(label), "%s %s%s%s##series%d",
+		             series[i].modality,
+		             series[i].series_number,
+		             detail[0] ? " - " : "",
+		             detail, i);
+		    if (ImGui::Selectable(label, selected_series == i)) {
+			    selected_series = i;
+			    instance_count = dicomweb_query_instances(
+				    remote_uri, dicomweb_username, dicomweb_password,
+				    studies[selected_study].study_instance_uid,
+				    series[i].series_instance_uid, instances, COUNT(instances));
+		    }
+		    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", series[i].series_instance_uid);
+	    }
+	    ImGui::NextColumn();
+	    for (i32 i = 0; i < instance_count; ++i) {
+		    ImGui::TextWrapped("%s", instances[i].sop_instance_uid);
+	    }
+	    ImGui::Columns(1);
+	    if (selected_study >= 0 && selected_series >= 0 &&
+	        ImGui::Button("Open selected series")) {
+		    char series_url[1024];
+		    if (dicomweb_build_series_url(series_url, sizeof(series_url), remote_uri,
+		                                  studies[selected_study].study_instance_uid,
+		                                  series[selected_series].series_instance_uid)) {
+			    copy_cstring(remote_uri, series_url, sizeof(remote_uri));
+			    dicomweb_open_series(app_state, remote_uri, dicomweb_username, dicomweb_password);
+			    snprintf(open_uri_status, sizeof(open_uri_status), "%s", dicomweb_get_last_status());
+		    }
+	    }
 	    ImGui::TreePop();
     }
     if (entered || ImGui::Button("Connect")) {

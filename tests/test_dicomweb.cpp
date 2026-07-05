@@ -36,6 +36,11 @@ TEST_CASE("DICOMweb parses WSI DICOM JSON metadata") {
 	CHECK(metadata.is_mpp_known);
 	CHECK(metadata.mpp_x == doctest::Approx(8.005837f));
 	CHECK(metadata.mpp_y == doctest::Approx(8.005837f));
+	REQUIRE(metadata.frame_numbers != nullptr);
+	CHECK(metadata.frame_map_count == 160);
+	CHECK(metadata.frame_numbers[0] == 1);
+	CHECK(metadata.frame_numbers[159] == 160);
+	dicomweb_instance_metadata_destroy(&metadata);
 }
 
 TEST_CASE("DICOMweb extracts a native frame from multipart related") {
@@ -85,4 +90,57 @@ TEST_CASE("DICOMweb parses QIDO instance references") {
 	CHECK(strcmp(refs[0].study_instance_uid, "study") == 0);
 	CHECK(strcmp(refs[0].series_instance_uid, "series") == 0);
 	CHECK(strcmp(refs[1].sop_instance_uid, "instance-2") == 0);
+}
+
+TEST_CASE("DICOMweb maps column-major frames to raster tiles") {
+	const char* json =
+		"[{"
+		"\"00080008\":{\"vr\":\"CS\",\"Value\":[\"ORIGINAL\",\"PRIMARY\",\"VOLUME\"]},"
+		"\"00080018\":{\"vr\":\"UI\",\"Value\":[\"instance\"]},"
+		"\"0020000D\":{\"vr\":\"UI\",\"Value\":[\"study\"]},"
+		"\"0020000E\":{\"vr\":\"UI\",\"Value\":[\"series\"]},"
+		"\"00280008\":{\"vr\":\"IS\",\"Value\":[4]},"
+		"\"00280010\":{\"vr\":\"US\",\"Value\":[256]},"
+		"\"00280011\":{\"vr\":\"US\",\"Value\":[256]},"
+		"\"00480006\":{\"vr\":\"UL\",\"Value\":[512]},"
+		"\"00480007\":{\"vr\":\"UL\",\"Value\":[512]},"
+		"\"52009230\":{\"vr\":\"SQ\",\"Value\":["
+		"{\"0048021A\":{\"vr\":\"SQ\",\"Value\":[{\"0048021E\":{\"vr\":\"SL\",\"Value\":[1]},\"0048021F\":{\"vr\":\"SL\",\"Value\":[1]}}]}},"
+		"{\"0048021A\":{\"vr\":\"SQ\",\"Value\":[{\"0048021E\":{\"vr\":\"SL\",\"Value\":[1]},\"0048021F\":{\"vr\":\"SL\",\"Value\":[257]}}]}},"
+		"{\"0048021A\":{\"vr\":\"SQ\",\"Value\":[{\"0048021E\":{\"vr\":\"SL\",\"Value\":[257]},\"0048021F\":{\"vr\":\"SL\",\"Value\":[1]}}]}},"
+		"{\"0048021A\":{\"vr\":\"SQ\",\"Value\":[{\"0048021E\":{\"vr\":\"SL\",\"Value\":[257]},\"0048021F\":{\"vr\":\"SL\",\"Value\":[257]}}]}}"
+		"]}"
+		"}]";
+	dicomweb_instance_metadata_t metadata = {};
+	REQUIRE(dicomweb_parse_instance_metadata(json, strlen(json), &metadata));
+	REQUIRE(metadata.frame_map_count == 4);
+	CHECK(metadata.frame_numbers[0] == 1);
+	CHECK(metadata.frame_numbers[1] == 3);
+	CHECK(metadata.frame_numbers[2] == 2);
+	CHECK(metadata.frame_numbers[3] == 4);
+	dicomweb_instance_metadata_destroy(&metadata);
+}
+
+TEST_CASE("DICOMweb parses archive study and series results") {
+	const char* studies_json =
+		"[{\"0020000D\":{\"vr\":\"UI\",\"Value\":[\"study-uid\"]},"
+		"\"00080020\":{\"vr\":\"DA\",\"Value\":[\"20260705\"]},"
+		"\"00081030\":{\"vr\":\"LO\",\"Value\":[\"Pathology\"]}}]";
+	dicomweb_study_ref_t studies[1] = {};
+	REQUIRE(dicomweb_parse_study_refs(studies_json, strlen(studies_json), studies, 1) == 1);
+	CHECK(strcmp(studies[0].study_instance_uid, "study-uid") == 0);
+	CHECK(strcmp(studies[0].study_date, "20260705") == 0);
+	CHECK(strcmp(studies[0].description, "Pathology") == 0);
+
+	const char* series_json =
+		"[{\"0020000E\":{\"vr\":\"UI\",\"Value\":[\"series-uid\"]},"
+		"\"00200011\":{\"vr\":\"IS\",\"Value\":[3]},"
+		"\"00080060\":{\"vr\":\"CS\",\"Value\":[\"SM\"]},"
+		"\"0008103E\":{\"vr\":\"LO\",\"Value\":[\"H&E\"]}}]";
+	dicomweb_series_ref_t series[1] = {};
+	REQUIRE(dicomweb_parse_series_refs(series_json, strlen(series_json), series, 1) == 1);
+	CHECK(strcmp(series[0].series_instance_uid, "series-uid") == 0);
+	CHECK(strcmp(series[0].series_number, "3") == 0);
+	CHECK(strcmp(series[0].modality, "SM") == 0);
+	CHECK(strcmp(series[0].description, "H&E") == 0);
 }

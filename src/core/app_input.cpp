@@ -20,6 +20,7 @@
 #include "viewer.h"
 #include "slide_score.h"
 #include "dicomweb_client.h"
+#include "gui.h"
 #include "stringutils.h"
 
 #if APPLE
@@ -124,9 +125,18 @@ bool app_load_input(app_state_t* app_state, const char* input, u32 filetype_hint
 	if (filetype_hint == 0 && (strncmp(input, "https://", 8) == 0 ||
 	                           strncmp(input, "http://", 7) == 0) &&
 	    strstr(input, "/studies/") && strstr(input, "/series/")) {
-		const char* username = getenv("SLIDESCAPE_DICOMWEB_USERNAME");
-		const char* password = getenv("SLIDESCAPE_DICOMWEB_PASSWORD");
+		const char* username = app_state->command.dicomweb_username;
+		const char* password = app_state->command.dicomweb_password;
+		if (!username) username = getenv("SLIDESCAPE_DICOMWEB_USERNAME");
+		if (!password) password = getenv("SLIDESCAPE_DICOMWEB_PASSWORD");
 		return dicomweb_open_series(app_state, input, username, password);
+	}
+	if (filetype_hint == 0 && (strncmp(input, "https://", 8) == 0 ||
+	                           strncmp(input, "http://", 7) == 0) &&
+	    strstr(input, "/dicom-web")) {
+		copy_cstring(remote_uri, input, sizeof(remote_uri));
+		show_open_uri_window = true;
+		return true;
 	}
 	if (filetype_hint == 0 && slide_score_uri_is_supported(input)) {
 		char api_key[4096];

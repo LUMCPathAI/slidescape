@@ -73,6 +73,18 @@ As of 2026-07-05:
 - the native backend was interactively verified against the complete three-
   instance local Orthanc UMCU pyramid: initial display, missing intermediate
   levels, and zoom-driven frame loading worked;
+- explicit Per-Frame Functional Groups matrix positions are used to map WADO-RS
+  frame numbers to viewer tiles; this fixed the UMCU column-major frame ordering;
+- tile workers reuse HTTP/TLS connections, with idle reconnection for Orthanc's
+  short keep-alive timeout;
+- the Open URI window can browse QIDO-RS studies, series, and instances, open a
+  selected series, and switch among sibling slide series within one study;
+- the three local UMCU slides were verified to use separate Study and Series
+  Instance UIDs and no Concatenation UID; they are selected through the archive
+  browser, while their files within each series are pyramid levels rather than
+  concatenation parts;
+- DICOMweb credentials can come from the UI, environment variables, or explicit
+  command-line options; environment variables remain preferable for passwords;
 - the transport supports Basic authentication headers, verified HTTPS, and
   unencrypted HTTP only for loopback development;
 - the small RGB WSI and three instances from one UMCU WSI series have

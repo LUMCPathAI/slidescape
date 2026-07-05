@@ -763,6 +763,11 @@ bool init_image_from_dicomweb(image_t* image, const dicomweb_remote_image_t* rem
 			tile->tile_index = tile_index;
 			tile->tile_x = tile_index % level_image->width_in_tiles;
 			tile->tile_y = tile_index / level_image->width_in_tiles;
+			if (!instance->frame_numbers ||
+			    tile_index >= instance->frame_map_count ||
+			    instance->frame_numbers[tile_index] == 0) {
+				tile->is_empty = true;
+			}
 		}
 	}
 	image->is_valid = image->level_images[0].exists;
@@ -1640,6 +1645,9 @@ void image_destroy(image_t* image) {
 			} else if (image->backend == IMAGE_BACKEND_SLIDE_SCORE) {
 				DUMMY_STATEMENT;
 			} else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
+				for (i32 i = 0; i < image->dicomweb.instance_count; ++i) {
+					dicomweb_instance_metadata_destroy(image->dicomweb.instances + i);
+				}
 				memset(image->dicomweb.authorization_header, 0,
 				       sizeof(image->dicomweb.authorization_header));
 			} else if (image->backend == IMAGE_BACKEND_STBI) {

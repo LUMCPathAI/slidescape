@@ -52,6 +52,7 @@ int main(int argc, char** argv) {
 			       metadata.mpp_x, metadata.mpp_y);
 			result = 0;
 		}
+		dicomweb_instance_metadata_destroy(&metadata);
 	} else if (strcmp(argv[1], "frame") == 0 && argc == 4) {
 		dicomweb_frame_t frame = {0};
 		if (dicomweb_parse_multipart_frame(data, size, argv[3], &frame)) {

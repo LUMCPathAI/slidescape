@@ -32,6 +32,8 @@ typedef struct dicomweb_instance_metadata_t {
 	float mpp_y;
 	bool is_mpp_known;
 	bool is_tiled_full;
+	u32 frame_map_count;
+	u32* frame_numbers;
 } dicomweb_instance_metadata_t;
 
 typedef struct dicomweb_frame_t {
@@ -42,12 +44,27 @@ typedef struct dicomweb_frame_t {
 } dicomweb_frame_t;
 
 #define DICOMWEB_MAX_INSTANCES 16
+#define DICOMWEB_MAX_STUDIES 128
+#define DICOMWEB_MAX_SERIES 128
 
 typedef struct dicomweb_instance_ref_t {
 	char study_instance_uid[65];
 	char series_instance_uid[65];
 	char sop_instance_uid[65];
 } dicomweb_instance_ref_t;
+
+typedef struct dicomweb_study_ref_t {
+	char study_instance_uid[65];
+	char study_date[17];
+	char description[129];
+} dicomweb_study_ref_t;
+
+typedef struct dicomweb_series_ref_t {
+	char series_instance_uid[65];
+	char series_number[17];
+	char modality[17];
+	char description[129];
+} dicomweb_series_ref_t;
 
 typedef struct dicomweb_remote_image_t {
 	char hostname[256];
@@ -57,14 +74,22 @@ typedef struct dicomweb_remote_image_t {
 	char series_instance_uid[65];
 	i32 port;
 	bool use_tls;
+	i32 available_series_count;
+	i32 selected_series_index;
+	dicomweb_series_ref_t available_series[DICOMWEB_MAX_SERIES];
 	i32 instance_count;
 	dicomweb_instance_metadata_t instances[DICOMWEB_MAX_INSTANCES];
 } dicomweb_remote_image_t;
 
 bool dicomweb_parse_instance_metadata(const char* json, size_t json_size,
                                       dicomweb_instance_metadata_t* out);
+void dicomweb_instance_metadata_destroy(dicomweb_instance_metadata_t* metadata);
 i32 dicomweb_parse_instance_refs(const char* json, size_t json_size,
                                  dicomweb_instance_ref_t* out, i32 capacity);
+i32 dicomweb_parse_study_refs(const char* json, size_t json_size,
+                              dicomweb_study_ref_t* out, i32 capacity);
+i32 dicomweb_parse_series_refs(const char* json, size_t json_size,
+                               dicomweb_series_ref_t* out, i32 capacity);
 bool dicomweb_parse_multipart_frame(const u8* body, size_t body_size,
                                     const char* response_content_type,
                                     dicomweb_frame_t* out);

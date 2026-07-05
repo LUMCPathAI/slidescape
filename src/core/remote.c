@@ -842,7 +842,6 @@ http_response_t* remote_connection_request_with_headers(tls_connection_t* connec
 
     response->status_code = parser.status_code;
     memrw_putc(0, &response->buffer);
-    console_print_verbose("Content length = %d\n", response->content_length);
     return response;
 }
 

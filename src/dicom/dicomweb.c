@@ -34,6 +34,14 @@ static struct json_value_s* first_value(struct json_object_s* dataset, const cha
 	return values->start ? values->start->value : NULL;
 }
 
+static struct json_array_s* attribute_values(struct json_object_s* dataset, const char* tag) {
+	struct json_value_s* attribute_value = object_get(dataset, tag);
+	if (!attribute_value || attribute_value->type != json_type_object) return NULL;
+	struct json_value_s* values_value = object_get((struct json_object_s*)attribute_value->payload, "Value");
+	if (!values_value || values_value->type != json_type_array) return NULL;
+	return (struct json_array_s*)values_value->payload;
+}
+
 static const char* scalar_string(struct json_value_s* value) {
 	if (!value) return NULL;
 	if (value->type == json_type_string) return ((struct json_string_s*)value->payload)->string;
@@ -95,6 +103,53 @@ static bool read_pixel_spacing(struct json_value_s* dataset_value, float* mpp_x,
 	return *mpp_x > 0.0f && *mpp_y > 0.0f;
 }
 
+static bool read_position_value(struct json_object_s* frame, const char* tag, i64* value) {
+	struct json_value_s* plane_position_attribute = object_get(frame, "0048021A");
+	if (!plane_position_attribute || plane_position_attribute->type != json_type_object) return false;
+	struct json_value_s* plane_position_values = object_get(
+		(struct json_object_s*)plane_position_attribute->payload, "Value");
+	if (!plane_position_values || plane_position_values->type != json_type_array) return false;
+	struct json_array_element_s* first = ((struct json_array_s*)plane_position_values->payload)->start;
+	if (!first || first->value->type != json_type_object) return false;
+	return read_tag_i64((struct json_object_s*)first->value->payload, tag, value);
+}
+
+static bool build_frame_map(struct json_object_s* dataset, dicomweb_instance_metadata_t* out) {
+	u64 width_in_tiles = ((u64)out->total_pixel_matrix_columns + out->columns - 1) / out->columns;
+	u64 height_in_tiles = ((u64)out->total_pixel_matrix_rows + out->rows - 1) / out->rows;
+	u64 tile_count = width_in_tiles * height_in_tiles;
+	if (!tile_count || tile_count > UINT32_MAX) return false;
+	out->frame_numbers = (u32*)calloc((size_t)tile_count, sizeof(u32));
+	if (!out->frame_numbers) return false;
+	out->frame_map_count = (u32)tile_count;
+
+	struct json_array_s* per_frame = attribute_values(dataset, "52009230");
+	if (!per_frame || !per_frame->start) {
+		if ((u64)out->number_of_frames > tile_count) return false;
+		for (u32 i = 0; i < (u32)out->number_of_frames; ++i) {
+			out->frame_numbers[i] = i + 1;
+		}
+		return true;
+	}
+
+	u32 one_based_frame = 1;
+	for (struct json_array_element_s* element = per_frame->start;
+	     element; element = element->next, ++one_based_frame) {
+		if (element->value->type != json_type_object) continue;
+		i64 column = 0;
+		i64 row = 0;
+		struct json_object_s* frame = (struct json_object_s*)element->value->payload;
+		if (!read_position_value(frame, "0048021E", &column) ||
+		    !read_position_value(frame, "0048021F", &row) ||
+		    column <= 0 || row <= 0) continue;
+		u64 tile_x = (u64)(column - 1) / out->columns;
+		u64 tile_y = (u64)(row - 1) / out->rows;
+		if (tile_x >= width_in_tiles || tile_y >= height_in_tiles) continue;
+		out->frame_numbers[tile_y * width_in_tiles + tile_x] = one_based_frame;
+	}
+	return one_based_frame - 1 == (u32)out->number_of_frames;
+}
+
 bool dicomweb_parse_instance_metadata(const char* json, size_t json_size,
                                       dicomweb_instance_metadata_t* out) {
 	if (!json || !json_size || !out) return false;
@@ -152,8 +207,17 @@ bool dicomweb_parse_instance_metadata(const char* json, size_t json_size,
 	    out->total_pixel_matrix_columns == 0 || out->total_pixel_matrix_rows == 0) {
 		valid = false;
 	}
+	if (valid && !build_frame_map(dataset, out)) valid = false;
 	free(root);
+	if (!valid) dicomweb_instance_metadata_destroy(out);
 	return valid;
+}
+
+void dicomweb_instance_metadata_destroy(dicomweb_instance_metadata_t* metadata) {
+	if (!metadata) return;
+	free(metadata->frame_numbers);
+	metadata->frame_numbers = NULL;
+	metadata->frame_map_count = 0;
 }
 
 i32 dicomweb_parse_instance_refs(const char* json, size_t json_size,
@@ -183,6 +247,52 @@ i32 dicomweb_parse_instance_refs(const char* json, size_t json_size,
 	}
 	free(root);
 	return count;
+}
+
+static i32 parse_qido_refs(const char* json, size_t json_size, void* out, i32 capacity,
+                           bool studies) {
+	if (!json || !json_size || !out || capacity <= 0) return 0;
+	struct json_value_s* root = json_parse_ex(json, json_size, json_parse_flags_default,
+	                                          dicomweb_json_alloc, NULL, NULL);
+	if (!root || root->type != json_type_array) {
+		if (root) free(root);
+		return 0;
+	}
+	i32 count = 0;
+	struct json_array_s* array = (struct json_array_s*)root->payload;
+	for (struct json_array_element_s* element = array->start;
+	     element && count < capacity; element = element->next) {
+		if (element->value->type != json_type_object) continue;
+		struct json_object_s* dataset = (struct json_object_s*)element->value->payload;
+		if (studies) {
+			dicomweb_study_ref_t ref = {0};
+			if (!copy_tag_string(dataset, "0020000D", ref.study_instance_uid,
+			                     sizeof(ref.study_instance_uid))) continue;
+			copy_tag_string(dataset, "00080020", ref.study_date, sizeof(ref.study_date));
+			copy_tag_string(dataset, "00081030", ref.description, sizeof(ref.description));
+			((dicomweb_study_ref_t*)out)[count++] = ref;
+		} else {
+			dicomweb_series_ref_t ref = {0};
+			if (!copy_tag_string(dataset, "0020000E", ref.series_instance_uid,
+			                     sizeof(ref.series_instance_uid))) continue;
+			copy_tag_string(dataset, "00200011", ref.series_number, sizeof(ref.series_number));
+			copy_tag_string(dataset, "00080060", ref.modality, sizeof(ref.modality));
+			copy_tag_string(dataset, "0008103E", ref.description, sizeof(ref.description));
+			((dicomweb_series_ref_t*)out)[count++] = ref;
+		}
+	}
+	free(root);
+	return count;
+}
+
+i32 dicomweb_parse_study_refs(const char* json, size_t json_size,
+                              dicomweb_study_ref_t* out, i32 capacity) {
+	return parse_qido_refs(json, json_size, out, capacity, true);
+}
+
+i32 dicomweb_parse_series_refs(const char* json, size_t json_size,
+                               dicomweb_series_ref_t* out, i32 capacity) {
+	return parse_qido_refs(json, json_size, out, capacity, false);
 }
 
 static const u8* find_bytes(const u8* haystack, size_t haystack_size,

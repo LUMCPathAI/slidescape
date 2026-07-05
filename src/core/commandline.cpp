@@ -101,6 +101,18 @@ app_command_t app_parse_commandline(int argc, const char** argv) {
 			}
 		} else  if (strcmp(arg, "--verbose") == 0) {
 			is_verbose_mode = true;
+		} else if (strcmp(arg, "--dicomweb-username") == 0) {
+			if (++arg_index < argc) {
+				app_command.dicomweb_username = args[arg_index];
+			} else {
+				console_print_error("--dicomweb-username expects a value\n");
+			}
+		} else if (strcmp(arg, "--dicomweb-password") == 0) {
+			if (++arg_index < argc) {
+				app_command.dicomweb_password = args[arg_index];
+			} else {
+				console_print_error("--dicomweb-password expects a value\n");
+			}
 		} else if (strcmp(arg, "--headless") == 0) {
 			app_command.headless = true;
 		} else if (strcmp(arg, "--overlay") == 0) {

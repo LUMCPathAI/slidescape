@@ -79,6 +79,17 @@ Enter the local development username and password shown above. Slidescape allows
 unencrypted DICOMweb only for a loopback host; non-local archives must use
 verified HTTPS.
 
+To browse instead of opening a known series, enter only the archive root:
+
+```text
+http://127.0.0.1:8042/dicom-web
+```
+
+Then select **Browse DICOMweb archive**. The browser queries studies, series,
+and instances through QIDO-RS. Selecting **Open selected series** opens all
+supported WSI pyramid instances in that series. Other slide series in the same
+study are also exposed through **View → DICOM slides**.
+
 For command-line development, credentials can be supplied without putting them
 in the URL:
 
@@ -91,8 +102,22 @@ SLIDESCAPE_DICOMWEB_PASSWORD=slidescape-local \
 
 The current viewer slice supports `TILED_FULL` brightfield VOLUME instances with
 JPEG Baseline frames. It discovers all instances in the series, builds the
-pyramid from their Total Pixel Matrix dimensions, and retrieves native frames
-on demand.
+pyramid from their Total Pixel Matrix dimensions, maps frames using their
+per-frame matrix positions, and retrieves native frames on demand. Tile workers
+reuse HTTP/TLS connections.
+
+Credentials can alternatively be passed as command-line options:
+
+```sh
+./Slidescape.app/Contents/MacOS/Slidescape \
+  --dicomweb-username slidescape \
+  --dicomweb-password slidescape-local \
+  "http://127.0.0.1:8042/dicom-web/studies/{StudyInstanceUID}/series/{SeriesInstanceUID}"
+```
+
+Environment variables are preferable for passwords because command-line
+arguments can be visible in shell history and process listings. Explicit
+command-line options override the corresponding environment variables.
 
 ## Inspect
 

@@ -224,6 +224,8 @@ struct app_command_t {
 		bool with_annotations;
 		command_export_error_enum error;
 	} export_command;
+	const char* dicomweb_username;
+	const char* dicomweb_password;
 	const char** inputs; // array
 	const char** overlay_inputs; // array
 };
