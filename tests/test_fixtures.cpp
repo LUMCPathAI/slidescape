@@ -4,6 +4,8 @@
 #include "stringutils.h"
 #include "tiff.h"
 #include "isyntax.h"
+#include "dicom.h"
+#include "dicom_wsi.h"
 #include "image_loader.h"
 
 #include <stdint.h>
@@ -201,6 +203,14 @@ static void ensure_image_read_region_thread_pool(void) {
 	}
 }
 
+static void ensure_dicom_initialized(void) {
+	static bool initialized = false;
+	if (!initialized) {
+		REQUIRE(dicom_init());
+		initialized = true;
+	}
+}
+
 typedef struct selected_tiff_tile_t {
 	i32 level;
 	i32 tile_x;
@@ -263,6 +273,25 @@ static image_t* load_tiff_fixture_image(const fixture_t* fixture) {
 	return image;
 }
 
+static image_t* load_dicom_fixture_image(const fixture_t* fixture) {
+	ensure_dicom_initialized();
+	ensure_image_read_region_thread_pool();
+
+	file_info_t file = viewer_get_file_info(fixture->path);
+	REQUIRE(file.is_valid);
+	REQUIRE(file.is_regular_file);
+	REQUIRE(file.type == VIEWER_FILE_TYPE_DICOM);
+
+	image_load_options_t options = {};
+	options.resource_id = 3000;
+	options.thread_pool = &global_thread_pool;
+	image_t* image = image_load_from_file(&file, NULL, &options);
+	REQUIRE(image != NULL);
+	REQUIRE(image->is_valid);
+	REQUIRE(image->backend == IMAGE_BACKEND_DICOM);
+	return image;
+}
+
 TEST_CASE("fixture manifest is readable") {
 	fixture_manifest_t* manifest = fixture_manifest();
 	REQUIRE(manifest->fixture_count > 0);
@@ -291,6 +320,10 @@ TEST_CASE("available WSI fixtures have expected extensions") {
 			CHECK((strcmp(extension, "tif") == 0 || strcmp(extension, "tiff") == 0));
 		} else if (strcmp(fixture.type, "isyntax") == 0) {
 			CHECK(strcmp(extension, "isyntax") == 0);
+		} else if (strcmp(fixture.type, "dicom") == 0) {
+			u8 header[256] = {};
+			REQUIRE(read_file_prefix(fixture.path, header, sizeof(header)));
+			CHECK(is_file_a_dicom_file(header, sizeof(header)));
 		} else if (strcmp(fixture.type, "asap_xml") == 0) {
 			CHECK(strcmp(extension, "xml") == 0);
 		}
@@ -411,6 +444,135 @@ TEST_CASE("TODO: TIFF fixture metadata serializes and deserializes" * doctest::s
 	// deserialized.level_image_ifd_count differs from the original and cleanup trips ltalloc
 	// guard checks. Keep this as a regression target once tiff_serialize/tiff_deserialize
 	// semantics are clarified or fixed.
+}
+
+TEST_CASE("open DICOM WSI fixtures through Slidescape DICOM reader") {
+	fixture_manifest_t* manifest = fixture_manifest();
+	bool checked_any = false;
+	for (size_t i = 0; i < manifest->fixture_count; ++i) {
+		fixture_t& fixture = manifest->fixtures[i];
+		if (strcmp(fixture.type, "dicom") != 0 ||
+		    !fixture_has_tag(fixture, "dicom-metadata") ||
+		    !test_fixture_file_exists(fixture.path)) {
+			continue;
+		}
+
+		CAPTURE(fixture.id);
+		CAPTURE(fixture.path);
+		image_t* image = load_dicom_fixture_image(&fixture);
+
+		CHECK(image->dicom.wsi.instance_count > 0);
+		CHECK(image->level_count > 0);
+		CHECK(image->width_in_pixels > 0);
+		CHECK(image->height_in_pixels > 0);
+		CHECK(image->tile_width > 0);
+		CHECK(image->tile_height > 0);
+
+		for (i32 level_index = 0; level_index < image->level_count; ++level_index) {
+			level_image_t* level = image->level_images + level_index;
+			if (!level->exists) continue;
+			CAPTURE(level_index);
+			CHECK(level->width_in_pixels > 0);
+			CHECK(level->height_in_pixels > 0);
+			CHECK(level->width_in_tiles > 0);
+			CHECK(level->height_in_tiles > 0);
+			CHECK(level->tile_count == level->width_in_tiles * level->height_in_tiles);
+			CHECK(level->tile_width > 0);
+			CHECK(level->tile_height > 0);
+		}
+
+		if (fixture_has_tag(fixture, "dicom-multislide")) {
+			CHECK(arrlen(image->dicom.slides) > 1);
+			CHECK(image->dicom.selected_slide_index >= 0);
+			CHECK(image->dicom.selected_slide_index < arrlen(image->dicom.slides));
+		}
+
+		image_destroy(image);
+		free(image);
+		checked_any = true;
+	}
+
+	if (!checked_any) {
+		MESSAGE("Skipping DICOM WSI metadata checks: no tagged DICOM fixture is present locally.");
+	}
+}
+
+TEST_CASE("decode a representative DICOM WSI frame") {
+	fixture_manifest_t* manifest = fixture_manifest();
+	bool checked_any = false;
+	for (size_t fixture_index = 0; fixture_index < manifest->fixture_count; ++fixture_index) {
+		fixture_t& fixture = manifest->fixtures[fixture_index];
+		if (strcmp(fixture.type, "dicom") != 0 ||
+		    !fixture_has_tag(fixture, "dicom-tile") ||
+		    !test_fixture_file_exists(fixture.path)) {
+			continue;
+		}
+
+		CAPTURE(fixture.id);
+		CAPTURE(fixture.path);
+		image_t* image = load_dicom_fixture_image(&fixture);
+
+		level_image_t* level = NULL;
+		i32 level_index = -1;
+		i32 tile_index = -1;
+		for (i32 candidate_level = 0; candidate_level < image->level_count && tile_index < 0; ++candidate_level) {
+			level_image_t* candidate = image->level_images + candidate_level;
+			if (!candidate->exists) continue;
+			for (i32 candidate_tile = 0; candidate_tile < candidate->tile_count; ++candidate_tile) {
+				if (!candidate->tiles[candidate_tile].is_empty) {
+					level = candidate;
+					level_index = candidate_level;
+					tile_index = candidate_tile;
+					break;
+				}
+			}
+		}
+
+		REQUIRE(level != NULL);
+		REQUIRE(level_index >= 0);
+		REQUIRE(tile_index >= 0);
+		CAPTURE(level_index);
+		CAPTURE(tile_index);
+
+		dicom_instance_t* level_instance = image->dicom.wsi.level_instances[level->pyramid_image_index];
+		REQUIRE(level_instance != NULL);
+		dicom_tile_t* dicom_tile = level_instance->tiles + tile_index;
+		REQUIRE(dicom_tile->exists);
+		if (!dicom_tile->is_offset_known) {
+			REQUIRE(dicom_wsi_index_level(&image->dicom, level->pyramid_image_index));
+		}
+		REQUIRE(dicom_tile->is_offset_known);
+		REQUIRE(dicom_tile->data_size > 0);
+
+		u8* pixels = dicom_wsi_decode_tile_to_bgra(&image->dicom, level->pyramid_image_index, tile_index);
+		REQUIRE(pixels != NULL);
+		CHECK(pixel_buffer_has_variation((u32*)pixels, (size_t)level->tile_width * (size_t)level->tile_height));
+
+		if (fixture_has_tag(fixture, "dicom-concatenation")) {
+			bool uses_multiple_instances = false;
+			dicom_instance_t* first_instance = NULL;
+			for (i32 i = 0; i < level_instance->tile_count; ++i) {
+				dicom_tile_t* tile = level_instance->tiles + i;
+				if (!tile->exists) continue;
+				if (!first_instance) {
+					first_instance = tile->instance;
+				} else if (tile->instance != first_instance) {
+					uses_multiple_instances = true;
+					break;
+				}
+			}
+			CHECK(uses_multiple_instances);
+		}
+
+		free(pixels);
+		image_destroy(image);
+		free(image);
+		checked_any = true;
+	}
+
+	if (!checked_any) {
+		MESSAGE("Skipping DICOM WSI frame decode check: no tagged DICOM fixture is present locally.");
+	}
 }
 
 TEST_CASE("decode a representative TIFF tile") {

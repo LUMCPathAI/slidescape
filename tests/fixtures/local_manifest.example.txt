@@ -9,3 +9,6 @@ private-he-tiff | tiff | private | tiff-metadata | ../../data_for_testing/test_B
 private-cd8-cropped-tiff | tiff | private | tiff-metadata,tiff-tile | ../../data_for_testing/test_MF_CD8.cropped.tiff |
 private-cd8-isyntax | isyntax | private | isyntax-metadata,isyntax-tile | ../../data_for_testing/test_MF_CD8.isyntax |
 private-cd8-asap-xml | asap_xml | private | annotation-basic | ../../data_for_testing/test_MF_CD8.xml |
+private-dicom-wsi | dicom | private | dicom-metadata,dicom-tile | /absolute/path/to/representative-volume-instance.dcm |
+private-dicom-multislide | dicom | private | dicom-metadata,dicom-multislide | /absolute/path/to/one-instance-in-multislide-directory.dcm |
+private-dicom-concatenation | dicom | private | dicom-metadata,dicom-tile,dicom-concatenation | /absolute/path/to/one-concatenation-part.dcm |
