@@ -1,0 +1,33 @@
+name: slidescape-orthanc
+
+services:
+  orthanc:
+    image: orthancteam/orthanc:26.6.1
+    ports:
+      - "127.0.0.1:8042:8042"
+    environment:
+      DICOM_WEB_PLUGIN_ENABLED: "true"
+      WSI_PLUGIN_ENABLED: "true"
+      ORTHANC__NAME: "Slidescape DICOMweb development archive"
+      ORTHANC__AUTHENTICATION_ENABLED: "true"
+      ORTHANC__REGISTERED_USERS: '{"slidescape":"slidescape-local"}'
+      ORTHANC__DEFAULT_ENCODING: "Utf8"
+      ORTHANC__DICOM_WEB__ROOT: "/dicom-web/"
+      ORTHANC__DICOM_WEB__STUDIES_METADATA: "Full"
+      ORTHANC__DICOM_WEB__SERIES_METADATA: "Full"
+      ORTHANC__DICOM_WEB__ENABLE_METADATA_CACHE: "true"
+      ORTHANC__DICOM_WEB__METADATA_WORKER_THREADS_COUNT: "4"
+      ORTHANC__DICOM_WEB__WADO_RS_LOADER_THREADS_COUNT: "4"
+    volumes:
+      - orthanc-db:/var/lib/orthanc/db
+    healthcheck:
+      test: ["CMD", "python3", "/probes/test-aliveness.py"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 10s
+    restart: "no"
+
+volumes:
+  orthanc-db:
+
