@@ -74,6 +74,27 @@ TEST_CASE("DICOMweb builds portable WADO-RS paths") {
 	                                      "study", "series", "instance", 0));
 }
 
+TEST_CASE("DICOMweb resolves IDC Slim viewer series URLs") {
+	const char* viewer_url =
+		"https://viewer.imaging.datacommons.cancer.gov/slim/studies/"
+		"2.25.211094631316408413440371843585977094852/series/"
+		"1.3.6.1.4.1.5962.99.1.208792987.352384958.1640886332827.2.0";
+	char resolved[1024];
+	REQUIRE(dicomweb_resolve_series_url(resolved, sizeof(resolved), viewer_url));
+	CHECK(strcmp(resolved,
+		"https://proxy.imaging.datacommons.cancer.gov/current/"
+		"viewer-only-no-downloads-see-tinyurl-dot-com-slash-3j3d9jyp/dicomWeb/studies/"
+		"2.25.211094631316408413440371843585977094852/series/"
+		"1.3.6.1.4.1.5962.99.1.208792987.352384958.1640886332827.2.0") == 0);
+
+	CHECK_FALSE(dicomweb_resolve_series_url(
+		resolved, sizeof(resolved),
+		"https://viewer.imaging.datacommons.cancer.gov/slim/studies/not-a-uid/series/1.2.3"));
+	REQUIRE(dicomweb_resolve_series_url(resolved, sizeof(resolved),
+	                                  "https://archive.example/dicomWeb/studies/1/series/2"));
+	CHECK(strcmp(resolved, "https://archive.example/dicomWeb/studies/1/series/2") == 0);
+}
+
 TEST_CASE("DICOMweb parses QIDO instance references") {
 	const char* json =
 		"[{"
@@ -100,6 +121,22 @@ TEST_CASE("DICOMweb parses QIDO instance references") {
 	CHECK(strcmp(refs[0].number_of_frames, "108") == 0);
 	CHECK(strcmp(refs[0].total_pixel_matrix_columns, "2875") == 0);
 	CHECK(strcmp(refs[1].sop_instance_uid, "instance-2") == 0);
+}
+
+TEST_CASE("DICOMweb accepts scoped QIDO instances without repeated parent UIDs") {
+	const char* json =
+		"[{"
+		"\"00080016\":{\"vr\":\"UI\",\"Value\":[\"1.2.840.10008.5.1.4.1.1.77.1.6\"]},"
+		"\"00080018\":{\"vr\":\"UI\",\"Value\":[\"1.2.3.4\"]},"
+		"\"00280008\":{\"vr\":\"IS\",\"Value\":[437]}"
+		"}]";
+	dicomweb_instance_ref_t ref = {};
+	REQUIRE(dicomweb_parse_instance_refs(json, strlen(json), &ref, 1) == 1);
+	CHECK(strcmp(ref.sop_instance_uid, "1.2.3.4") == 0);
+	CHECK(ref.study_instance_uid[0] == '\0');
+	CHECK(ref.series_instance_uid[0] == '\0');
+	CHECK(strcmp(ref.number_of_frames, "437") == 0);
+	CHECK(dicomweb_count_instance_refs(json, strlen(json)) == 1);
 }
 
 TEST_CASE("DICOMweb maps column-major frames to raster tiles") {

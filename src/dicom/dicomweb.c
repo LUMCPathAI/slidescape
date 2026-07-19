@@ -252,12 +252,12 @@ i32 dicomweb_parse_instance_refs(const char* json, size_t json_size,
 		if (element->value->type != json_type_object) continue;
 		struct json_object_s* dataset = (struct json_object_s*)element->value->payload;
 		dicomweb_instance_ref_t ref = {0};
-		if (copy_tag_string(dataset, "0020000D", ref.study_instance_uid,
-		                    sizeof(ref.study_instance_uid)) &&
-		    copy_tag_string(dataset, "0020000E", ref.series_instance_uid,
-		                    sizeof(ref.series_instance_uid)) &&
-		    copy_tag_string(dataset, "00080018", ref.sop_instance_uid,
+		if (copy_tag_string(dataset, "00080018", ref.sop_instance_uid,
 		                    sizeof(ref.sop_instance_uid))) {
+			copy_tag_string(dataset, "0020000D", ref.study_instance_uid,
+			                sizeof(ref.study_instance_uid));
+			copy_tag_string(dataset, "0020000E", ref.series_instance_uid,
+			                sizeof(ref.series_instance_uid));
 			copy_tag_string(dataset, "00080016", ref.sop_class_uid,
 			                sizeof(ref.sop_class_uid));
 			copy_tag_string_at(dataset, "00080008", 2, ref.image_flavor,
@@ -298,12 +298,8 @@ i32 dicomweb_count_instance_refs(const char* json, size_t json_size) {
 	     element; element = element->next) {
 		if (element->value->type != json_type_object) continue;
 		struct json_object_s* dataset = (struct json_object_s*)element->value->payload;
-		char study_uid[65];
-		char series_uid[65];
 		char instance_uid[65];
-		if (copy_tag_string(dataset, "0020000D", study_uid, sizeof(study_uid)) &&
-		    copy_tag_string(dataset, "0020000E", series_uid, sizeof(series_uid)) &&
-		    copy_tag_string(dataset, "00080018", instance_uid, sizeof(instance_uid))) {
+		if (copy_tag_string(dataset, "00080018", instance_uid, sizeof(instance_uid))) {
 			++count;
 		}
 	}
@@ -465,4 +461,43 @@ bool dicomweb_build_frame_path(char* dest, size_t dest_size,
 	char suffix[64];
 	snprintf(suffix, sizeof(suffix), "frames/%u", one_based_frame_number);
 	return build_path(dest, dest_size, root, study_uid, series_uid, instance_uid, suffix);
+}
+
+static bool is_dicom_uid(const char* value, size_t length) {
+	if (!value || !length || length > 64 || value[0] == '.' || value[length - 1] == '.') return false;
+	for (size_t i = 0; i < length; ++i) {
+		if ((value[i] < '0' || value[i] > '9') && value[i] != '.') return false;
+		if (value[i] == '.' && i > 0 && value[i - 1] == '.') return false;
+	}
+	return true;
+}
+
+bool dicomweb_resolve_series_url(char* dest, size_t dest_size, const char* url) {
+	if (!dest || !dest_size || !url) return false;
+	static const char idc_viewer_prefix[] =
+		"https://viewer.imaging.datacommons.cancer.gov/slim/studies/";
+	if (strncmp(url, idc_viewer_prefix, sizeof(idc_viewer_prefix) - 1) != 0) {
+		size_t length = strlen(url);
+		if (!length || length >= dest_size) return false;
+		memcpy(dest, url, length + 1);
+		return true;
+	}
+
+	const char* study = url + sizeof(idc_viewer_prefix) - 1;
+	const char* series_marker = strstr(study, "/series/");
+	if (!series_marker) return false;
+	const char* series = series_marker + strlen("/series/");
+	const char* series_end = strpbrk(series, "/?#");
+	if (!series_end) series_end = series + strlen(series);
+	size_t study_length = (size_t)(series_marker - study);
+	size_t series_length = (size_t)(series_end - series);
+	if (!is_dicom_uid(study, study_length) || !is_dicom_uid(series, series_length)) return false;
+
+	static const char idc_dicomweb_base[] =
+		"https://proxy.imaging.datacommons.cancer.gov/current/"
+		"viewer-only-no-downloads-see-tinyurl-dot-com-slash-3j3d9jyp/dicomWeb";
+	i32 length = snprintf(dest, dest_size, "%s/studies/%.*s/series/%.*s",
+	                      idc_dicomweb_base, (i32)study_length, study,
+	                      (i32)series_length, series);
+	return length > 0 && (size_t)length < dest_size;
 }

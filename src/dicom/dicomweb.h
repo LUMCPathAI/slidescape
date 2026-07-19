@@ -116,6 +116,7 @@ bool dicomweb_build_frame_path(char* dest, size_t dest_size,
                                const char* series_uid,
                                const char* instance_uid,
                                u32 one_based_frame_number);
+bool dicomweb_resolve_series_url(char* dest, size_t dest_size, const char* url);
 
 #ifdef __cplusplus
 }

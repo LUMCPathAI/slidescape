@@ -122,6 +122,9 @@ static bool parse_archive_url(const char* url, dicomweb_remote_image_t* remote,
 }
 
 static bool parse_series_url(const char* url, dicomweb_remote_image_t* remote) {
+	char resolved_url[2048];
+	if (!dicomweb_resolve_series_url(resolved_url, sizeof(resolved_url), url)) return false;
+	url = resolved_url;
 	const char* path = NULL;
 	if (!parse_archive_url(url, remote, &path)) return false;
 	const char* studies = strstr(path, "/studies/");
@@ -463,10 +466,12 @@ i32 dicomweb_async_open_series_url(dicomweb_async_context_t* context,
                                    const char* series_url,
                                    const char* username,
                                    const char* password) {
+	char resolved_url[2048];
+	if (!dicomweb_resolve_series_url(resolved_url, sizeof(resolved_url), series_url)) return 0;
 	dicomweb_remote_image_t remote = {0};
-	if (!series_url || !parse_series_url(series_url, &remote)) return 0;
+	if (!parse_series_url(resolved_url, &remote)) return 0;
 	return dicomweb_async_query(context, DICOMWEB_ASYNC_OPEN_SERIES,
-	                            series_url, username, password,
+	                            resolved_url, username, password,
 	                            remote.study_instance_uid, remote.series_instance_uid);
 }
 
@@ -646,9 +651,12 @@ static image_t* dicomweb_prepare_configured_series(
 		    *request_options->cancellation_generation != request_options->expected_generation) {
 			break;
 		}
+		const char* study_uid = refs[i].study_instance_uid[0]
+		                        ? refs[i].study_instance_uid : remote.study_instance_uid;
+		const char* series_uid = refs[i].series_instance_uid[0]
+		                         ? refs[i].series_instance_uid : remote.series_instance_uid;
 		if (!dicomweb_build_instance_metadata_path(path, sizeof(path), remote.root,
-		                                           refs[i].study_instance_uid,
-		                                           refs[i].series_instance_uid,
+		                                           study_uid, series_uid,
 		                                           refs[i].sop_instance_uid)) continue;
 		http_response_t* response = dicomweb_get_with_options(
 			&remote, path, "application/dicom+json", false, request_options);

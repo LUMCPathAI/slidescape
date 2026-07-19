@@ -1,7 +1,7 @@
 # DICOMweb WSI Ingestion And Viewer Handoff
 
-Status: proposed implementation plan  
-Last updated: 2026-07-04
+Status: prototype implemented; transport and conformance hardening remain
+Last updated: 2026-07-19
 
 This document defines the first implementation path for adding DICOMweb whole-slide
 imaging (WSI) support around Slidescape. It is intended to be both an architectural
@@ -48,7 +48,7 @@ Orthanc and dcm4chee are initially test fixtures and reference implementations.
 
 ## Implementation Progress
 
-As of 2026-07-05:
+As of 2026-07-19:
 
 - manifest-driven DICOM WSI metadata tests exist in `tests/test_fixtures.cpp`;
 - representative local DICOM frame decoding is covered;
@@ -130,12 +130,60 @@ As of 2026-07-05:
   plane;
 - the next client work is richer logical-slide/technical-detail metadata,
   QIDO pagination and server-side search, connect/write deadlines, associated
-  images, sparse frame mapping, and OAuth/OIDC bearer-token acquisition.
+  images, sparse frame mapping, and OAuth/OIDC bearer-token acquisition;
+- the public IDC proxy was exercised against study
+  `2.25.211094631316408413440371843585977094852`, series
+  `1.3.6.1.4.1.5962.99.1.208792987.352384958.1640886332827.2.0`;
+- that IDC series exposes six WSI instances: three `VOLUME` pyramid levels plus
+  `THUMBNAIL`, `OVERVIEW`, and `LABEL`; Slidescape opened the three volume levels
+  and retrieved JPEG Baseline frames through the tile cache;
+- IDC's scoped QIDO instance response omits the already-known Study and Series
+  Instance UIDs. The client now accepts that legal response shape and supplies the
+  parent UIDs from the request context;
+- pasted IDC Slim viewer series URLs are translated at the URL-adapter boundary to
+  IDC's documented unauthenticated proxy DICOMweb endpoint.
 
 This establishes the local-file reader as a regression oracle for the future
 DICOMweb backend. Both local reference archives now have pinned harnesses and a
 first shared-fixture protocol run; the broader automated M3 conformance matrix
 remains.
+
+## 2026-07-19 Architecture Review
+
+The overall direction remains sound: keep the archive as a separate product or
+service, expose standard DICOMweb, prove the viewer against independent servers,
+and postpone native MRXS conversion until the DICOM path is trustworthy. The
+Orthanc plus dcm4chee split is especially valuable and should remain an acceptance
+gate.
+
+The current code should nevertheless be treated as an interoperability prototype,
+not as completion of M1 or M2. Development should now prioritize the M1 transport
+and parser acceptance criteria before adding more archive-browser or ingestion
+features. In particular:
+
+- bound response headers, metadata bodies, multipart headers, and frame parts before
+  allocation; the current transport buffers complete bodies;
+- reject truncated HTTP messages rather than returning a partial response after an
+  early connection close;
+- replace fixed backend instance/series arrays with owned dynamic storage before
+  concatenations or broad archive interoperability;
+- separate connect, write, idle-read, and total deadlines and report which one fired;
+- validate configured URLs and reject control characters before constructing an
+  HTTP request;
+- add QIDO pagination and server-side filters before browsing a cloud-scale archive;
+- make captured IDC QIDO, metadata, and multipart shapes regression fixtures, while
+  keeping live IDC tests optional because the public proxy has quotas and mutable
+  release data;
+- keep provider/viewer URL translation in a small adapter. Core QIDO/WADO code must
+  continue to operate on configured DICOMweb URLs without provider-specific rules;
+- complete associated-image, colour-management, optical-path, focal-plane, sparse,
+  and concatenation checks before making broader WSI compatibility claims.
+
+For cloud PACS work, DICOMweb remains the right imaging interface, but it is not the
+whole operational design. Archive selection, identity reconciliation, quarantine,
+publication state, audit, authorization, retention, backup, and disaster recovery
+remain separate production decisions. The proposed ingest coordinator boundary is
+therefore still appropriate.
 
 ## Why DICOM-Only Comes First
 
