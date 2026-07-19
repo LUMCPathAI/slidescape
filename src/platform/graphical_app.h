@@ -176,6 +176,10 @@ void set_window_title(window_handle_t window, const char* title);
 void reset_window_title(window_handle_t window);
 void message_box(window_handle_t window, const char* message);
 
+#if LINUX || APPLE
+void determine_if_relative_mouse_mode_can_be_safely_enabled(SDL_version version);
+#endif
+
 // globals
 #if defined(GRAPHICAL_APP_IMPL)
 #define INIT(...) __VA_ARGS__

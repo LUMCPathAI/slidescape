@@ -24,20 +24,11 @@
 profiler_state_t global_profiler;
 
 const char* profiler_section_names[PROFILER_SECTION_COUNT] = {
-	"Frame",
-	"Input",
-	"GUI New Frame",
-	"Viewer",
-	"Process WSI input",
-	"Draw Annotations",
-	"Render Image",
-	"Completion Queue",
-	"Tile Loading",
-	"Scene Render",
-	"GUI Draw",
-	"ImGui Render",
-	"Present",
+#define PROFILER_SECTION_NAME_ENTRY(id, name) name,
+	PROFILER_SECTION_LIST(PROFILER_SECTION_NAME_ENTRY)
+#undef PROFILER_SECTION_NAME_ENTRY
 };
+STATIC_ASSERT(COUNT(profiler_section_names) == PROFILER_SECTION_COUNT);
 
 void profiler_new_frame(void) {
 	if (global_profiler.paused) return;

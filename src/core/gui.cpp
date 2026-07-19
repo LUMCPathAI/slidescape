@@ -1779,6 +1779,14 @@ void gui_draw(app_state_t* app_state, input_t* input, i32 client_width, i32 clie
             ImGui::Checkbox("Draw macro image", &app_state->scene.draw_macro_image);
             ImGui::Checkbox("Draw tile outlines", &app_state->scene.draw_outlines);
             ImGui::Checkbox("Draw clip rectangles", &app_state->scene.draw_envelopes);
+			ImGui::Separator();
+			ImGui::Checkbox("Use annotation mip coordinates", &annotation_enable_mip_coordinates);
+			ImGui::Text("Annotation mip level: %d", annotation_mip_current_level);
+			ImGui::SliderInt("Min annotation mip", &annotation_mip_min_level, -1, ANNOTATION_MIP_LEVEL_COUNT - 1);
+			ImGui::SliderInt("Max annotation mip", &annotation_mip_max_level, -1, ANNOTATION_MIP_LEVEL_COUNT - 1);
+			if (annotation_mip_min_level > annotation_mip_max_level) {
+				annotation_mip_max_level = annotation_mip_min_level;
+			}
 
             // Options for adjusting level offsets
             if (arrlen(app_state->loaded_images) > 0) {

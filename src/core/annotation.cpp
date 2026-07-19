@@ -26,6 +26,197 @@
 
 static rgba_t default_group_color = RGBA(60, 220, 50, 255);
 
+typedef struct annotation_simplify_range_t {
+	i32 start_offset;
+	i32 end_offset;
+} annotation_simplify_range_t;
+
+static float annotation_mip_tolerance_for_level(i32 level) {
+	return 0.25f * (float)(1 << level);
+}
+
+static bool annotation_is_closed_coordinate_shape(annotation_t* annotation) {
+	bool result = !annotation->is_open && annotation->type != ANNOTATION_LINE && annotation->coordinate_count >= 3;
+	return result;
+}
+
+static float distance_sq_to_line_segment(v2f point, v2f line_start, v2f line_end) {
+	v2f projected_point = project_point_on_line_segment(point, line_start, line_end, NULL);
+	float result = v2f_length_squared(v2f_subtract(point, projected_point));
+	return result;
+}
+
+static void annotation_free_mip_levels(annotation_t* annotation) {
+	for (i32 i = 0; i < ANNOTATION_MIP_LEVEL_COUNT; ++i) {
+		arrfree(annotation->mip_levels[i].coordinates);
+		annotation->mip_levels[i].coordinates = NULL;
+		annotation->mip_levels[i].coordinate_count = 0;
+		annotation->mip_levels[i].tolerance = 0.0f;
+	}
+	annotation->mip_valid_flags = 0;
+}
+
+static void annotation_simplify_mark_arc(v2f* coordinates, i32 coordinate_count, i32 start_index, i32 end_index, float tolerance_sq, bool* keep, annotation_simplify_range_t* stack) {
+	i32 arc_length = end_index - start_index;
+	if (arc_length < 0) {
+		arc_length += coordinate_count;
+	}
+	if (arc_length <= 0) {
+		return;
+	}
+
+	i32 stack_count = 0;
+	stack[stack_count++] = {0, arc_length};
+	keep[start_index] = true;
+	keep[end_index] = true;
+
+	while (stack_count > 0) {
+		annotation_simplify_range_t range = stack[--stack_count];
+		i32 start_offset = range.start_offset;
+		i32 end_offset = range.end_offset;
+		if ((end_offset - start_offset) <= 1) {
+			continue;
+		}
+
+		i32 segment_start_index = (start_index + start_offset) % coordinate_count;
+		i32 segment_end_index = (start_index + end_offset) % coordinate_count;
+		v2f segment_start = coordinates[segment_start_index];
+		v2f segment_end = coordinates[segment_end_index];
+
+		float max_distance_sq = -1.0f;
+		i32 max_distance_offset = -1;
+		for (i32 offset = start_offset + 1; offset < end_offset; ++offset) {
+			i32 coordinate_index = (start_index + offset) % coordinate_count;
+			float distance_sq = distance_sq_to_line_segment(coordinates[coordinate_index], segment_start, segment_end);
+			if (distance_sq > max_distance_sq) {
+				max_distance_sq = distance_sq;
+				max_distance_offset = offset;
+			}
+		}
+
+		if (max_distance_offset >= 0 && max_distance_sq > tolerance_sq) {
+			i32 keep_index = (start_index + max_distance_offset) % coordinate_count;
+			keep[keep_index] = true;
+			ASSERT(stack_count + 2 <= coordinate_count * 2);
+			stack[stack_count++] = {start_offset, max_distance_offset};
+			stack[stack_count++] = {max_distance_offset, end_offset};
+		}
+	}
+}
+
+static v2f* annotation_create_simplified_coordinates(annotation_t* annotation, float tolerance, i32* simplified_count_out) {
+	v2f* result = NULL;
+	*simplified_count_out = 0;
+	if (annotation->coordinate_count <= 4 || tolerance <= 0.0f) {
+		return NULL;
+	}
+
+	temp_memory_t temp_memory = begin_temp_memory_on_local_thread();
+	bool* keep = arena_push_array(temp_memory.arena, annotation->coordinate_count, bool);
+	memset(keep, 0, annotation->coordinate_count * sizeof(bool));
+	annotation_simplify_range_t* stack = arena_push_array(temp_memory.arena, annotation->coordinate_count * 2, annotation_simplify_range_t);
+	float tolerance_sq = SQUARE(tolerance);
+
+	bool closed = annotation_is_closed_coordinate_shape(annotation);
+	if (closed) {
+		i32 min_x_index = 0;
+		i32 max_x_index = 0;
+		i32 min_y_index = 0;
+		i32 max_y_index = 0;
+		for (i32 i = 1; i < annotation->coordinate_count; ++i) {
+			v2f p = annotation->coordinates[i];
+			if (p.x < annotation->coordinates[min_x_index].x) min_x_index = i;
+			if (p.x > annotation->coordinates[max_x_index].x) max_x_index = i;
+			if (p.y < annotation->coordinates[min_y_index].y) min_y_index = i;
+			if (p.y > annotation->coordinates[max_y_index].y) max_y_index = i;
+		}
+
+		i32 first_anchor = min_x_index;
+		i32 second_anchor = max_x_index;
+		float x_distance_sq = v2f_length_squared(v2f_subtract(annotation->coordinates[min_x_index], annotation->coordinates[max_x_index]));
+		float y_distance_sq = v2f_length_squared(v2f_subtract(annotation->coordinates[min_y_index], annotation->coordinates[max_y_index]));
+		if (y_distance_sq > x_distance_sq) {
+			first_anchor = min_y_index;
+			second_anchor = max_y_index;
+		}
+
+		annotation_simplify_mark_arc(annotation->coordinates, annotation->coordinate_count, first_anchor, second_anchor, tolerance_sq, keep, stack);
+		annotation_simplify_mark_arc(annotation->coordinates, annotation->coordinate_count, second_anchor, first_anchor, tolerance_sq, keep, stack);
+	} else {
+		annotation_simplify_mark_arc(annotation->coordinates, annotation->coordinate_count, 0, annotation->coordinate_count - 1, tolerance_sq, keep, stack);
+	}
+
+	for (i32 i = 0; i < annotation->coordinate_count; ++i) {
+		if (keep[i]) {
+			arrput(result, annotation->coordinates[i]);
+		}
+	}
+
+	i32 result_count = arrlen(result);
+	i32 min_count = closed ? 3 : 2;
+	if (result_count < min_count || result_count >= annotation->coordinate_count) {
+		arrfree(result);
+		result = NULL;
+		result_count = 0;
+	}
+
+	*simplified_count_out = result_count;
+	release_temp_memory(&temp_memory);
+	return result;
+}
+
+static i32 annotation_mip_level_for_screen_point_width(float screen_point_width) {
+	float desired_tolerance = screen_point_width * 0.75f;
+	i32 level = -1;
+	for (i32 i = 0; i < ANNOTATION_MIP_LEVEL_COUNT; ++i) {
+		float tolerance = annotation_mip_tolerance_for_level(i);
+		if (tolerance <= desired_tolerance) {
+			level = i;
+		}
+	}
+	i32 min_level = CLAMP(annotation_mip_min_level, -1, ANNOTATION_MIP_LEVEL_COUNT - 1);
+	i32 max_level = CLAMP(annotation_mip_max_level, -1, ANNOTATION_MIP_LEVEL_COUNT - 1);
+	if (min_level > max_level) {
+		i32 temp = min_level;
+		min_level = max_level;
+		max_level = temp;
+	}
+	level = CLAMP(level, min_level, max_level);
+	annotation_mip_current_level = level;
+	return level;
+}
+
+static v2f* annotation_get_mip_coordinates(annotation_t* annotation, i32 desired_mip_level, bool allow_mip_coordinates, i32* coordinate_count_out) {
+	*coordinate_count_out = annotation->coordinate_count;
+	if (!annotation_enable_mip_coordinates || !allow_mip_coordinates || annotation->selected || annotation->coordinate_count <= 4 || desired_mip_level < 0) {
+		return annotation->coordinates;
+	}
+
+	i32 min_level = -1;
+	i32 max_level = ANNOTATION_MIP_LEVEL_COUNT - 1;
+	i32 highest_level = CLAMP(desired_mip_level, 0, ANNOTATION_MIP_LEVEL_COUNT - 1);
+	highest_level = MIN(highest_level, max_level);
+	i32 lowest_level = MAX(min_level, 0);
+	for (i32 level = highest_level; level >= lowest_level; --level) {
+		u32 level_flag = (1u << level);
+		annotation_mip_level_t* mip = annotation->mip_levels + level;
+		if (!(annotation->mip_valid_flags & level_flag)) {
+			arrfree(mip->coordinates);
+			mip->coordinates = annotation_create_simplified_coordinates(annotation, annotation_mip_tolerance_for_level(level), &mip->coordinate_count);
+			mip->tolerance = annotation_mip_tolerance_for_level(level);
+			annotation->mip_valid_flags |= level_flag;
+		}
+
+		if (mip->coordinates && mip->coordinate_count > 0) {
+			*coordinate_count_out = mip->coordinate_count;
+			return mip->coordinates;
+		}
+	}
+	return annotation->coordinates;
+}
+
+static i32 project_point_onto_coordinates(v2f* coordinates, i32 coordinate_count, bool closed, v2f point, float* t_ptr, v2f* projected_point_ptr, float* distance_ptr);
+
 i32 add_annotation_group(annotation_set_t* annotation_set, const char* name) {
 	annotation_group_t new_group = {};
     new_group.color = default_group_color; // default color
@@ -578,12 +769,15 @@ void interact_with_annotations(app_state_t* app_state, scene_t* scene, input_t* 
 	// Determine which annotation is being targeted by the mouse.
 	annotation_hit_result_t hit_result = {};
 	bool need_select_deselect = false;
+	i32 desired_mip_level = annotation_mip_level_for_screen_point_width(scene->zoom.screen_point_width);
 	if (annotation_set->is_edit_mode) {
 		// For most edit operations, including those targeting a coordinate node, we want to be biased toward the
 		// selected annotation (otherwise we might end up interacting with a non-selected annotation instead)
-		hit_result = get_annotation_hit_result(app_state, annotation_set, scene->mouse,
-											   300.0f * scene->zoom.screen_point_width,
-											   +5.0f * scene->zoom.screen_point_width);
+		bool wants_insert_coordinate = annotation_set->is_insert_coordinate_mode || annotation_set->force_insert_mode || input->keyboard.key_shift.down;
+		float edit_hover_distance = wants_insert_coordinate ? annotation_insert_hover_distance : annotation_hover_distance;
+		hit_result = get_annotation_hit_result(app_state, annotation_set, scene->mouse, -1,
+											   edit_hover_distance * scene->zoom.screen_point_width,
+											   +5.0f * scene->zoom.screen_point_width, false);
 
 		if (!annotation_set->is_insert_coordinate_mode && !annotation_set->is_insert_coordinate_mode) {
 			// In this case we can either try to grab a coordinate node, or select/deselect annotation.
@@ -594,12 +788,15 @@ void interact_with_annotations(app_state_t* app_state, scene_t* scene, input_t* 
 			}
 		}
 	}
-	if (!annotation_set->is_edit_mode || need_select_deselect) {
+	bool need_broad_select_search = (need_select_deselect && scene->clicked) ||
+	                                (!annotation_set->is_edit_mode && scene->clicked) ||
+	                                (scene->is_dragging && input->keyboard.key_ctrl.down && !scene->is_drag_vector_within_click_tolerance);
+	if (need_broad_select_search) {
 		// NOTE: There is a small negative bias for clicking on selected annotations, so that you are more
 		// likely to switch over to another annotation instead of deselecting the one you are on.
-		hit_result = get_annotation_hit_result(app_state, annotation_set, scene->mouse,
+		hit_result = get_annotation_hit_result(app_state, annotation_set, scene->mouse, desired_mip_level,
 		                                       300.0f * scene->zoom.screen_point_width,
-		                                       -5.0f * scene->zoom.screen_point_width);
+		                                       -5.0f * scene->zoom.screen_point_width, !annotation_set->is_edit_mode);
 	}
 
 	if (hit_result.is_valid) {
@@ -797,12 +994,10 @@ void interact_with_annotations(app_state_t* app_state, scene_t* scene, input_t* 
 	if (annotation_set->selection_count > 0) {
 		if (!gui_want_capture_keyboard) {
 			if (was_key_pressed(input, KEY_DeleteForward)) {
-				if (hit_result.annotation_index >= 0) {
-					if (dont_ask_to_delete_annotations) {
-						delete_selected_annotations(app_state, annotation_set);
-					} else {
-						show_delete_annotation_prompt = true;
-					}
+				if (dont_ask_to_delete_annotations) {
+					delete_selected_annotations(app_state, annotation_set);
+				} else {
+					show_delete_annotation_prompt = true;
 				}
 			}
 
@@ -899,7 +1094,7 @@ bool is_point_within_annotation_bounds(annotation_t* annotation, v2f point, floa
 }
 
 // Determine which annotation & coordinate are closest to a certain point in space (e.g., the mouse cursor position)
-annotation_hit_result_t get_annotation_hit_result(app_state_t* app_state, annotation_set_t* annotation_set, v2f point, float bounds_check_tolerance, float bias_for_selected) {
+annotation_hit_result_t get_annotation_hit_result(app_state_t* app_state, annotation_set_t* annotation_set, v2f point, i32 desired_mip_level, float bounds_check_tolerance, float bias_for_selected, bool use_mip_coordinates) {
 	annotation_hit_result_t hit_result = {};
 	hit_result.annotation_index = -1;
 	hit_result.line_segment_coordinate_index = -1;
@@ -931,10 +1126,13 @@ annotation_hit_result_t get_annotation_hit_result(app_state_t* app_state, annota
 				float line_segment_distance = FLT_MAX; // distance to line segment
 				v2f projected_point = {}; // projected point on line segment
 				float t_clamped = 0.0f; // how for we are along the line segment (between 0 and 1)
-				i32 nearest_line_segment_coordinate_index = project_point_onto_annotation(annotation_set, annotation,
-				                                                                          point, &t_clamped,
-				                                                                          &projected_point,
-				                                                                          &line_segment_distance);
+				i32 coordinate_count = 0;
+				v2f* coordinates = annotation_get_mip_coordinates(annotation, desired_mip_level, use_mip_coordinates, &coordinate_count);
+				i32 nearest_line_segment_coordinate_index = project_point_onto_coordinates(coordinates, coordinate_count,
+				                                                                           annotation_is_closed_coordinate_shape(annotation),
+				                                                                           point, &t_clamped,
+				                                                                           &projected_point,
+				                                                                           &line_segment_distance);
 				// Store for later use
 				annotation->line_segment_distance_to_cursor = line_segment_distance;
 				annotation->line_segment_distance_last_updated_frame = app_state->frame_counter;
@@ -960,8 +1158,10 @@ annotation_hit_result_t get_annotation_hit_result(app_state_t* app_state, annota
 		annotation_t* annotation = get_active_annotation(annotation_set, hit_result.annotation_index);
 		// TODO: what about annotations that don't have coordinates?
 		ASSERT(annotation->coordinate_count > 0);
-		for (i32 i = 0; i < annotation->coordinate_count; ++i) {
-			v2f* coordinate = annotation->coordinates + i;
+		i32 coordinate_count = 0;
+		v2f* coordinates = annotation_get_mip_coordinates(annotation, desired_mip_level, use_mip_coordinates, &coordinate_count);
+		for (i32 i = 0; i < coordinate_count; ++i) {
+			v2f* coordinate = coordinates + i;
 			float delta_x = point.x - coordinate->x;
 			float delta_y = point.y - coordinate->y;
 			float sq_distance = SQUARE(delta_x) + SQUARE(delta_y);
@@ -978,12 +1178,12 @@ annotation_hit_result_t get_annotation_hit_result(app_state_t* app_state, annota
 }
 
 
-i32 project_point_onto_annotation(annotation_set_t* annotation_set, annotation_t* annotation, v2f point, float* t_ptr, v2f* projected_point_ptr, float* distance_ptr) {
+static i32 project_point_onto_coordinates(v2f* coordinates, i32 coordinate_count, bool closed, v2f point, float* t_ptr, v2f* projected_point_ptr, float* distance_ptr) {
 	i32 insert_before_index = -1;
-	ASSERT(annotation->coordinate_count > 0);
-	if (annotation->coordinate_count == 1) {
+	ASSERT(coordinate_count > 0);
+	if (coordinate_count == 1) {
 		// trivial case
-		v2f line_point = annotation->coordinates[0];
+		v2f line_point = coordinates[0];
 		if (t_ptr) *t_ptr = 0.0f;
 		if (projected_point_ptr) *projected_point_ptr = line_point;
 		if (distance_ptr) {
@@ -991,18 +1191,17 @@ i32 project_point_onto_annotation(annotation_set_t* annotation_set, annotation_t
 			*distance_ptr = distance;
 		}
 		insert_before_index = 1;
-	} else if (annotation->coordinate_count > 1) {
+	} else if (coordinate_count > 1) {
 		// find the line segment (between coordinates) closest to the point we are checking against
 		float closest_distance_sq = FLT_MAX;
 		v2f closest_projected_point = {};
 		float t_closest = 0.0f;
 		bool found_closest = false;
-		bool is_open_polyline = annotation->is_open || annotation->type == ANNOTATION_LINE;
-		i32 segment_count = is_open_polyline ? annotation->coordinate_count - 1 : annotation->coordinate_count;
+		i32 segment_count = closed ? coordinate_count : coordinate_count - 1;
 		for (i32 i = 0; i < segment_count; ++i) {
-			v2f* coordinate_current = annotation->coordinates + i;
-			i32 coordinate_index_after = (i + 1) % annotation->coordinate_count;
-			v2f* coordinate_after = annotation->coordinates + coordinate_index_after;
+			v2f* coordinate_current = coordinates + i;
+			i32 coordinate_index_after = (i + 1) % coordinate_count;
+			v2f* coordinate_after = coordinates + coordinate_index_after;
 			v2f line_start = *coordinate_current;
 			v2f line_end = *coordinate_after;
 			float t = 0.0f;
@@ -1033,6 +1232,13 @@ i32 project_point_onto_annotation(annotation_set_t* annotation_set, annotation_t
 	return insert_before_index;
 }
 
+i32 project_point_onto_annotation(annotation_set_t* annotation_set, annotation_t* annotation, v2f point, float* t_ptr, v2f* projected_point_ptr, float* distance_ptr) {
+	i32 result = project_point_onto_coordinates(annotation->coordinates, annotation->coordinate_count,
+	                                            annotation_is_closed_coordinate_shape(annotation),
+	                                            point, t_ptr, projected_point_ptr, distance_ptr);
+	return result;
+}
+
 void deselect_annotation_coordinates(annotation_set_t* annotation_set) {
 	annotation_set->selected_coordinate_index = -1;
 	annotation_set->selected_coordinate_annotation_index = -1;
@@ -1048,6 +1254,7 @@ void annotation_invalidate_derived_calculations_from_coordinates(annotation_t* a
 	u32 derived_calculation_flags_mask = (ANNOTATION_VALID_BOUNDS | ANNOTATION_VALID_TESSELATION | ANNOTATION_VALID_AREA | ANNOTATION_VALID_LENGTH);
 	annotation->fallback_valid_flags |= (annotation->valid_flags & derived_calculation_flags_mask);
 	annotation->valid_flags &= ~(derived_calculation_flags_mask);
+	annotation_free_mip_levels(annotation);
 }
 
 void annotation_invalidate_derived_calculations_from_features(annotation_t* annotation) {
@@ -1240,6 +1447,11 @@ void split_annotation(app_state_t* app_state, annotation_set_t* annotation_set, 
 
 	// Reserve space for new coord
 	annotation_t new_annotation = *annotation;
+	new_annotation.tesselated_trianges = NULL;
+	new_annotation.mip_valid_flags = 0;
+	for (i32 i = 0; i < ANNOTATION_MIP_LEVEL_COUNT; ++i) {
+		new_annotation.mip_levels[i] = {};
+	}
 	i32 new_coordinate_count_lower_part = lower_coordinate_index + 1;
 	i32 new_coordinate_count_upper_part = annotation->coordinate_count - upper_coordinate_index;
 	new_annotation.coordinate_count = new_coordinate_count_lower_part + new_coordinate_count_upper_part;
@@ -1450,6 +1662,7 @@ static void draw_annotation_fill_area(temp_memory_t* temp_memory, app_state_t* a
 typedef struct annotation_batch_data_t {
 	i32 start_index;
 	i32 batch_size;
+	i32 desired_mip_level;
 	app_state_t* app_state;
 	scene_t* scene;
 	annotation_set_t* annotation_set;
@@ -1459,7 +1672,7 @@ typedef struct annotation_batch_data_t {
 } annotation_batch_data_t;
 
 
-void draw_annotation_batch(app_state_t* app_state, scene_t* scene, annotation_set_t* annotation_set, v2f camera_min, i32 start_index, i32 batch_size, volatile i32* completion_counter, i32 logical_thread_index, i32 draw_list_index) {
+void draw_annotation_batch(app_state_t* app_state, scene_t* scene, annotation_set_t* annotation_set, v2f camera_min, i32 start_index, i32 batch_size, i32 desired_mip_level, volatile i32* completion_counter, i32 logical_thread_index, i32 draw_list_index) {
 	ImDrawList* draw_list = gui_get_extra_drawlist(draw_list_index);
 	i32 end_index = MIN(start_index + batch_size, annotation_set->active_annotation_count);
 	for (i32 annotation_index = start_index; annotation_index < end_index; ++annotation_index) {
@@ -1533,21 +1746,24 @@ void draw_annotation_batch(app_state_t* app_state, scene_t* scene, annotation_se
 
 			// Draw the annotation in the background list (behind UI elements), as a thick colored line
 			if (need_full_draw) {
-				v2f* points = (v2f*) arena_push_size(temp_memory.arena, sizeof(v2f) * annotation->coordinate_count);
-				for (i32 i = 0; i < annotation->coordinate_count; ++i) {
-					points[i] = world_pos_to_screen_pos(scene, annotation->coordinates[i]);
+				i32 draw_coordinate_count = 0;
+				bool use_mip_coordinates = !need_draw_nodes;
+				v2f* draw_coordinates = annotation_get_mip_coordinates(annotation, desired_mip_level, use_mip_coordinates, &draw_coordinate_count);
+				v2f* points = (v2f*) arena_push_size(temp_memory.arena, sizeof(v2f) * draw_coordinate_count);
+				for (i32 i = 0; i < draw_coordinate_count; ++i) {
+					points[i] = world_pos_to_screen_pos(scene, draw_coordinates[i]);
 				}
-				if (annotation->coordinate_count >= 4 || annotation->type == ANNOTATION_LINE) {
-					gui_draw_polygon_outline(points, annotation->coordinate_count, line_color, closed, thickness, draw_list);
-				} else if (annotation->coordinate_count >= 2) {
+				if (draw_coordinate_count >= 4 || annotation->type == ANNOTATION_LINE) {
+					gui_draw_polygon_outline(points, draw_coordinate_count, line_color, closed, thickness, draw_list);
+				} else if (draw_coordinate_count >= 2) {
 					draw_list->AddLine(points[0], points[1], *(u32*)(&line_color), thickness);
-					if (annotation->coordinate_count == 3) {
+					if (draw_coordinate_count == 3) {
 						draw_list->AddLine(points[1], points[2], *(u32*)(&line_color), thickness);
 						if (closed) {
 							draw_list->AddLine(points[2], points[0], *(u32*)(&line_color), thickness);
 						}
 					}
-				} else if (annotation->coordinate_count == 1) {
+				} else if (draw_coordinate_count == 1) {
 					// In this situation, need_draw_nodes is set to true (so we'll draw the node later)
 //				    annotation_draw_coordinate_dot(draw_list, points[0], annotation_node_size * 0.7f, base_color);
 				}
@@ -1601,7 +1817,7 @@ void draw_annotation_batch(app_state_t* app_state, scene_t* scene, annotation_se
 void draw_annotation_batch_func(i32 logical_thread_index, void* userdata)  {
 	annotation_batch_data_t* data = (annotation_batch_data_t*) userdata;
 	if (data && data->annotation_set) {
-		draw_annotation_batch(data->app_state, data->scene, data->annotation_set, data->camera_min, data->start_index, data->batch_size, data->completion_counter, logical_thread_index, data->draw_list_index);
+		draw_annotation_batch(data->app_state, data->scene, data->annotation_set, data->camera_min, data->start_index, data->batch_size, data->desired_mip_level, data->completion_counter, logical_thread_index, data->draw_list_index);
 	} else {
 		fatal_error("invalid task data");
 	}
@@ -1612,6 +1828,7 @@ void draw_annotations(app_state_t* app_state, scene_t* scene, annotation_set_t* 
 	if (!scene->enable_annotations) return;
 
 	recount_selected_annotations(app_state, annotation_set);
+	i32 desired_mip_level = annotation_mip_level_for_screen_point_width(scene->zoom.screen_point_width);
 
 	// First, we do the noninteractive part of annotation drawing.
 	// This can be split into batches for multithreading. This improves performance for large annotation sets.
@@ -1645,6 +1862,7 @@ void draw_annotations(app_state_t* app_state, scene_t* scene, annotation_set_t* 
 			annotation_batch_data_t batch_data = {
 				.start_index = start_index,
 				.batch_size = batch_size,
+				.desired_mip_level = desired_mip_level,
 				.app_state = app_state,
 				.scene = scene,
 				.annotation_set = annotation_set,
@@ -1653,7 +1871,7 @@ void draw_annotations(app_state_t* app_state, scene_t* scene, annotation_set_t* 
 				.completion_counter = &completion_counter,
 			};
 			if (!thread_pool_submit_high_priority_task(&global_thread_pool, draw_annotation_batch_func, &batch_data, sizeof(batch_data))) {
-				draw_annotation_batch(app_state, scene, annotation_set, camera_min, start_index, batch_size, &completion_counter, 0, batch);
+				draw_annotation_batch(app_state, scene, annotation_set, camera_min, start_index, batch_size, desired_mip_level, &completion_counter, 0, batch);
 			}
 		}
 		while (completion_counter < annotation_batch_count) {
@@ -1669,7 +1887,7 @@ void draw_annotations(app_state_t* app_state, scene_t* scene, annotation_set_t* 
 		for (i32 batch = 0; batch < annotation_batch_count; ++batch) {
 			i32 start_index = batch * annotations_per_batch;
 			i32 batch_size = MIN(annotation_set->active_annotation_count - start_index, annotations_per_batch);
-			draw_annotation_batch(app_state, scene, annotation_set, camera_min, start_index, batch_size, &completion_counter, 0, batch);
+			draw_annotation_batch(app_state, scene, annotation_set, camera_min, start_index, batch_size, desired_mip_level, &completion_counter, 0, batch);
 		}
 	}
 
@@ -2846,12 +3064,17 @@ annotation_t duplicate_annotation(annotation_t* annotation) {
 	result.valid_flags = 0;
 	result.fallback_valid_flags = 0;
 	result.tesselated_trianges = NULL;
+	result.mip_valid_flags = 0;
+	for (i32 i = 0; i < ANNOTATION_MIP_LEVEL_COUNT; ++i) {
+		result.mip_levels[i] = {};
+	}
 
 	return result;
 }
 
 void destroy_annotation(annotation_t* annotation) {
 	if (annotation) {
+		annotation_free_mip_levels(annotation);
 		arrfree(annotation->coordinates);
 		arrfree(annotation->tesselated_trianges);
 		annotation->coordinates = NULL;

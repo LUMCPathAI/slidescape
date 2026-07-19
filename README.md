@@ -17,19 +17,7 @@ The viewer has built-in support for:
 * Simple images (JPEG, PNG).
 * DICOM.
 
-Slidescape can also detect and load the [OpenSlide](https://github.com/openslide/openslide) library at runtime.
 If OpenSlide is present, the Aperio, Hamamatsu, Leica, MIRAX, Sakura, Trestle, and Ventana formats can additionally be loaded.
-
-To enable OpenSlide support on Windows, download (or compile) the [64-bit binaries](https://openslide.org/download/)
-and put all of the DLL files together in an `openslide/` folder, and put that folder in the same location as `slidescape.exe`.
-
-To enable OpenSlide support on Linux, install the `openslide` library, either using a package manager or
-by building and installing it manually. The program will try to locate `libopenslide.so`, either in the
-default system library paths or in `/usr/local/lib/`.
-
-To enable OpenSlide support on macOS, install the `openslide` library using Homebrew or MacPorts.
-The program will try to locate `libopenslide.dylib` in the default install path: either `/usr/local/opt/openslide/lib/` for
-Homebrew, or `/opt/local/lib/` for MacPorts.
 
 ### Viewing options
 
@@ -158,6 +146,22 @@ cd ..
 cmake --build build --target slidescape -- -j
 ./slidescape
 ```
+
+### OpenSlide support
+
+Slidescape can detect and load the [OpenSlide](https://github.com/openslide/openslide) library at runtime.
+
+To enable OpenSlide support on Windows, download (or compile) the [64-bit binaries](https://openslide.org/download/)
+and put all of the DLL files together in an `openslide/` folder, and put that folder in the same location as `slidescape.exe`.
+
+To enable OpenSlide support on Linux, install the `openslide` library, either using a package manager or
+by building and installing it manually. The program will try to locate `libopenslide.so`, either in the
+default system library paths or in `/usr/local/lib/`.
+
+On macOS release builds, the official OpenSlide binary distribution can be bundled inside `Slidescape.app`.
+As an alternative, you can install the `openslide` library using Homebrew or MacPorts.
+The program will try to locate `libopenslide.dylib` in the app bundle first, then `/opt/local/lib/libopenslide.dylib`,
+`/opt/homebrew/opt/openslide/lib/libopenslide.dylib`, and `/usr/local/opt/openslide/lib/libopenslide.dylib`.
 
 
 ## Credits

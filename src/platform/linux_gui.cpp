@@ -34,6 +34,27 @@
 
 
 SDL_Window* g_window;
+static SDL_Cursor* global_cursor_arrow;
+static SDL_Cursor* global_cursor_crosshair;
+static SDL_Cursor* global_current_cursor;
+
+static void linux_init_cursors() {
+    if (!global_cursor_arrow) {
+        global_cursor_arrow = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_ARROW);
+        if (!global_cursor_arrow) {
+            console_print_error("Failed to create arrow cursor: %s\n", SDL_GetError());
+        }
+    }
+    if (!global_cursor_crosshair) {
+        global_cursor_crosshair = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_CROSSHAIR);
+        if (!global_cursor_crosshair) {
+            console_print_error("Failed to create crosshair cursor: %s\n", SDL_GetError());
+        }
+    }
+    if (!global_current_cursor) {
+        global_current_cursor = global_cursor_arrow;
+    }
+}
 
 void message_box(window_handle_t window, const char* message) {
 //	NSRunAlertPanel(@"Title", @"This is your message.", @"OK", nil, nil);
@@ -63,35 +84,53 @@ void set_swap_interval(int interval) {
 // TODO: how to detect if SDL_SetRelativeMouseMode will work properly or not?
 // Do we simply disable by default, and add an option to re-enable cursor hiding?
 
+static bool can_safely_enable_relative_mouse_mode;
+void determine_if_relative_mouse_mode_can_be_safely_enabled(SDL_version version) {
+    if (version.major == 2) {
+        can_safely_enable_relative_mouse_mode = true;
+    } else if (version.major == 2) {
+        if (version.minor >= 24) {
+            can_safely_enable_relative_mouse_mode = true;
+        }
+    }
+}
+
 void mouse_show() {
     if (cursor_hidden) {
-        cursor_hidden = false;
-#if 0
         SDL_SetRelativeMouseMode(SDL_FALSE);
-#endif
+        cursor_hidden = false;
     }
 }
 
 void mouse_hide() {
-    if (!cursor_hidden) {
+    if (!cursor_hidden && !gui_want_capture_mouse) {
+        if (can_safely_enable_relative_mouse_mode && SDL_SetRelativeMouseMode(SDL_TRUE) != 0) {
+            console_print_error("Failed to enable relative mouse mode: %s\n", SDL_GetError());
+            return;
+        }
         cursor_hidden = true;
-        // TODO: fix mouse hiding on macOS while panning
-#if 0
-        SDL_SetRelativeMouseMode(SDL_TRUE);
-#endif
     }
 }
 
 void update_cursor() {
-    // TODO:
+    if (!gui_user_can_resize_at_window_edge) {
+        linux_init_cursors();
+        if (global_current_cursor) {
+            SDL_SetCursor(global_current_cursor);
+        }
+    }
 }
 
 void set_cursor_default() {
-    // TODO: SetCursor(global_cursor_arrow);
+    linux_init_cursors();
+    global_current_cursor = global_cursor_arrow;
+    update_cursor();
 }
 
 void set_cursor_crosshair() {
-    // TODO: SetCursor(global_cursor_arrow);
+    linux_init_cursors();
+    global_current_cursor = global_cursor_crosshair;
+    update_cursor();
 }
 
 bool need_open_file_dialog = false;
@@ -235,4 +274,3 @@ bool check_fullscreen(window_handle_t window) {
     bool fullscreen = SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP;
     return fullscreen;
 }
-

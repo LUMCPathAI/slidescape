@@ -13,6 +13,18 @@ option(BUILD_SLIDESERVER "Build the experimental slideserver executable" OFF)
 option(USE_JPEG_SIMD "Use SIMD code for libjpeg-turbo" ON)
 option(USE_ADDRESS_SANITIZER "Use address sanitizer" OFF)
 
+if (APPLE)
+    # For macOS: to produce a notarization-ready app bundle, sign with a Developer ID Application certificate, passing cmake flags:
+    #   -DWITH_CODESIGN=ON -DMACOS_CODESIGN_IDENTITY="Developer ID Application: Your Team"
+    option(WITH_CODESIGN "Code-sign the macOS app bundle after building" OFF)
+    option(MACOS_BUNDLE_OPENSLIDE "Bundle OpenSlide and its non-system dylib dependencies in the macOS app bundle" ON)
+    set(MACOS_CODESIGN_IDENTITY "Developer ID Application" CACHE STRING "Code-signing identity for the macOS app bundle")
+    set(MACOS_CODESIGN_ENTITLEMENTS "" CACHE FILEPATH "Optional entitlements plist for signing the macOS app bundle")
+    # NOTE: the script will by default look in `~/Downloads` for an OpenSlide binary distribution named `openslide-bin-*-macos-arm64-x86_64`
+    set(MACOS_OPENSLIDE_DYLIB "" CACHE FILEPATH "Optional path to libopenslide.dylib for the macOS app bundle")
+    set(MACOS_OPENSLIDE_ROOT "" CACHE PATH "Optional path to an official OpenSlide macOS binary distribution")
+endif()
+
 # Detect CPU type and whether we're building 64-bit or 32-bit code
 math(EXPR BITS "${CMAKE_SIZEOF_VOID_P} * 8")
 string(TOLOWER ${CMAKE_SYSTEM_PROCESSOR} CMAKE_SYSTEM_PROCESSOR_LC)
@@ -424,22 +436,59 @@ elseif(APPLE)
     target_link_libraries(slidescape ${SDL2_LIBRARIES})
     set_target_properties(slidescape PROPERTIES OUTPUT_NAME Slidescape)
 
-
-    # Copy the .dylib file for SDL2 into the slidescape.app/Contents/MacOS folder.
-    # And modify the executable, so that the packaged .dylib files are loaded at runtime.
+    # Copy bundled dylibs into the app and rewrite install names so the app can
+    # run on machines without Homebrew/MacPorts.
     set(BUNDLE_BINARY_DIR "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/Slidescape.app/Contents/MacOS")
-    execute_process(COMMAND uname -m COMMAND tr -d '\n' OUTPUT_VARIABLE ARCHITECTURE)
-    execute_process(COMMAND sdl2-config --prefix COMMAND tr -d '\n' OUTPUT_VARIABLE SDL2_PREFIX)
-    set(FIND_LINKED_DYLIB_COMMAND otool -L ${BUNDLE_BINARY_DIR}/slidescape | grep SDL2- -m 1 | cut -d' ' -f1)
+    set(ARCHITECTURE "${CPU_TYPE}")
+    execute_process(COMMAND sdl2-config --prefix OUTPUT_VARIABLE SDL2_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE)
+    set(SDL2_DYLIB "${SDL2_PREFIX}/lib/libSDL2.dylib")
+    if(MACOS_BUNDLE_OPENSLIDE AND NOT MACOS_OPENSLIDE_DYLIB AND MACOS_OPENSLIDE_ROOT)
+        set(OPENSLIDE_CANDIDATE "${MACOS_OPENSLIDE_ROOT}/lib/libopenslide.dylib")
+        if(EXISTS "${OPENSLIDE_CANDIDATE}")
+            set(MACOS_OPENSLIDE_DYLIB "${OPENSLIDE_CANDIDATE}")
+        else()
+            message(WARNING "MACOS_OPENSLIDE_ROOT does not contain lib/libopenslide.dylib: ${MACOS_OPENSLIDE_ROOT}")
+        endif()
+    endif()
+    if(MACOS_BUNDLE_OPENSLIDE AND NOT MACOS_OPENSLIDE_DYLIB)
+        file(GLOB OPENSLIDE_OFFICIAL_DISTS
+                "$ENV{HOME}/Downloads/openslide-bin-*-macos-arm64-x86_64"
+                "$ENV{HOME}/Downloads/openslide-bin-*-macos-x86_64-arm64")
+        list(SORT OPENSLIDE_OFFICIAL_DISTS)
+        list(REVERSE OPENSLIDE_OFFICIAL_DISTS)
+        foreach(OPENSLIDE_DIST ${OPENSLIDE_OFFICIAL_DISTS})
+            set(OPENSLIDE_CANDIDATE "${OPENSLIDE_DIST}/lib/libopenslide.dylib")
+            if(EXISTS "${OPENSLIDE_CANDIDATE}")
+                set(MACOS_OPENSLIDE_DYLIB "${OPENSLIDE_CANDIDATE}")
+                break()
+            endif()
+        endforeach()
+    endif()
+    if(MACOS_BUNDLE_OPENSLIDE AND MACOS_OPENSLIDE_DYLIB)
+        message(STATUS "Bundling OpenSlide from ${MACOS_OPENSLIDE_DYLIB}")
+    elseif(MACOS_BUNDLE_OPENSLIDE)
+        message(WARNING "MACOS_BUNDLE_OPENSLIDE is ON, but no official OpenSlide macOS binary distribution was found")
+    endif()
+
     add_custom_command(TARGET slidescape POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${BUNDLE_BINARY_DIR}/${ARCHITECTURE}"
-            COMMAND cp -f "${SDL2_PREFIX}/lib/libSDL2.dylib" "${BUNDLE_BINARY_DIR}/${ARCHITECTURE}/libSDL2.dylib"
-            COMMAND cp -f "${CMAKE_SOURCE_DIR}/src/Info.plist" "${BUNDLE_BINARY_DIR}/../Info.plist"
-            COMMAND install_name_tool -change `${FIND_LINKED_DYLIB_COMMAND}`
-            @executable_path/${ARCHITECTURE}/libSDL2.dylib "${BUNDLE_BINARY_DIR}/Slidescape")
+            COMMAND ${CMAKE_COMMAND}
+                -DBUNDLE_BINARY_DIR="${BUNDLE_BINARY_DIR}"
+                -DARCHITECTURE="${ARCHITECTURE}"
+                -DSDL2_DYLIB="${SDL2_DYLIB}"
+                -DOPENSLIDE_DYLIB="${MACOS_OPENSLIDE_DYLIB}"
+                -P "${CMAKE_SOURCE_DIR}/resources/bundle_macos_dylibs.cmake"
+            COMMAND cp -f "${CMAKE_SOURCE_DIR}/src/Info.plist" "${BUNDLE_BINARY_DIR}/../Info.plist")
     if (WITH_CODESIGN)
+        if(MACOS_CODESIGN_ENTITLEMENTS)
+            set(MACOS_CODESIGN_ENTITLEMENTS_ARGS --entitlements "${MACOS_CODESIGN_ENTITLEMENTS}")
+        else()
+            set(MACOS_CODESIGN_ENTITLEMENTS_ARGS "")
+        endif()
         add_custom_command(TARGET slidescape POST_BUILD
-                COMMAND codesign --deep -s "Developer ID Application" ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/Slidescape.app)
+                COMMAND codesign --force --deep --timestamp --options runtime
+                    --sign "${MACOS_CODESIGN_IDENTITY}"
+                    ${MACOS_CODESIGN_ENTITLEMENTS_ARGS}
+                    "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/Slidescape.app")
     endif()
 else()
     add_executable(slidescape ${VIEWER_SOURCE_FILES} ${LIBRARY_SOURCE_FILES})

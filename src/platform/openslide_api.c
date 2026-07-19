@@ -85,21 +85,23 @@ bool init_openslide() {
 	SetDllDirectoryW(NULL);
 
 #elif defined(__APPLE__)
-	void* library_handle = dlopen("libopenslide.dylib", RTLD_LAZY);
+	void* library_handle = dlopen("@executable_path/libopenslide.dylib", RTLD_LAZY);
 	if (!library_handle) {
-		// Check expected library path for MacPorts
-		library_handle = dlopen("/opt/local/lib/libopenslide.dylib", RTLD_LAZY);
+		library_handle = dlopen("libopenslide.dylib", RTLD_LAZY);
 		if (!library_handle) {
-			// Check expected library path for Homebrew
-			// The path difers for Apple Silicon and Intel. We'll check the Apple Silicon prefix first,
-			// and fall back on the Intel prefix if that fails.
-			library_handle = dlopen("/opt/homebrew/opt/openslide/lib/libopenslide.dylib", RTLD_LAZY);
+			// Check expected library path for MacPorts
+			library_handle = dlopen("/opt/local/lib/libopenslide.dylib", RTLD_LAZY);
 			if (!library_handle) {
-				// Check expected library path for Homebrew (Intel)
-				library_handle = dlopen("/usr/local/opt/openslide/lib/libopenslide.dylib", RTLD_LAZY);
+				// Check expected library path for Homebrew
+				// The path differs for Apple Silicon and Intel. We'll check the Apple Silicon prefix first,
+				// and fall back on the Intel prefix if that fails.
+				library_handle = dlopen("/opt/homebrew/opt/openslide/lib/libopenslide.dylib", RTLD_LAZY);
+				if (!library_handle) {
+					// Check expected library path for Homebrew (Intel)
+					library_handle = dlopen("/usr/local/opt/openslide/lib/libopenslide.dylib", RTLD_LAZY);
+				}
 			}
 		}
-
 	}
 #else
 	void* library_handle = dlopen("libopenslide.so", RTLD_LAZY);

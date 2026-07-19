@@ -28,6 +28,7 @@
 #include "gui.h" // TODO: move
 #include "dicom.h"
 #include "presenter.h"
+#include "profiler.h"
 #include "stringutils.h"
 
 #include "imgui.h"
@@ -679,7 +680,12 @@ int main(int argc, const char** argv)
         return -1;
     }
 	float seconds_elapsed_sdl_init = get_seconds_elapsed(clock_sdl_begin, get_clock());
-	console_print_verbose("Initialized SDL in %g seconds\n", seconds_elapsed_sdl_init);
+
+	SDL_version sdl_version = {};
+	SDL_GetVersion(&sdl_version);
+	console_print("SDL version: %d.%d.%d (initialized in %.03f seconds)\n", sdl_version.major, sdl_version.minor, sdl_version.patch, seconds_elapsed_sdl_init);
+
+	determine_if_relative_mouse_mode_can_be_safely_enabled(sdl_version);
 
 	// Create window with graphics context
 	presenter_window_desc_t renderer_window_desc = {};
@@ -687,12 +693,15 @@ int main(int argc, const char** argv)
 	renderer_window_desc.width = desired_window_width;
 	renderer_window_desc.height = desired_window_height;
 	renderer_window_desc.start_maximized = window_start_maximized;
+	i64 linux_init_begin = get_clock();
     if (!presenter_init_window(&renderer_window_desc, PRESENTER_API_OPENGL)) {
 	    return 1;
     }
     SDL_Window* window = presenter_get_window();
     g_window = window;
 	app_state->main_window = window;
+	float seconds_elapsed_linux_init = get_seconds_elapsed(linux_init_begin, get_clock());
+	console_print("Initialized window in %.03f seconds\n", seconds_elapsed_linux_init);
 
 #if LINUX
 	linux_create_single_instance_socket();
@@ -877,11 +886,15 @@ int main(int argc, const char** argv)
         last_clock = current_clock;
         delta_t = CLAMP(delta_t, 0.00001f, 2.0f / 60.0f); // prevent physics overshoot at lag spikes
 
+	    profiler_new_frame();
+	    profiler_begin(PROFILER_SECTION_FRAME);
+
         // Poll and handle events (inputs, window resize, etc.)
         // You can read the io.WantCaptureMouse, io.WantCaptureKeyboard flags to tell if dear imgui wants to use your inputs.
         // - When io.WantCaptureMouse is true, do not dispatch mouse input data to your main application.
         // - When io.WantCaptureKeyboard is true, do not dispatch keyboard input data to your main application.
         // Generally you may always pass all inputs to dear imgui, and hide them from your application based on those two flags.
+	    profiler_begin(PROFILER_SECTION_INPUT);
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL2_ProcessEvent(&event);
@@ -925,6 +938,7 @@ int main(int argc, const char** argv)
 #endif
 
         linux_process_input();
+	    profiler_end(PROFILER_SECTION_INPUT);
 
 	    if (was_key_pressed(curr_input, KEY_F4) && curr_input->keyboard.key_alt.down) {
 		    need_quit = true;
@@ -958,15 +972,20 @@ int main(int argc, const char** argv)
         }
 
         // Start the Dear ImGui frame
+	    profiler_begin(PROFILER_SECTION_GUI_NEW_FRAME);
 		presenter_imgui_new_frame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 	    gui_reset_all_extra_drawlists();
+	    profiler_end(PROFILER_SECTION_GUI_NEW_FRAME);
 
         // Update and render our application
+	    profiler_begin(PROFILER_SECTION_VIEWER);
         viewer_update_and_render(app_state, curr_input, display_w, display_h, delta_t);
+	    profiler_end(PROFILER_SECTION_VIEWER);
 
         // Finish up by rendering the UI
+	    profiler_begin(PROFILER_SECTION_IMGUI_RENDER);
         ImGui::Render();
 		presenter_set_viewport((int) io.DisplaySize.x, (int) io.DisplaySize.y);
 
@@ -1003,8 +1022,13 @@ int main(int argc, const char** argv)
 
 		// Render the rest of the ImGui draw data (submitted on the main thread)
 		presenter_render_imgui_draw_data(ImGui::GetDrawData());
+	    profiler_end(PROFILER_SECTION_IMGUI_RENDER);
 
+	    profiler_begin(PROFILER_SECTION_PRESENT);
 		presenter_present();
+	    profiler_end(PROFILER_SECTION_PRESENT);
+
+	    profiler_end(PROFILER_SECTION_FRAME);
 
         float frame_time = get_seconds_elapsed(last_clock, get_clock());
 
