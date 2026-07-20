@@ -236,6 +236,22 @@ void dicomweb_instance_metadata_destroy(dicomweb_instance_metadata_t* metadata) 
 	metadata->frame_map_count = 0;
 }
 
+void dicomweb_remote_image_destroy(dicomweb_remote_image_t* remote) {
+	if (!remote) return;
+	for (i32 i = 0; i < remote->instance_count; ++i) {
+		dicomweb_instance_metadata_destroy(remote->instances + i);
+	}
+	free(remote->instances);
+	free(remote->available_series);
+	memset(remote->authorization_header, 0, sizeof(remote->authorization_header));
+	remote->instances = NULL;
+	remote->instance_count = 0;
+	remote->instance_capacity = 0;
+	remote->available_series = NULL;
+	remote->available_series_count = 0;
+	remote->available_series_capacity = 0;
+}
+
 i32 dicomweb_parse_instance_refs(const char* json, size_t json_size,
                                  dicomweb_instance_ref_t* out, i32 capacity) {
 	if (!json || !json_size || (capacity > 0 && !out) || capacity < 0) return 0;
@@ -389,6 +405,7 @@ static bool copy_parameter(const char* text, const char* name, char* dest, size_
 bool dicomweb_parse_multipart_frame(const u8* body, size_t body_size,
                                     const char* response_content_type,
                                     dicomweb_frame_t* out) {
+	static const size_t max_part_header_size = KILOBYTES(16);
 	if (!body || !body_size || !response_content_type || !out) return false;
 	memset(out, 0, sizeof(*out));
 	char boundary[256];
@@ -400,7 +417,8 @@ bool dicomweb_parse_multipart_frame(const u8* body, size_t body_size,
 	if (!part) return false;
 	const u8* headers = part + marker_length;
 	size_t remaining = body_size - (size_t)(headers - body);
-	const u8* payload = find_bytes(headers, remaining, "\r\n\r\n", 4);
+	size_t header_search_size = MIN(remaining, max_part_header_size + 4);
+	const u8* payload = find_bytes(headers, header_search_size, "\r\n\r\n", 4);
 	if (!payload) return false;
 	payload += 4;
 	remaining = body_size - (size_t)(payload - body);
@@ -410,6 +428,7 @@ bool dicomweb_parse_multipart_frame(const u8* body, size_t body_size,
 	if (!end || end <= payload) return false;
 
 	size_t header_size = (size_t)(payload - 4 - headers);
+	if (header_size > max_part_header_size) return false;
 	char* header_text = (char*)malloc(header_size + 1);
 	if (!header_text) return false;
 	memcpy(header_text, headers, header_size);
@@ -463,7 +482,7 @@ bool dicomweb_build_frame_path(char* dest, size_t dest_size,
 	return build_path(dest, dest_size, root, study_uid, series_uid, instance_uid, suffix);
 }
 
-static bool is_dicom_uid(const char* value, size_t length) {
+bool dicomweb_is_valid_uid(const char* value, size_t length) {
 	if (!value || !length || length > 64 || value[0] == '.' || value[length - 1] == '.') return false;
 	for (size_t i = 0; i < length; ++i) {
 		if ((value[i] < '0' || value[i] > '9') && value[i] != '.') return false;
@@ -491,7 +510,8 @@ bool dicomweb_resolve_series_url(char* dest, size_t dest_size, const char* url) 
 	if (!series_end) series_end = series + strlen(series);
 	size_t study_length = (size_t)(series_marker - study);
 	size_t series_length = (size_t)(series_end - series);
-	if (!is_dicom_uid(study, study_length) || !is_dicom_uid(series, series_length)) return false;
+	if (!dicomweb_is_valid_uid(study, study_length) ||
+	    !dicomweb_is_valid_uid(series, series_length)) return false;
 
 	static const char idc_dicomweb_base[] =
 		"https://proxy.imaging.datacommons.cancer.gov/current/"

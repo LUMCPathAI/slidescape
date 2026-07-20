@@ -88,6 +88,16 @@ As of 2026-07-19:
   roots open the DICOMweb Archive browser;
 - QIDO result storage is dynamically sized rather than silently capped by the
   browser's former fixed study/series/instance arrays;
+- DICOMweb HTTP responses now use a bounded incremental parser: response headers,
+  DICOM JSON bodies, frame bodies, and multipart part headers have explicit
+  limits, and an early connection close is rejected as a truncated response;
+- configured URLs, DICOM UIDs, and generated request header/path text are
+  validated before an HTTP request is sent;
+- archive browsing uses bounded QIDO `limit`/`offset` pagination, detects repeated
+  pages from servers that ignore offsets, and asks the user to refine searches
+  after the 1,000-result browser safety limit;
+- series opening also paginates instance discovery, with a separate 10,000-instance
+  safety limit, so large concatenations are no longer silently cut off;
 - DICOMweb requests poll for cancellation and use a 30-second total request
   deadline after connecting;
 - the three local UMCU slides were verified to use separate Study and Series
@@ -129,7 +139,7 @@ As of 2026-07-19:
   JPEG Baseline, brightfield VOLUME instances, one optical path, and one focal
   plane;
 - the next client work is richer logical-slide/technical-detail metadata,
-  QIDO pagination and server-side search, connect/write deadlines, associated
+  QIDO server-side search, separate connect/write/idle-read deadlines, associated
   images, sparse frame mapping, and OAuth/OIDC bearer-token acquisition;
 - the public IDC proxy was exercised against study
   `2.25.211094631316408413440371843585977094852`, series
@@ -142,6 +152,9 @@ As of 2026-07-19:
   parent UIDs from the request context;
 - pasted IDC Slim viewer series URLs are translated at the URL-adapter boundary to
   IDC's documented unauthenticated proxy DICOMweb endpoint.
+- the IDC series-opening regression can run headlessly from the command line; after
+  the transport, storage, and pagination hardening it again opened the three
+  pyramid instances within the 30-second request deadline.
 
 This establishes the local-file reader as a regression oracle for the future
 DICOMweb backend. Both local reference archives now have pinned harnesses and a
@@ -161,15 +174,13 @@ not as completion of M1 or M2. Development should now prioritize the M1 transpor
 and parser acceptance criteria before adding more archive-browser or ingestion
 features. In particular:
 
-- bound response headers, metadata bodies, multipart headers, and frame parts before
-  allocation; the current transport buffers complete bodies;
-- reject truncated HTTP messages rather than returning a partial response after an
-  early connection close;
-- replace fixed backend instance/series arrays with owned dynamic storage before
-  concatenations or broad archive interoperability;
+- keep the new response/header limits conservative and make them configurable if
+  real conformant archives demonstrate a need for larger payloads;
+- retain truncated-response regression coverage when the transport is refactored;
+- retain explicit ownership tests around the dynamically allocated backend
+  instance and sibling-series storage;
 - separate connect, write, idle-read, and total deadlines and report which one fired;
-- validate configured URLs and reject control characters before constructing an
-  HTTP request;
+- retain configured-URL, UID, and request-injection validation coverage;
 - add QIDO pagination and server-side filters before browsing a cloud-scale archive;
 - make captured IDC QIDO, metadata, and multipart shapes regression fixtures, while
   keeping live IDC tests optional because the public proxy has quotas and mutable

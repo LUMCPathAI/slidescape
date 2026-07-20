@@ -1649,11 +1649,7 @@ void image_destroy(image_t* image) {
 			} else if (image->backend == IMAGE_BACKEND_SLIDE_SCORE) {
 				DUMMY_STATEMENT;
 			} else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
-				for (i32 i = 0; i < image->dicomweb.instance_count; ++i) {
-					dicomweb_instance_metadata_destroy(image->dicomweb.instances + i);
-				}
-				memset(image->dicomweb.authorization_header, 0,
-				       sizeof(image->dicomweb.authorization_header));
+				dicomweb_remote_image_destroy(&image->dicomweb);
 			} else if (image->backend == IMAGE_BACKEND_STBI) {
 				if (image->simple.pixels) {
 					stbi_image_free(image->simple.pixels);

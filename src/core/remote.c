@@ -645,56 +645,13 @@ static i32 header_field_callback(http_parser *parser, const char *p, size_t len)
 typedef struct http_response_parse_context_t {
     http_response_t* response;
     bool message_complete;
-    bool last_was_header_value;
-    char header_name[128];
-    size_t header_name_length;
-    char header_value[512];
-    size_t header_value_length;
 } http_response_parse_context_t;
-
-static void http_response_commit_header(http_response_parse_context_t* context) {
-    context->header_name[context->header_name_length] = '\0';
-    context->header_value[context->header_value_length] = '\0';
-    if (strcasecmp(context->header_name, "Content-Type") == 0) {
-        copy_cstring(context->response->content_type, context->header_value,
-                     sizeof(context->response->content_type));
-    }
-    context->header_name_length = 0;
-    context->header_value_length = 0;
-}
 
 static i32 body_callback(http_parser *parser, const char *p, size_t len) {
     http_response_parse_context_t* context = (http_response_parse_context_t*)parser->data;
-    if (context->last_was_header_value) {
-        http_response_commit_header(context);
-        context->last_was_header_value = false;
-    }
     http_response_t* response = context->response;
     memrw_push_back(&response->buffer, (void*)p, len);
     response->content_length += len;
-    return 0;
-}
-
-static i32 response_header_field_callback(http_parser* parser, const char* p, size_t len) {
-    http_response_parse_context_t* context = (http_response_parse_context_t*)parser->data;
-    if (context->last_was_header_value) {
-        http_response_commit_header(context);
-        context->last_was_header_value = false;
-    }
-    size_t available = sizeof(context->header_name) - 1 - context->header_name_length;
-    size_t copy_length = ATMOST(len, available);
-    memcpy(context->header_name + context->header_name_length, p, copy_length);
-    context->header_name_length += copy_length;
-    return 0;
-}
-
-static i32 response_header_value_callback(http_parser* parser, const char* p, size_t len) {
-    http_response_parse_context_t* context = (http_response_parse_context_t*)parser->data;
-    size_t available = sizeof(context->header_value) - 1 - context->header_value_length;
-    size_t copy_length = ATMOST(len, available);
-    memcpy(context->header_value + context->header_value_length, p, copy_length);
-    context->header_value_length += copy_length;
-    context->last_was_header_value = true;
     return 0;
 }
 
@@ -730,6 +687,28 @@ static i32 remote_build_get_request_with_headers(char* request, size_t request_s
                                                  const char* host, const char* path,
                                                  const char* accept, const char* extra_headers,
                                                  bool close_after_request) {
+	if (!host || !host[0] || !path || path[0] != '/') return -1;
+	for (const u8* p = (const u8*)host; *p; ++p) {
+		if (*p <= 0x20 || *p == 0x7f) return -1;
+	}
+	for (const u8* p = (const u8*)path; *p; ++p) {
+		if (*p <= 0x20 || *p == 0x7f) return -1;
+	}
+	if (accept) {
+		for (const u8* p = (const u8*)accept; *p; ++p) {
+			if (*p == '\r' || *p == '\n' || *p == 0x7f) return -1;
+		}
+	}
+	if (extra_headers) {
+		if (strstr(extra_headers, "\r\n\r\n")) return -1;
+		for (const u8* p = (const u8*)extra_headers; *p; ++p) {
+			if (*p == 0x7f || (*p < 0x20 && *p != '\r' && *p != '\n' && *p != '\t')) {
+				return -1;
+			}
+			if (*p == '\r' && p[1] != '\n') return -1;
+			if (*p == '\n' && (p == (const u8*)extra_headers || p[-1] != '\r')) return -1;
+		}
+	}
     return snprintf(request, request_size,
                     "GET %s HTTP/1.1\r\n"
                     "Accept: %s\r\n"
@@ -782,11 +761,17 @@ static bool remote_request_was_cancelled(const remote_request_options_t* options
 	       *options->cancellation_generation != options->expected_generation;
 }
 
+static void remote_request_set_error(const remote_request_options_t* options,
+                                     http_response_error_t error) {
+	if (options && options->out_error) *options->out_error = error;
+}
+
 http_response_t* remote_connection_request_with_headers_and_options(
 	tls_connection_t* connection, const char* host, const char* path, const char* accept,
 	const char* extra_headers, bool close_after_request,
 	const remote_request_options_t* options) {
     ASSERT(connection);
+	remote_request_set_error(options, HTTP_RESPONSE_ERROR_NONE);
 
     u32 read_poll_timeout_ms = options && options->read_poll_timeout_ms
                                ? options->read_poll_timeout_ms : 250;
@@ -797,14 +782,19 @@ http_response_t* remote_connection_request_with_headers_and_options(
     i32 request_len = remote_build_get_request_with_headers(request, sizeof(request), host, path,
                                                             accept, extra_headers, close_after_request);
     if (request_len <= 0 || request_len >= sizeof(request)) {
+		remote_request_set_error(options, HTTP_RESPONSE_ERROR_INVALID_REQUEST);
         return NULL;
     }
 
     i32 ret = 1;
     i32 bytes_written = 0;
     while (bytes_written < request_len) {
-        if (remote_request_was_cancelled(options) ||
-            get_seconds_elapsed(request_start_clock, get_clock()) > total_timeout_seconds) {
+		if (remote_request_was_cancelled(options)) {
+			remote_request_set_error(options, HTTP_RESPONSE_ERROR_CANCELLED);
+			return NULL;
+		}
+        if (get_seconds_elapsed(request_start_clock, get_clock()) > total_timeout_seconds) {
+			remote_request_set_error(options, HTTP_RESPONSE_ERROR_TIMEOUT);
             return NULL;
         }
         ret = connection->use_tls
@@ -816,31 +806,27 @@ http_response_t* remote_connection_request_with_headers_and_options(
             bytes_written += ret;
         } else if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
             console_print_error("remote_connection_request(): network write returned %d\n", ret);
+			remote_request_set_error(options, HTTP_RESPONSE_ERROR_NETWORK_WRITE);
             return NULL;
         }
     }
 
-    http_response_t* response = (http_response_t*)calloc(1, sizeof(http_response_t));
-    response->buffer = memrw_create(MEGABYTES(1));
-
-    http_response_parse_context_t context = {};
-    context.response = response;
-
-    http_parser_settings settings = {};
-    settings.on_header_field = response_header_field_callback;
-    settings.on_header_value = response_header_value_callback;
-    settings.on_body = body_callback;
-    settings.on_message_complete = message_complete_callback;
-
-    http_parser parser = {};
-    http_parser_init(&parser, HTTP_RESPONSE);
-    parser.data = (void*)&context;
+	http_response_parser_t parser = {0};
+	if (!http_response_parser_init(&parser, options ? options->max_response_body_size : 0)) {
+		remote_request_set_error(options, HTTP_RESPONSE_ERROR_PARSE);
+		return NULL;
+	}
 
     u8 read_buffer[KILOBYTES(16)];
-    while (!context.message_complete) {
-        if (remote_request_was_cancelled(options) ||
-            get_seconds_elapsed(request_start_clock, get_clock()) > total_timeout_seconds) {
-            http_response_destroy(response);
+	while (!parser.message_complete) {
+		if (remote_request_was_cancelled(options)) {
+			remote_request_set_error(options, HTTP_RESPONSE_ERROR_CANCELLED);
+			http_response_parser_destroy(&parser);
+			return NULL;
+		}
+        if (get_seconds_elapsed(request_start_clock, get_clock()) > total_timeout_seconds) {
+			remote_request_set_error(options, HTTP_RESPONSE_ERROR_TIMEOUT);
+			http_response_parser_destroy(&parser);
             return NULL;
         }
         ret = connection->use_tls
@@ -857,20 +843,26 @@ http_response_t* remote_connection_request_with_headers_and_options(
         }
         if (ret < 0) {
             console_print_error("remote_connection_request(): mbedtls_ssl_read returned %d\n", ret);
-            http_response_destroy(response);
+			remote_request_set_error(options, HTTP_RESPONSE_ERROR_NETWORK_READ);
+			http_response_parser_destroy(&parser);
             return NULL;
         }
 
-        size_t nparsed = http_parser_execute(&parser, &settings, (char*)read_buffer, ret);
-        if (nparsed != (size_t)ret && !context.message_complete) {
-            console_print_error("remote_connection_request(): HTTP parser stopped after %zu of %d bytes\n", nparsed, ret);
-            http_response_destroy(response);
+		if (!http_response_parser_execute(&parser, read_buffer, (size_t)ret)) {
+			remote_request_set_error(options, parser.error);
+			http_response_parser_destroy(&parser);
             return NULL;
         }
     }
 
-    response->status_code = parser.status_code;
-    memrw_putc(0, &response->buffer);
+	http_response_parser_finish(&parser);
+	if (parser.error != HTTP_RESPONSE_ERROR_NONE) {
+		remote_request_set_error(options, parser.error);
+		http_response_parser_destroy(&parser);
+		return NULL;
+	}
+	http_response_t* response = http_response_parser_take_response(&parser);
+	http_response_parser_destroy(&parser);
     return response;
 }
 

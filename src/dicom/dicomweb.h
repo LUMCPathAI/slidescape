@@ -43,10 +43,6 @@ typedef struct dicomweb_frame_t {
 	char transfer_syntax_uid[65];
 } dicomweb_frame_t;
 
-#define DICOMWEB_MAX_INSTANCES 16
-#define DICOMWEB_MAX_STUDIES 128
-#define DICOMWEB_MAX_SERIES 128
-
 typedef struct dicomweb_instance_ref_t {
 	char study_instance_uid[65];
 	char series_instance_uid[65];
@@ -84,15 +80,18 @@ typedef struct dicomweb_remote_image_t {
 	i32 port;
 	bool use_tls;
 	i32 available_series_count;
+	i32 available_series_capacity;
 	i32 selected_series_index;
-	dicomweb_series_ref_t available_series[DICOMWEB_MAX_SERIES];
+	dicomweb_series_ref_t* available_series;
 	i32 instance_count;
-	dicomweb_instance_metadata_t instances[DICOMWEB_MAX_INSTANCES];
+	i32 instance_capacity;
+	dicomweb_instance_metadata_t* instances;
 } dicomweb_remote_image_t;
 
 bool dicomweb_parse_instance_metadata(const char* json, size_t json_size,
                                       dicomweb_instance_metadata_t* out);
 void dicomweb_instance_metadata_destroy(dicomweb_instance_metadata_t* metadata);
+void dicomweb_remote_image_destroy(dicomweb_remote_image_t* remote);
 i32 dicomweb_parse_instance_refs(const char* json, size_t json_size,
                                  dicomweb_instance_ref_t* out, i32 capacity);
 i32 dicomweb_count_instance_refs(const char* json, size_t json_size);
@@ -117,6 +116,7 @@ bool dicomweb_build_frame_path(char* dest, size_t dest_size,
                                const char* instance_uid,
                                u32 one_based_frame_number);
 bool dicomweb_resolve_series_url(char* dest, size_t dest_size, const char* url);
+bool dicomweb_is_valid_uid(const char* value, size_t length);
 
 #ifdef __cplusplus
 }

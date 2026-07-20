@@ -309,11 +309,13 @@ set(SLIDESCAPE_NONGUI_BASE_FILES
         src/core/image_loader.c
         src/core/tile_cache.c
         src/core/tile_loader.c
+        src/core/http_response_parser.c
         src/utils/phasecorrelate.c
         src/third_party/lz4.c
         src/third_party/yxml.c
         src/third_party/minfft.c
         src/third_party/miniz_tinfl.c
+        src/third_party/http_parser.c
         src/third_party/ltalloc.cc
         src/tiff/tiff.c
         src/tiff/tiff_write.c
@@ -373,7 +375,6 @@ set(VIEWER_SOURCE_FILES
         imgui/backends/imgui_impl_opengl3.cpp
         imgui/misc/freetype/imgui_freetype.cpp
         imgui/imgui_widget_flamegraph.cpp
-        third_party/http_parser.c
         utils/triangulate.c
         utils/profiler.c
         )

@@ -19,21 +19,17 @@
 #pragma once
 #include "common.h"
 #include "viewer.h"
-
-typedef struct http_response_t {
-    memrw_t buffer;
-    size_t content_length;
-    i32 status_code;
-    char content_type[256];
-} http_response_t;
+#include "http_response_parser.h"
 
 typedef struct tls_connection_t tls_connection_t;
 
 typedef struct remote_request_options_t {
 	u32 read_poll_timeout_ms;
 	float total_timeout_seconds;
+	size_t max_response_body_size;
 	volatile i32* cancellation_generation;
 	i32 expected_generation;
+	http_response_error_t* out_error;
 } remote_request_options_t;
 
 #ifdef __cplusplus

@@ -62,6 +62,16 @@ TEST_CASE("DICOMweb extracts a native frame from multipart related") {
 	CHECK(strcmp(frame.transfer_syntax_uid, "1.2.840.10008.1.2.4.50") == 0);
 }
 
+TEST_CASE("DICOMweb rejects oversized multipart part headers") {
+	const char* content_type = "multipart/related; boundary=frame-boundary";
+	std::string body = "--frame-boundary\r\nX-Large: ";
+	body.append(KILOBYTES(17), 'x');
+	body += "\r\n\r\nframe\r\n--frame-boundary--\r\n";
+	dicomweb_frame_t frame = {};
+	CHECK_FALSE(dicomweb_parse_multipart_frame((const u8*)body.data(), body.size(),
+	                                           content_type, &frame));
+}
+
 TEST_CASE("DICOMweb builds portable WADO-RS paths") {
 	char path[512];
 	REQUIRE(dicomweb_build_instance_metadata_path(path, sizeof(path), "/dicom-web",
@@ -93,6 +103,35 @@ TEST_CASE("DICOMweb resolves IDC Slim viewer series URLs") {
 	REQUIRE(dicomweb_resolve_series_url(resolved, sizeof(resolved),
 	                                  "https://archive.example/dicomWeb/studies/1/series/2"));
 	CHECK(strcmp(resolved, "https://archive.example/dicomWeb/studies/1/series/2") == 0);
+}
+
+TEST_CASE("DICOMweb validates UID syntax") {
+	CHECK(dicomweb_is_valid_uid("1.2.840.10008.1", strlen("1.2.840.10008.1")));
+	CHECK(dicomweb_is_valid_uid("2.25.211094631316408413440371843585977094852",
+	                            strlen("2.25.211094631316408413440371843585977094852")));
+	CHECK_FALSE(dicomweb_is_valid_uid("", 0));
+	CHECK_FALSE(dicomweb_is_valid_uid(".1.2", 4));
+	CHECK_FALSE(dicomweb_is_valid_uid("1..2", 4));
+	CHECK_FALSE(dicomweb_is_valid_uid("1.2\r\nX-Test:1", strlen("1.2\r\nX-Test:1")));
+}
+
+TEST_CASE("DICOMweb remote image destruction releases dynamic metadata") {
+	dicomweb_remote_image_t remote = {};
+	remote.instances = (dicomweb_instance_metadata_t*)calloc(2, sizeof(*remote.instances));
+	remote.instance_count = 2;
+	remote.instance_capacity = 2;
+	remote.instances[0].frame_numbers = (u32*)calloc(3, sizeof(u32));
+	remote.instances[0].frame_map_count = 3;
+	remote.available_series = (dicomweb_series_ref_t*)calloc(4, sizeof(*remote.available_series));
+	remote.available_series_count = 4;
+	remote.available_series_capacity = 4;
+	dicomweb_remote_image_destroy(&remote);
+	CHECK(remote.instances == nullptr);
+	CHECK(remote.instance_count == 0);
+	CHECK(remote.instance_capacity == 0);
+	CHECK(remote.available_series == nullptr);
+	CHECK(remote.available_series_count == 0);
+	CHECK(remote.available_series_capacity == 0);
 }
 
 TEST_CASE("DICOMweb parses QIDO instance references") {

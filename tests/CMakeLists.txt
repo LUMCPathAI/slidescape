@@ -3,6 +3,7 @@ add_executable(slidescape_tests
         test_main.cpp
         test_fixtures.cpp
         test_dicomweb.cpp
+        test_http_response_parser.cpp
         test_mathutils.cpp
         test_memrw.cpp
         test_stb_sprintf.cpp

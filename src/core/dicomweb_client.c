@@ -22,6 +22,7 @@
 extern bool show_dicom_slides_window;
 
 static char dicomweb_last_status[512];
+static THREAD_LOCAL http_response_error_t dicomweb_last_transport_error;
 
 typedef struct dicomweb_worker_connection_t {
 	tls_connection_t* connection;
@@ -34,6 +35,11 @@ typedef struct dicomweb_worker_connection_t {
 static THREAD_LOCAL dicomweb_worker_connection_t dicomweb_worker_connection;
 
 #define DICOMWEB_ASYNC_COMPLETION_RESULT 0x4449434fu
+#define DICOMWEB_MAX_JSON_RESPONSE_SIZE MEGABYTES(256)
+#define DICOMWEB_MAX_FRAME_RESPONSE_SIZE MEGABYTES(64)
+#define DICOMWEB_QIDO_PAGE_SIZE 100
+#define DICOMWEB_QIDO_BROWSER_RESULT_LIMIT 1000
+#define DICOMWEB_QIDO_OPEN_INSTANCE_LIMIT 10000
 #define DICOMWEB_INSTANCE_INCLUDE_FIELDS \
 	"?includefield=00080016&includefield=00080008&includefield=00200013" \
 	"&includefield=00280008&includefield=00209161&includefield=00209162" \
@@ -54,6 +60,58 @@ static image_t* dicomweb_prepare_configured_series(
 	dicomweb_remote_image_t remote, const remote_request_options_t* request_options,
 	char* message, size_t message_size);
 
+static size_t dicomweb_async_item_size(dicomweb_async_query_kind_t kind) {
+	switch (kind) {
+		case DICOMWEB_ASYNC_QUERY_STUDIES: return sizeof(dicomweb_study_ref_t);
+		case DICOMWEB_ASYNC_QUERY_SERIES: return sizeof(dicomweb_series_ref_t);
+		case DICOMWEB_ASYNC_QUERY_INSTANCES: return sizeof(dicomweb_instance_ref_t);
+		default: return 0;
+	}
+}
+
+static i32 dicomweb_async_count_items(dicomweb_async_query_kind_t kind,
+	                                  const char* json, size_t json_size) {
+	switch (kind) {
+		case DICOMWEB_ASYNC_QUERY_STUDIES:
+			return dicomweb_count_study_refs(json, json_size);
+		case DICOMWEB_ASYNC_QUERY_SERIES:
+			return dicomweb_count_series_refs(json, json_size);
+		case DICOMWEB_ASYNC_QUERY_INSTANCES:
+			return dicomweb_count_instance_refs(json, json_size);
+		default: return 0;
+	}
+}
+
+static i32 dicomweb_async_parse_items(dicomweb_async_query_kind_t kind,
+	                                  const char* json, size_t json_size,
+	                                  void* out, i32 capacity) {
+	switch (kind) {
+		case DICOMWEB_ASYNC_QUERY_STUDIES:
+			return dicomweb_parse_study_refs(json, json_size,
+			                                 (dicomweb_study_ref_t*)out, capacity);
+		case DICOMWEB_ASYNC_QUERY_SERIES:
+			return dicomweb_parse_series_refs(json, json_size,
+			                                  (dicomweb_series_ref_t*)out, capacity);
+		case DICOMWEB_ASYNC_QUERY_INSTANCES:
+			return dicomweb_parse_instance_refs(json, json_size,
+			                                    (dicomweb_instance_ref_t*)out, capacity);
+		default: return 0;
+	}
+}
+
+static const char* dicomweb_async_item_uid(dicomweb_async_query_kind_t kind,
+	                                       const void* item) {
+	switch (kind) {
+		case DICOMWEB_ASYNC_QUERY_STUDIES:
+			return ((const dicomweb_study_ref_t*)item)->study_instance_uid;
+		case DICOMWEB_ASYNC_QUERY_SERIES:
+			return ((const dicomweb_series_ref_t*)item)->series_instance_uid;
+		case DICOMWEB_ASYNC_QUERY_INSTANCES:
+			return ((const dicomweb_instance_ref_t*)item)->sop_instance_uid;
+		default: return "";
+	}
+}
+
 const char* dicomweb_get_last_status(void) {
 	return dicomweb_last_status;
 }
@@ -68,12 +126,29 @@ static void set_status(const char* format, ...) {
 
 static bool is_loopback_host(const char* hostname) {
 	return strcmp(hostname, "127.0.0.1") == 0 ||
-	       strcmp(hostname, "localhost") == 0 ||
-	       strcmp(hostname, "::1") == 0;
+	       strcmp(hostname, "localhost") == 0;
+}
+
+static bool url_text_is_safe(const char* text) {
+	if (!text || !text[0]) return false;
+	for (const u8* p = (const u8*)text; *p; ++p) {
+		if (*p <= 0x20 || *p == 0x7f || *p == '\\') return false;
+	}
+	return true;
+}
+
+static bool hostname_is_safe(const char* hostname) {
+	if (!hostname || !hostname[0]) return false;
+	for (const u8* p = (const u8*)hostname; *p; ++p) {
+		if ((*p < 'a' || *p > 'z') && (*p < 'A' || *p > 'Z') &&
+		    (*p < '0' || *p > '9') && *p != '.' && *p != '-') return false;
+	}
+	return true;
 }
 
 static bool parse_archive_url(const char* url, dicomweb_remote_image_t* remote,
                               const char** out_path) {
+	if (!url_text_is_safe(url)) return false;
 	const char* authority = NULL;
 	if (strncmp(url, "https://", 8) == 0) {
 		remote->use_tls = true;
@@ -88,6 +163,7 @@ static bool parse_archive_url(const char* url, dicomweb_remote_image_t* remote,
 	}
 	const char* path = strchr(authority, '/');
 	if (!path) return false;
+	if (strchr(path, '?') || strchr(path, '#')) return false;
 	const char* colon = NULL;
 	for (const char* p = authority; p < path; ++p) {
 		if (*p == ':') colon = p;
@@ -97,14 +173,18 @@ static bool parse_archive_url(const char* url, dicomweb_remote_image_t* remote,
 	if (!host_length || host_length >= sizeof(remote->hostname)) return false;
 	memcpy(remote->hostname, authority, host_length);
 	remote->hostname[host_length] = '\0';
+	if (!hostname_is_safe(remote->hostname)) return false;
 	if (colon) {
 		char port_string[16];
 		size_t port_length = (size_t)(path - colon - 1);
 		if (!port_length || port_length >= sizeof(port_string)) return false;
 		memcpy(port_string, colon + 1, port_length);
 		port_string[port_length] = '\0';
-		remote->port = atoi(port_string);
-		if (remote->port <= 0 || remote->port > 65535) return false;
+		char* port_end = NULL;
+		long parsed_port = strtol(port_string, &port_end, 10);
+		if (port_end == port_string || *port_end != '\0' ||
+		    parsed_port <= 0 || parsed_port > 65535) return false;
+		remote->port = (i32)parsed_port;
 	}
 	if (!remote->use_tls && !is_loopback_host(remote->hostname)) {
 		set_status("DICOMweb refuses unencrypted HTTP to non-loopback host '%s'.", remote->hostname);
@@ -137,7 +217,9 @@ static bool parse_series_url(const char* url, dicomweb_remote_image_t* remote) {
 	const char* series_end = strchr(series_start, '/');
 	size_t series_length = series_end ? (size_t)(series_end - series_start) : strlen(series_start);
 	if (!study_length || study_length >= sizeof(remote->study_instance_uid) ||
-	    !series_length || series_length >= sizeof(remote->series_instance_uid)) return false;
+	    !series_length || series_length >= sizeof(remote->series_instance_uid) ||
+	    !dicomweb_is_valid_uid(study_start, study_length) ||
+	    !dicomweb_is_valid_uid(series_start, series_length)) return false;
 	memcpy(remote->study_instance_uid, study_start, study_length);
 	remote->study_instance_uid[study_length] = '\0';
 	memcpy(remote->series_instance_uid, series_start, series_length);
@@ -216,28 +298,55 @@ static tls_connection_t* get_worker_connection(const dicomweb_remote_image_t* re
 static http_response_t* dicomweb_get_with_options(
 	const dicomweb_remote_image_t* remote, const char* path, const char* accept,
 	bool reuse_worker_connection, const remote_request_options_t* options) {
+	remote_request_options_t effective_options = options ? *options : (remote_request_options_t){0};
+	if (!effective_options.read_poll_timeout_ms) effective_options.read_poll_timeout_ms = 250;
+	if (effective_options.total_timeout_seconds <= 0.0f) effective_options.total_timeout_seconds = 30.0f;
+	if (!effective_options.max_response_body_size) {
+		effective_options.max_response_body_size = strstr(accept, "image/jpeg")
+		                                           ? DICOMWEB_MAX_FRAME_RESPONSE_SIZE
+		                                           : DICOMWEB_MAX_JSON_RESPONSE_SIZE;
+	}
+	http_response_error_t* caller_error = effective_options.out_error;
+	dicomweb_last_transport_error = HTTP_RESPONSE_ERROR_NONE;
+	effective_options.out_error = &dicomweb_last_transport_error;
 	if (reuse_worker_connection) {
 		for (i32 attempt = 0; attempt < 2; ++attempt) {
 			tls_connection_t* connection = get_worker_connection(remote);
-			if (!connection) return NULL;
+			if (!connection) {
+				dicomweb_last_transport_error = HTTP_RESPONSE_ERROR_CONNECTION;
+				if (caller_error) *caller_error = dicomweb_last_transport_error;
+				return NULL;
+			}
 			http_response_t* response = remote_connection_request_with_headers_and_options(
 				connection, remote->hostname, path, accept,
-				remote->authorization_header, false, options);
+				remote->authorization_header, false, &effective_options);
 			if (response) {
 				dicomweb_worker_connection.last_used_clock = get_clock();
+				if (caller_error) *caller_error = dicomweb_last_transport_error;
 				return response;
 			}
 			drop_worker_connection();
 		}
+		if (caller_error) *caller_error = dicomweb_last_transport_error;
 		return NULL;
 	}
 	tls_connection_t* connection = remote_connection_open_http(remote->hostname, remote->port,
 	                                                           remote->use_tls);
-	if (!connection) return NULL;
+	if (!connection) {
+		dicomweb_last_transport_error = HTTP_RESPONSE_ERROR_CONNECTION;
+		if (caller_error) *caller_error = dicomweb_last_transport_error;
+		return NULL;
+	}
 	http_response_t* response = remote_connection_request_with_headers_and_options(
-		connection, remote->hostname, path, accept, remote->authorization_header, true, options);
+		connection, remote->hostname, path, accept, remote->authorization_header, true,
+		&effective_options);
 	remote_connection_close_and_free(connection);
+	if (caller_error) *caller_error = dicomweb_last_transport_error;
 	return response;
+}
+
+static const char* dicomweb_transport_error(void) {
+	return http_response_error_string(dicomweb_last_transport_error);
 }
 
 static http_response_t* dicomweb_get(const dicomweb_remote_image_t* remote,
@@ -305,18 +414,18 @@ static void dicomweb_async_task_func(i32 logical_thread_index, void* userdata) {
 		goto complete;
 	}
 
-	char path[1400];
+	char base_path[1400];
 	i32 path_length = 0;
 	switch (task->kind) {
 		case DICOMWEB_ASYNC_QUERY_STUDIES:
-			path_length = snprintf(path, sizeof(path), "%s/studies", remote.root);
+			path_length = snprintf(base_path, sizeof(base_path), "%s/studies", remote.root);
 			break;
 		case DICOMWEB_ASYNC_QUERY_SERIES:
-			path_length = snprintf(path, sizeof(path), "%s/studies/%s/series",
+			path_length = snprintf(base_path, sizeof(base_path), "%s/studies/%s/series",
 			                       remote.root, task->study_uid);
 			break;
 		case DICOMWEB_ASYNC_QUERY_INSTANCES:
-			path_length = snprintf(path, sizeof(path), "%s/studies/%s/series/%s/instances%s",
+			path_length = snprintf(base_path, sizeof(base_path), "%s/studies/%s/series/%s/instances%s",
 			                       remote.root, task->study_uid, task->series_uid,
 			                       DICOMWEB_INSTANCE_INCLUDE_FIELDS);
 			break;
@@ -324,78 +433,105 @@ static void dicomweb_async_task_func(i32 logical_thread_index, void* userdata) {
 			copy_cstring(result->message, "Invalid DICOMweb query.", sizeof(result->message));
 			goto complete;
 	}
-	if (path_length <= 0 || path_length >= sizeof(path)) {
+	if (path_length <= 0 || path_length >= sizeof(base_path)) {
 		copy_cstring(result->message, "DICOMweb query path is too long.",
 		             sizeof(result->message));
 		goto complete;
 	}
 
-	http_response_t* response = dicomweb_get_with_options(
-		&remote, path, "application/dicom+json", false, &request_options);
-	if (task->generation != task->context->generation) {
-		if (response) http_response_destroy(response);
-		result->cancelled = true;
-		copy_cstring(result->message, "Request cancelled.", sizeof(result->message));
-		goto complete;
-	}
-	result->http_status = response ? response->status_code : 0;
-	if (!response || response->status_code < 200 || response->status_code >= 300) {
-		snprintf(result->message, sizeof(result->message),
-		         "DICOMweb query failed (HTTP %d).", result->http_status);
-		if (response) http_response_destroy(response);
-		goto complete;
-	}
+	size_t item_size = dicomweb_async_item_size(task->kind);
+	char previous_page_first_uid[65] = {0};
+	for (i32 offset = 0; offset < DICOMWEB_QIDO_BROWSER_RESULT_LIMIT;) {
+		char path[1500];
+		const char separator = strchr(base_path, '?') ? '&' : '?';
+		path_length = snprintf(path, sizeof(path), "%s%climit=%d&offset=%d",
+		                       base_path, separator, DICOMWEB_QIDO_PAGE_SIZE, offset);
+		if (path_length <= 0 || path_length >= sizeof(path)) {
+			copy_cstring(result->message, "DICOMweb query path is too long.",
+			             sizeof(result->message));
+			goto complete;
+		}
+		http_response_t* response = dicomweb_get_with_options(
+			&remote, path, "application/dicom+json", false, &request_options);
+		if (task->generation != task->context->generation) {
+			if (response) http_response_destroy(response);
+			result->cancelled = true;
+			copy_cstring(result->message, "Request cancelled.", sizeof(result->message));
+			goto complete;
+		}
+		result->http_status = response ? response->status_code : 0;
+		if (!response || response->status_code < 200 || response->status_code >= 300) {
+			if (response) {
+				snprintf(result->message, sizeof(result->message),
+				         "DICOMweb query failed (HTTP %d).", result->http_status);
+				http_response_destroy(response);
+			} else {
+				snprintf(result->message, sizeof(result->message),
+				         "DICOMweb query failed: %s.", dicomweb_transport_error());
+			}
+			goto complete;
+		}
 
-	const char* json = (const char*)response->buffer.data;
-	size_t json_size = response->content_length;
-	if (task->kind == DICOMWEB_ASYNC_QUERY_STUDIES) {
-		result->count = dicomweb_count_study_refs(json, json_size);
-		if (result->count > 0) {
-			result->studies = (dicomweb_study_ref_t*)calloc(
-				(size_t)result->count, sizeof(*result->studies));
-			if (!result->studies ||
-			    dicomweb_parse_study_refs(json, json_size, result->studies,
-			                              result->count) != result->count) {
-				copy_cstring(result->message, "Could not parse DICOMweb study results.",
-				             sizeof(result->message));
-				http_response_destroy(response);
-				goto complete;
-			}
+		const char* json = (const char*)response->buffer.data;
+		i32 page_count = dicomweb_async_count_items(task->kind, json,
+		                                               response->content_length);
+		if (page_count == 0) {
+			http_response_destroy(response);
+			break;
 		}
-	} else if (task->kind == DICOMWEB_ASYNC_QUERY_SERIES) {
-		result->count = dicomweb_count_series_refs(json, json_size);
-		if (result->count > 0) {
-			result->series = (dicomweb_series_ref_t*)calloc(
-				(size_t)result->count, sizeof(*result->series));
-			if (!result->series ||
-			    dicomweb_parse_series_refs(json, json_size, result->series,
-			                               result->count) != result->count) {
-				copy_cstring(result->message, "Could not parse DICOMweb series results.",
-				             sizeof(result->message));
-				http_response_destroy(response);
-				goto complete;
-			}
+		i32 remaining = DICOMWEB_QIDO_BROWSER_RESULT_LIMIT - result->count;
+		i32 append_count = MIN(page_count, remaining);
+		void* page_items = calloc((size_t)append_count, item_size);
+		if (!page_items || dicomweb_async_parse_items(task->kind, json,
+		                                                response->content_length,
+		                                                page_items, append_count) != append_count) {
+			free(page_items);
+			http_response_destroy(response);
+			copy_cstring(result->message, "Could not parse DICOMweb query results.",
+			             sizeof(result->message));
+			goto complete;
 		}
-	} else {
-		result->count = dicomweb_count_instance_refs(json, json_size);
-		if (result->count > 0) {
-			result->instances = (dicomweb_instance_ref_t*)calloc(
-				(size_t)result->count, sizeof(*result->instances));
-			if (!result->instances ||
-			    dicomweb_parse_instance_refs(json, json_size, result->instances,
-			                                  result->count) != result->count) {
-				copy_cstring(result->message, "Could not parse DICOMweb instance results.",
-				             sizeof(result->message));
-				http_response_destroy(response);
-				goto complete;
-			}
+		const char* page_first_uid = dicomweb_async_item_uid(task->kind, page_items);
+		if (offset > 0 && strcmp(page_first_uid, previous_page_first_uid) == 0) {
+			free(page_items);
+			http_response_destroy(response);
+			result->truncated = true;
+			break;
 		}
+		copy_cstring(previous_page_first_uid, page_first_uid,
+		             sizeof(previous_page_first_uid));
+		void* items = realloc(result->items, (size_t)(result->count + append_count) * item_size);
+		if (!items) {
+			free(page_items);
+			http_response_destroy(response);
+			copy_cstring(result->message, "Out of memory while storing DICOMweb results.",
+			             sizeof(result->message));
+			goto complete;
+		}
+		result->items = items;
+		memcpy((u8*)result->items + (size_t)result->count * item_size,
+		       page_items, (size_t)append_count * item_size);
+		free(page_items);
+		result->count += append_count;
+		http_response_destroy(response);
+		if (append_count < page_count || result->count >= DICOMWEB_QIDO_BROWSER_RESULT_LIMIT) {
+			result->truncated = true;
+			break;
+		}
+		if (page_count > DICOMWEB_QIDO_PAGE_SIZE) break;
+		if (page_count < DICOMWEB_QIDO_PAGE_SIZE) break;
+		offset += page_count;
 	}
-	http_response_destroy(response);
 	result->succeeded = true;
-	snprintf(result->message, sizeof(result->message),
-	         "DICOMweb query returned %d result%s.",
-	         result->count, result->count == 1 ? "" : "s");
+	if (result->truncated) {
+		snprintf(result->message, sizeof(result->message),
+		         "DICOMweb query returned the first %d results; refine the search to see more.",
+		         result->count);
+	} else {
+		snprintf(result->message, sizeof(result->message),
+		         "DICOMweb query returned %d result%s.",
+		         result->count, result->count == 1 ? "" : "s");
+	}
 
 complete:
 	memset(task->password, 0, sizeof(task->password));
@@ -440,6 +576,11 @@ i32 dicomweb_async_query(dicomweb_async_context_t* context,
 	    kind <= DICOMWEB_ASYNC_QUERY_NONE || kind > DICOMWEB_ASYNC_OPEN_SERIES) {
 		return 0;
 	}
+	if ((kind == DICOMWEB_ASYNC_QUERY_SERIES ||
+	     kind == DICOMWEB_ASYNC_QUERY_INSTANCES || kind == DICOMWEB_ASYNC_OPEN_SERIES) &&
+	    (!study_uid || !dicomweb_is_valid_uid(study_uid, strlen(study_uid)))) return 0;
+	if ((kind == DICOMWEB_ASYNC_QUERY_INSTANCES || kind == DICOMWEB_ASYNC_OPEN_SERIES) &&
+	    (!series_uid || !dicomweb_is_valid_uid(series_uid, strlen(series_uid)))) return 0;
 	dicomweb_async_task_t* task = (dicomweb_async_task_t*)calloc(1, sizeof(*task));
 	if (!task) return 0;
 	task->context = context;
@@ -537,6 +678,7 @@ i32 dicomweb_query_studies(const char* archive_url, const char* username, const 
 
 i32 dicomweb_query_series(const char* archive_url, const char* username, const char* password,
                           const char* study_uid, dicomweb_series_ref_t* out, i32 capacity) {
+	if (!study_uid || !dicomweb_is_valid_uid(study_uid, strlen(study_uid))) return 0;
 	dicomweb_remote_image_t remote = {0};
 	if (!configure_archive(&remote, archive_url, username, password)) return 0;
 	char path[1200];
@@ -558,6 +700,9 @@ i32 dicomweb_query_series(const char* archive_url, const char* username, const c
 i32 dicomweb_query_instances(const char* archive_url, const char* username, const char* password,
                              const char* study_uid, const char* series_uid,
                              dicomweb_instance_ref_t* out, i32 capacity) {
+	if (!study_uid || !series_uid ||
+	    !dicomweb_is_valid_uid(study_uid, strlen(study_uid)) ||
+	    !dicomweb_is_valid_uid(series_uid, strlen(series_uid))) return 0;
 	dicomweb_remote_image_t remote = {0};
 	if (!configure_archive(&remote, archive_url, username, password)) return 0;
 	char path[1400];
@@ -580,6 +725,9 @@ i32 dicomweb_query_instances(const char* archive_url, const char* username, cons
 
 bool dicomweb_build_series_url(char* dest, size_t dest_size, const char* archive_url,
                                const char* study_uid, const char* series_uid) {
+	if (!study_uid || !series_uid ||
+	    !dicomweb_is_valid_uid(study_uid, strlen(study_uid)) ||
+	    !dicomweb_is_valid_uid(series_uid, strlen(series_uid))) return false;
 	dicomweb_remote_image_t remote = {0};
 	if (!parse_archive_url(archive_url, &remote, NULL)) return false;
 	i32 length = snprintf(dest, dest_size, "%s://%s:%d%s/studies/%s/series/%s",
@@ -590,20 +738,65 @@ bool dicomweb_build_series_url(char* dest, size_t dest_size, const char* archive
 
 static void load_available_series(dicomweb_remote_image_t* remote,
                                   const remote_request_options_t* request_options) {
-	char path[1200];
-	i32 length = snprintf(path, sizeof(path), "%s/studies/%s/series",
+	char base_path[1200];
+	i32 length = snprintf(base_path, sizeof(base_path), "%s/studies/%s/series",
 	                      remote->root, remote->study_instance_uid);
-	if (length <= 0 || length >= sizeof(path)) return;
-	http_response_t* response = dicomweb_get_with_options(
-		remote, path, "application/dicom+json", false, request_options);
-	if (!response || response->status_code < 200 || response->status_code >= 300) {
-		if (response) http_response_destroy(response);
-		return;
+	if (length <= 0 || length >= sizeof(base_path)) return;
+	dicomweb_series_ref_t* series = NULL;
+	i32 count = 0;
+	char previous_page_first_uid[65] = {0};
+	for (i32 offset = 0; offset < DICOMWEB_QIDO_BROWSER_RESULT_LIMIT;) {
+		char path[1300];
+		length = snprintf(path, sizeof(path), "%s?limit=%d&offset=%d",
+		                  base_path, DICOMWEB_QIDO_PAGE_SIZE, offset);
+		if (length <= 0 || length >= sizeof(path)) goto fail;
+		http_response_t* response = dicomweb_get_with_options(
+			remote, path, "application/dicom+json", false, request_options);
+		if (!response || response->status_code < 200 || response->status_code >= 300) {
+			if (response) http_response_destroy(response);
+			goto fail;
+		}
+		const char* json = (const char*)response->buffer.data;
+		i32 page_count = dicomweb_count_series_refs(json, response->content_length);
+		if (page_count == 0) {
+			http_response_destroy(response);
+			break;
+		}
+		if (page_count > DICOMWEB_QIDO_BROWSER_RESULT_LIMIT - count) {
+			http_response_destroy(response);
+			goto fail;
+		}
+		dicomweb_series_ref_t* resized = (dicomweb_series_ref_t*)realloc(
+			series, (size_t)(count + page_count) * sizeof(*series));
+		if (!resized) {
+			http_response_destroy(response);
+			goto fail;
+		}
+		series = resized;
+		dicomweb_series_ref_t* page = series + count;
+		if (dicomweb_parse_series_refs(json, response->content_length,
+		                               page, page_count) != page_count) {
+			http_response_destroy(response);
+			goto fail;
+		}
+		if (offset > 0 && strcmp(page[0].series_instance_uid,
+		                         previous_page_first_uid) == 0) {
+			http_response_destroy(response);
+			goto fail;
+		}
+		copy_cstring(previous_page_first_uid, page[0].series_instance_uid,
+		             sizeof(previous_page_first_uid));
+		count += page_count;
+		http_response_destroy(response);
+		if (count >= DICOMWEB_QIDO_BROWSER_RESULT_LIMIT &&
+		    page_count == DICOMWEB_QIDO_PAGE_SIZE) goto fail;
+		if (page_count != DICOMWEB_QIDO_PAGE_SIZE) break;
+		offset += page_count;
 	}
-	remote->available_series_count = dicomweb_parse_series_refs(
-		(const char*)response->buffer.data, response->content_length,
-		remote->available_series, COUNT(remote->available_series));
-	http_response_destroy(response);
+	free(remote->available_series);
+	remote->available_series = series;
+	remote->available_series_count = count;
+	remote->available_series_capacity = count;
 	remote->selected_series_index = -1;
 	for (i32 i = 0; i < remote->available_series_count; ++i) {
 		if (strcmp(remote->available_series[i].series_instance_uid,
@@ -612,6 +805,10 @@ static void load_available_series(dicomweb_remote_image_t* remote,
 			break;
 		}
 	}
+	return;
+
+fail:
+	free(series);
 }
 
 static int compare_instance_width_descending(const void* a, const void* b) {
@@ -620,6 +817,105 @@ static int compare_instance_width_descending(const void* a, const void* b) {
 	if (left->total_pixel_matrix_columns < right->total_pixel_matrix_columns) return 1;
 	if (left->total_pixel_matrix_columns > right->total_pixel_matrix_columns) return -1;
 	return 0;
+}
+
+static bool dicomweb_remote_reserve_instances(dicomweb_remote_image_t* remote, i32 capacity) {
+	if (capacity <= remote->instance_capacity) return true;
+	i32 new_capacity = MAX(capacity, MAX(8, remote->instance_capacity * 2));
+	dicomweb_instance_metadata_t* instances = (dicomweb_instance_metadata_t*)realloc(
+		remote->instances, (size_t)new_capacity * sizeof(*instances));
+	if (!instances) return false;
+	memset(instances + remote->instance_capacity, 0,
+	       (size_t)(new_capacity - remote->instance_capacity) * sizeof(*instances));
+	remote->instances = instances;
+	remote->instance_capacity = new_capacity;
+	return true;
+}
+
+static bool dicomweb_query_instance_refs_all(
+	const dicomweb_remote_image_t* remote, const char* base_path,
+	const remote_request_options_t* request_options,
+	dicomweb_instance_ref_t** out_refs, i32* out_count,
+	char* message, size_t message_size) {
+	*out_refs = NULL;
+	*out_count = 0;
+	char previous_page_first_uid[65] = {0};
+	for (i32 offset = 0; offset < DICOMWEB_QIDO_OPEN_INSTANCE_LIMIT;) {
+		char path[1500];
+		const char separator = strchr(base_path, '?') ? '&' : '?';
+		i32 length = snprintf(path, sizeof(path), "%s%climit=%d&offset=%d",
+		                      base_path, separator, DICOMWEB_QIDO_PAGE_SIZE, offset);
+		if (length <= 0 || length >= sizeof(path)) {
+			copy_cstring(message, "DICOMweb series path is too long.", message_size);
+			goto fail;
+		}
+		http_response_t* response = dicomweb_get_with_options(
+			remote, path, "application/dicom+json", false, request_options);
+		if (!response || response->status_code < 200 || response->status_code >= 300) {
+			if (response) {
+				snprintf(message, message_size,
+				         "DICOMweb QIDO-RS request failed (HTTP %d).",
+				         response->status_code);
+				http_response_destroy(response);
+			} else {
+				snprintf(message, message_size, "DICOMweb QIDO-RS request failed: %s.",
+				         dicomweb_transport_error());
+			}
+			goto fail;
+		}
+		const char* json = (const char*)response->buffer.data;
+		i32 page_count = dicomweb_count_instance_refs(json, response->content_length);
+		if (page_count == 0) {
+			http_response_destroy(response);
+			return true;
+		}
+		if (page_count > DICOMWEB_QIDO_OPEN_INSTANCE_LIMIT - *out_count) {
+			http_response_destroy(response);
+			copy_cstring(message,
+			             "DICOMweb series exceeds the 10000-instance safety limit.",
+			             message_size);
+			goto fail;
+		}
+		dicomweb_instance_ref_t* refs = (dicomweb_instance_ref_t*)realloc(
+			*out_refs, (size_t)(*out_count + page_count) * sizeof(**out_refs));
+		if (!refs) {
+			http_response_destroy(response);
+			copy_cstring(message, "Out of memory while storing DICOMweb instance results.",
+			             message_size);
+			goto fail;
+		}
+		*out_refs = refs;
+		dicomweb_instance_ref_t* page = refs + *out_count;
+		if (dicomweb_parse_instance_refs(json, response->content_length,
+		                                 page, page_count) != page_count) {
+			http_response_destroy(response);
+			copy_cstring(message, "Could not parse DICOMweb instance results.", message_size);
+			goto fail;
+		}
+		if (offset > 0 && strcmp(page[0].sop_instance_uid,
+		                         previous_page_first_uid) == 0) {
+			http_response_destroy(response);
+			copy_cstring(message,
+			             "DICOMweb server repeated a QIDO page; safe pagination is unavailable.",
+			             message_size);
+			goto fail;
+		}
+		copy_cstring(previous_page_first_uid, page[0].sop_instance_uid,
+		             sizeof(previous_page_first_uid));
+		*out_count += page_count;
+		http_response_destroy(response);
+		if (page_count < DICOMWEB_QIDO_PAGE_SIZE) return true;
+		if (page_count > DICOMWEB_QIDO_PAGE_SIZE) return true;
+		offset += page_count;
+	}
+	copy_cstring(message, "DICOMweb series exceeds the 10000-instance safety limit.",
+	             message_size);
+
+fail:
+	free(*out_refs);
+	*out_refs = NULL;
+	*out_count = 0;
+	return false;
 }
 
 static image_t* dicomweb_prepare_configured_series(
@@ -632,21 +928,22 @@ static image_t* dicomweb_prepare_configured_series(
 	                      DICOMWEB_INSTANCE_INCLUDE_FIELDS);
 	if (length <= 0 || length >= sizeof(path)) {
 		copy_cstring(message, "DICOMweb series path is too long.", message_size);
+		dicomweb_remote_image_destroy(&remote);
 		return NULL;
 	}
-	http_response_t* qido = dicomweb_get_with_options(
-		&remote, path, "application/dicom+json", false, request_options);
-	if (!qido || qido->status_code < 200 || qido->status_code >= 300) {
-		snprintf(message, message_size, "DICOMweb QIDO-RS request failed (HTTP %d).",
-		         qido ? qido->status_code : 0);
-		if (qido) http_response_destroy(qido);
+	dicomweb_instance_ref_t* refs = NULL;
+	i32 ref_count = 0;
+	if (!dicomweb_query_instance_refs_all(&remote, path, request_options,
+	                                      &refs, &ref_count, message, message_size)) {
+		dicomweb_remote_image_destroy(&remote);
 		return NULL;
 	}
-	dicomweb_instance_ref_t refs[DICOMWEB_MAX_INSTANCES];
-	i32 ref_count = dicomweb_parse_instance_refs((const char*)qido->buffer.data,
-	                                             qido->content_length, refs, COUNT(refs));
-	http_response_destroy(qido);
-	for (i32 i = 0; i < ref_count && remote.instance_count < DICOMWEB_MAX_INSTANCES; ++i) {
+	i32 metadata_request_failures = 0;
+	i32 last_metadata_http_status = 0;
+	http_response_error_t last_metadata_transport_error = HTTP_RESPONSE_ERROR_NONE;
+	i32 metadata_parse_failures = 0;
+	i32 unsupported_instances = 0;
+	for (i32 i = 0; i < ref_count; ++i) {
 		if (request_options && request_options->cancellation_generation &&
 		    *request_options->cancellation_generation != request_options->expected_generation) {
 			break;
@@ -661,23 +958,60 @@ static image_t* dicomweb_prepare_configured_series(
 		http_response_t* response = dicomweb_get_with_options(
 			&remote, path, "application/dicom+json", false, request_options);
 		if (!response || response->status_code < 200 || response->status_code >= 300) {
-			if (response) http_response_destroy(response);
+			++metadata_request_failures;
+			if (response) {
+				last_metadata_http_status = response->status_code;
+				http_response_destroy(response);
+			} else {
+				last_metadata_transport_error = dicomweb_last_transport_error;
+			}
 			continue;
 		}
 		dicomweb_instance_metadata_t metadata = {0};
-		if (dicomweb_parse_instance_metadata((const char*)response->buffer.data,
-		                                     response->content_length, &metadata) &&
-		    strcmp(metadata.image_flavor, "VOLUME") == 0 && metadata.is_tiled_full) {
-			remote.instances[remote.instance_count++] = metadata;
+		bool parsed = dicomweb_parse_instance_metadata((const char*)response->buffer.data,
+		                                               response->content_length, &metadata);
+		if (parsed && strcmp(metadata.image_flavor, "VOLUME") == 0 && metadata.is_tiled_full) {
+			if (dicomweb_remote_reserve_instances(&remote, remote.instance_count + 1)) {
+				remote.instances[remote.instance_count++] = metadata;
+			} else {
+				dicomweb_instance_metadata_destroy(&metadata);
+				free(refs);
+				http_response_destroy(response);
+				dicomweb_remote_image_destroy(&remote);
+				copy_cstring(message, "Out of memory while opening DICOMweb metadata.", message_size);
+				return NULL;
+			}
 		} else {
+			if (parsed) ++unsupported_instances;
+			else ++metadata_parse_failures;
 			dicomweb_instance_metadata_destroy(&metadata);
 		}
 		http_response_destroy(response);
 	}
+	free(refs);
 	if (remote.instance_count == 0) {
-		copy_cstring(message,
-		             "DICOMweb series has no supported TILED_FULL VOLUME instances.",
-		             message_size);
+		if (metadata_request_failures > 0) {
+			if (last_metadata_http_status) {
+				snprintf(message, message_size,
+				         "DICOMweb could not retrieve metadata for %d instance%s (last HTTP status: %d).",
+				         metadata_request_failures, metadata_request_failures == 1 ? "" : "s",
+				         last_metadata_http_status);
+			} else {
+				snprintf(message, message_size,
+				         "DICOMweb could not retrieve metadata for %d instance%s (last error: %s).",
+				         metadata_request_failures, metadata_request_failures == 1 ? "" : "s",
+				         http_response_error_string(last_metadata_transport_error));
+			}
+		} else if (metadata_parse_failures > 0) {
+			snprintf(message, message_size,
+			         "DICOMweb returned invalid or unsupported metadata for %d instance%s.",
+			         metadata_parse_failures, metadata_parse_failures == 1 ? "" : "s");
+		} else {
+			snprintf(message, message_size,
+			         "DICOMweb series has no supported TILED_FULL VOLUME instances (%d inspected).",
+			         unsupported_instances);
+		}
+		dicomweb_remote_image_destroy(&remote);
 		return NULL;
 	}
 	qsort(remote.instances, remote.instance_count, sizeof(remote.instances[0]),
@@ -685,12 +1019,12 @@ static image_t* dicomweb_prepare_configured_series(
 
 	image_t* image = (image_t*)calloc(1, sizeof(image_t));
 	if (!image || !init_image_from_dicomweb(image, &remote, false)) {
-		for (i32 i = 0; i < remote.instance_count; ++i) {
-			dicomweb_instance_metadata_destroy(remote.instances + i);
-		}
 		if (image) {
-			for (i32 i = 0; i < image->level_count; ++i) free(image->level_images[i].tiles);
+			if (image->backend == IMAGE_BACKEND_DICOMWEB) image_destroy(image);
+			else dicomweb_remote_image_destroy(&remote);
 			free(image);
+		} else {
+			dicomweb_remote_image_destroy(&remote);
 		}
 		copy_cstring(message, "DICOMweb pyramid metadata is unsupported or inconsistent.",
 		             message_size);
@@ -742,10 +1076,15 @@ bool dicomweb_open_related_series(app_state_t* app_state, const image_t* current
 	if (!current_image || current_image->backend != IMAGE_BACKEND_DICOMWEB) return false;
 	dicomweb_remote_image_t remote = current_image->dicomweb;
 	if (series_index < 0 || series_index >= remote.available_series_count) return false;
+	remote.available_series = NULL;
+	remote.available_series_count = 0;
+	remote.available_series_capacity = 0;
+	remote.instances = NULL;
 	remote.instance_count = 0;
+	remote.instance_capacity = 0;
 	remote.selected_series_index = series_index;
 	copy_cstring(remote.series_instance_uid,
-	             remote.available_series[series_index].series_instance_uid,
+	             current_image->dicomweb.available_series[series_index].series_instance_uid,
 	             sizeof(remote.series_instance_uid));
 	return dicomweb_open_configured_series(app_state, remote);
 }

@@ -30,6 +30,7 @@ typedef struct dicomweb_async_result_t {
 	i32 http_status;
 	bool succeeded;
 	bool cancelled;
+	bool truncated;
 	char message[512];
 	i32 count;
 	image_t* image;
