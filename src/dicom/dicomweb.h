@@ -112,6 +112,8 @@ i32 dicomweb_count_series_refs(const char* json, size_t json_size);
 bool dicomweb_parse_multipart_frame(const u8* body, size_t body_size,
                                     const char* response_content_type,
                                     dicomweb_frame_t* out);
+u8* dicomweb_decode_jpeg_frame_to_bgra(const dicomweb_instance_metadata_t* instance,
+		const dicomweb_frame_t* frame);
 bool dicomweb_build_instance_metadata_path(char* dest, size_t dest_size,
                                            const char* root,
                                            const char* study_uid,

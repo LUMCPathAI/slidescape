@@ -31,6 +31,8 @@
 
 #include "lz4.h"
 
+#include <ctype.h>
+
 #define LISTING_IMPLEMENTATION
 #include "listing.h"
 
@@ -1294,6 +1296,39 @@ static int compare_dicom_slides(const void* a, const void* b) {
 	return strcmp(slide_a->representative_filename, slide_b->representative_filename);
 }
 
+static bool dicom_paths_equal(const char* a, const char* b) {
+	while (*a || *b) {
+		bool a_is_separator = *a == '/' || *a == '\\';
+		bool b_is_separator = *b == '/' || *b == '\\';
+		if (a_is_separator || b_is_separator) {
+			if (!a_is_separator || !b_is_separator) return false;
+			while (*a == '/' || *a == '\\') ++a;
+			while (*b == '/' || *b == '\\') ++b;
+			continue;
+		}
+		#if WINDOWS
+		if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+		#else
+		if (*a != *b) return false;
+		#endif
+		++a;
+		++b;
+	}
+	return true;
+}
+
+static void dicom_load_instances_from_directory_tree(dicom_series_t* dicom, directory_info_t* directory) {
+	for (i32 i = 0; i < arrlen(directory->dicom_files); ++i) {
+		dicom_instance_t instance = dicom_load_file(dicom, directory->dicom_files + i);
+		if (instance.is_valid) {
+			arrput(dicom->instances, instance);
+		}
+	}
+	for (i32 i = 0; i < arrlen(directory->directories); ++i) {
+		dicom_load_instances_from_directory_tree(dicom, directory->directories + i);
+	}
+}
+
 bool dicom_open_from_directory(dicom_series_t* dicom, directory_info_t* directory, const file_info_t* selected_file) {
 	i64 start = get_clock();
 
@@ -1304,18 +1339,8 @@ bool dicom_open_from_directory(dicom_series_t* dicom, directory_info_t* director
 	#endif
 	dicom->tag_handler_func = is_verbose_mode ? handle_dicom_tag_for_tag_dumping : NULL;
 
-	// TODO: load child directories as well.
-
 	bool success = true;
-
-	i32 file_count = arrlen(directory->dicom_files);
-	for (i32 i = 0; i < file_count; ++i) {
-		file_info_t* file = directory->dicom_files + i;
-		dicom_instance_t instance = dicom_load_file(dicom, file);
-		if (instance.is_valid) {
-			arrput(dicom->instances, instance);
-		}
-	}
+	dicom_load_instances_from_directory_tree(dicom, directory);
 
 	if (dicom->debug_output_file) {
 		fclose(dicom->debug_output_file);
@@ -1329,8 +1354,7 @@ bool dicom_open_from_directory(dicom_series_t* dicom, directory_info_t* director
 	dicom_ui_t selected_series_instance_uid = {};
 	for (i32 i = 0; i < arrlen(dicom->instances); ++i) {
 		dicom_instance_t* instance = dicom->instances + i;
-		const char* instance_filename = one_past_last_slash(instance->filename, strlen(instance->filename));
-		if (selected_file && strcmp(instance_filename, selected_file->filename_in_directory) == 0) {
+		if (selected_file && dicom_paths_equal(instance->filename, selected_file->full_filename)) {
 			selected_series_instance_uid = instance->general_series.SeriesInstanceUID;
 		}
 		if (instance->image_flavor == DICOM_IMAGE_FLAVOR_VOLUME) {

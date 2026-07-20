@@ -130,7 +130,7 @@ in order to make console output visible. See [README_console.txt](doc/README_con
 ### Windows
 You can build the program using CMake and the MinGW-w64 toolchain.
 
-All library code is included with the source code distribution (there are no other external dependencies).
+All required library code is included with the source code distribution.
 
 You may wish to install `nasm` so that the SIMD-optimized assembly code in libjpeg-turbo can be compiled.
 
@@ -177,7 +177,7 @@ Slidescape embeds code from the following projects, under their respective licen
 * [json.h](https://github.com/sheredom/json.h) (JSON parser)
 * [linmath.h](https://github.com/datenwolf/linmath.h) (linear math library)
 * [stb_image.h](https://github.com/nothings/stb) (image loader)
-* [OpenJPEG](https://github.com/uclouvain/openjpeg) (discrete wavelet transform)
+* [OpenJPEG](https://github.com/uclouvain/openjpeg) (JPEG 2000 image codec and discrete wavelet transform)
 * [LZ4](https://github.com/lz4/lz4) (compression algorithm)
 * [base64.c](http://web.mit.edu/freebsd/head/contrib/wpa/src/utils/base64.c) (base64 decoder)
 * [cityhash](https://github.com/google/cityhash/blob/8af9b8c2b889d80c22d6bc26ba0df1afb79a30db/src/city.cc#L50) (byte swap operations)

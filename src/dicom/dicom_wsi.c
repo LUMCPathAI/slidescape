@@ -21,6 +21,7 @@
 #include "dicom_wsi.h"
 
 #include "jpeg_decoder.h"
+#include "jpeg2000_decoder.h"
 
 // Returns either &array[index] if it already exists, or a newly added and zeroed element at the end of the array
 #define array_last_maybe_expand(array, index) \
@@ -487,6 +488,8 @@ u8* dicom_wsi_decode_tile_to_bgra(dicom_series_t* dicom_series, i32 instance_ind
 	} else {
 		i64 data_size = dicom_defragment_encapsulated_pixel_data_frame(tile_data, bytes_read);
 		bool is_jpeg_baseline = instance->transfer_syntax_uid.as_enum == DICOM_JPEGBaseline8Bit;
+		bool is_jpeg2000 = instance->transfer_syntax_uid.as_enum == DICOM_JPEG2000Lossless ||
+		                   instance->transfer_syntax_uid.as_enum == DICOM_JPEG2000;
 		if (data_size > 0 && is_jpeg_baseline) {
 			// JPEG compression
 			i32 width = 0;
@@ -513,6 +516,18 @@ u8* dicom_wsi_decode_tile_to_bgra(dicom_series_t* dicom_series, i32 instance_ind
 			} else {
 				if (pixels) free(pixels);
 				result = NULL;
+			}
+		} else if (data_size > 0 && is_jpeg2000) {
+			i32 width = 0;
+			i32 height = 0;
+			result = jpeg2000_decode_image_to_bgra(tile_data, data_size, &width, &height);
+			if (result && (width != instance->columns || height != instance->rows)) {
+				console_print_error("DICOM tile decode: JPEG 2000 dimensions do not match DICOM frame\n");
+				free(result);
+				result = NULL;
+			}
+			if (!result) {
+				console_print_error("DICOM tile decode: JPEG 2000 decoding failed\n");
 			}
 		} else if (data_size <= 0) {
 			console_print_error("DICOM tile decode: invalid encapsulated Pixel Data frame\n");

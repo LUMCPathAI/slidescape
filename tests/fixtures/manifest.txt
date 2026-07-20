@@ -8,3 +8,4 @@
 # or add machine-local private entries to local_manifest.txt.
 
 zenodo-testslide-isyntax | isyntax | public | isyntax-metadata,isyntax-tile | testslide.isyntax | https://zenodo.org/record/5037046/files/testslide.isyntax
+idc-cgci-htmcp-dlbcl-he | dicom | public | dicom-metadata,dicom-tile,dicom-directory,dicom-jpeg2000 | dicom/cgci_htmcp_dlbcl | https://viewer.imaging.datacommons.cancer.gov/slim/studies/2.25.232620998953489036136937306696716616790/series/1.3.6.1.4.1.5962.99.1.2975130277.493130405.1772501688997.4.0

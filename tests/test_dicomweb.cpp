@@ -1,6 +1,8 @@
 #include "doctest.h"
 
 #include "dicomweb.h"
+#include "jpeg_decoder.h"
+#include "stringutils.h"
 
 #ifndef SLIDESCAPE_TEST_DICOMWEB_FIXTURE_DIR
 #define SLIDESCAPE_TEST_DICOMWEB_FIXTURE_DIR "tests/fixtures/dicomweb"
@@ -84,6 +86,44 @@ TEST_CASE("DICOMweb extracts a native frame from multipart related") {
 	CHECK(frame.data[1] == 0xd8);
 	CHECK(strcmp(frame.media_type, "image/jpeg") == 0);
 	CHECK(strcmp(frame.transfer_syntax_uid, "1.2.840.10008.1.2.4.50") == 0);
+}
+
+TEST_CASE("DICOMweb decodes transcoded JPEG using its embedded color space") {
+	const i32 width = 16;
+	const i32 height = 16;
+	u8 source[width * height * 4];
+	for (i32 i = 0; i < width * height; ++i) {
+		source[i * 4 + 0] = 20;
+		source[i * 4 + 1] = 40;
+		source[i * 4 + 2] = 200;
+		source[i * 4 + 3] = 255;
+	}
+	u8* jpeg = NULL;
+	u64 jpeg_size = 0;
+	jpeg_encode_image(source, width, height, 95, &jpeg, &jpeg_size);
+	REQUIRE(jpeg != NULL);
+	REQUIRE(jpeg_size > 0);
+
+	dicomweb_instance_metadata_t instance = {};
+	copy_cstring(instance.photometric_interpretation, "RGB",
+	             sizeof(instance.photometric_interpretation));
+	instance.columns = width;
+	instance.rows = height;
+	dicomweb_frame_t frame = {};
+	frame.data = jpeg;
+	frame.size = jpeg_size;
+	copy_cstring(frame.media_type, "image/jpeg", sizeof(frame.media_type));
+	copy_cstring(frame.transfer_syntax_uid, "1.2.840.10008.1.2.4.50",
+	             sizeof(frame.transfer_syntax_uid));
+
+	u8* decoded = dicomweb_decode_jpeg_frame_to_bgra(&instance, &frame);
+	REQUIRE(decoded != NULL);
+	CHECK(decoded[0] == doctest::Approx(20).epsilon(0.15));
+	CHECK(decoded[1] == doctest::Approx(40).epsilon(0.15));
+	CHECK(decoded[2] == doctest::Approx(200).epsilon(0.15));
+	CHECK(decoded[3] == 255);
+	free(decoded);
+	free(jpeg);
 }
 
 TEST_CASE("DICOMweb rejects oversized multipart part headers") {

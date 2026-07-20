@@ -12,7 +12,6 @@
 
 #include "dicomweb.h"
 #include "image.h"
-#include "jpeg_decoder.h"
 #include "remote.h"
 #include "stringutils.h"
 #include "tile_cache.h"
@@ -1185,21 +1184,8 @@ static u8* retrieve_frame_pixels(const dicomweb_remote_image_t* remote,
 	dicomweb_frame_t frame = {0};
 	u8* pixels = NULL;
 	if (dicomweb_parse_multipart_frame(response->buffer.data, response->content_length,
-	                                   response->content_type, &frame) &&
-	    strcmp(frame.media_type, "image/jpeg") == 0 &&
-	    strcmp(frame.transfer_syntax_uid, "1.2.840.10008.1.2.4.50") == 0) {
-		i32 width = 0;
-		i32 height = 0;
-		i32 channels = 0;
-		if (strcmp(instance->photometric_interpretation, "RGB") == 0) {
-			pixels = jpeg_decode_rgb_image((u8*)frame.data, (u32)frame.size, &width, &height, &channels);
-		} else {
-			pixels = jpeg_decode_image((u8*)frame.data, (u32)frame.size, &width, &height, &channels);
-		}
-		if (pixels && (width != instance->columns || height != instance->rows || channels != 4)) {
-			free(pixels);
-			pixels = NULL;
-		}
+	                                   response->content_type, &frame)) {
+		pixels = dicomweb_decode_jpeg_frame_to_bgra(instance, &frame);
 	}
 	http_response_destroy(response);
 	return pixels;

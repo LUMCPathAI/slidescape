@@ -259,7 +259,22 @@ void viewer_directory_info_destroy(directory_info_t* info) {
 	info->is_valid = false;
 }
 
-directory_info_t viewer_get_directory_info(const char* path) {
+enum {
+	// PS3.10 section 8.2 permits at most eight File ID components, including the file itself.
+	DICOM_DIRECTORY_RECURSION_LIMIT = 7,
+};
+
+static void viewer_join_path(char* dest, size_t dest_size, const char* directory, const char* name) {
+	size_t directory_len = strlen(directory);
+	if (directory_len > 0 && (directory[directory_len - 1] == '/' || directory[directory_len - 1] == '\\')) {
+		snprintf(dest, dest_size, "%s%s", directory, name);
+	} else {
+		snprintf(dest, dest_size, "%s" PATH_SEP "%s", directory, name);
+	}
+}
+
+static directory_info_t viewer_get_directory_info_internal(const char* path,
+		i32 dicom_recursion_levels_remaining, bool dicom_only) {
 	directory_info_t directory = {0};
 	directory_listing_t* listing = create_directory_listing_and_find_first_file(path, NULL);
 	if (listing) {
@@ -267,17 +282,23 @@ directory_info_t viewer_get_directory_info(const char* path) {
 		do {
 			char* current_filename = get_current_filename_from_directory_listing(listing);
 			char full_filename[512];
-			snprintf(full_filename, sizeof(full_filename), "%s" PATH_SEP "%s", path, current_filename);
+			viewer_join_path(full_filename, sizeof(full_filename), path, current_filename);
 			file_info_t file = viewer_get_file_info(full_filename);
 			if (file.is_valid) {
-				if (file.is_directory) {
-					directory_info_t subdir_info = viewer_get_directory_info(full_filename);
-					arrput(directory.directories, subdir_info);
+				if (file.is_directory && dicom_recursion_levels_remaining > 0) {
+					directory_info_t subdir_info = viewer_get_directory_info_internal(
+						full_filename, dicom_recursion_levels_remaining - 1, true);
+					if (subdir_info.contains_dicom_files) {
+						directory.contains_dicom_files = true;
+						arrput(directory.directories, subdir_info);
+					} else {
+						viewer_directory_info_destroy(&subdir_info);
+					}
 				} else if (file.is_regular_file) {
 					if (file.type == VIEWER_FILE_TYPE_DICOM) {
 						directory.contains_dicom_files = true;
 						arrput(directory.dicom_files, file);
-					} else {
+					} else if (!dicom_only) {
 						arrput(directory.nondicom_files, file);
 						if (file.is_image) {
 							directory.contains_nondicom_images = true;
@@ -293,6 +314,14 @@ directory_info_t viewer_get_directory_info(const char* path) {
 	}
 
 	return directory;
+}
+
+directory_info_t viewer_get_directory_info(const char* path) {
+	return viewer_get_directory_info_internal(path, 0, false);
+}
+
+directory_info_t viewer_get_dicom_directory_info(const char* path) {
+	return viewer_get_directory_info_internal(path, DICOM_DIRECTORY_RECURSION_LIMIT, false);
 }
 
 static bool image_try_load_with_openslide(image_t* image, const char* filename, image_load_options_t* options, bool is_overlay) {

@@ -279,7 +279,7 @@ bool load_generic_file(app_state_t* app_state, const char* filename, u32 filetyp
 				}
 			}
 		} else if (file.is_directory) {
-			directory_info_t directory = viewer_get_directory_info(filename);
+			directory_info_t directory = viewer_get_dicom_directory_info(filename);
 			if (directory.is_valid) {
                 console_print("Trying to open a directory '%s'\n", filename);
                 if (directory.contains_dicom_files) {

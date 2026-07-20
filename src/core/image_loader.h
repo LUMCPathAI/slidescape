@@ -82,6 +82,7 @@ typedef struct image_load_options_t {
 
 file_info_t viewer_get_file_info(const char* filename);
 directory_info_t viewer_get_directory_info(const char* path);
+directory_info_t viewer_get_dicom_directory_info(const char* path);
 void viewer_directory_info_destroy(directory_info_t* info);
 void load_openslide_wsi(wsi_t* wsi, const char* filename, bool openslide_loading_done, thread_pool_t* thread_pool);
 image_t* image_load_from_file(file_info_t* file, directory_info_t* directory, image_load_options_t* options);

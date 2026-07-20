@@ -10,11 +10,35 @@
 
 #include "dicomweb.h"
 
+#include "jpeg_decoder.h"
 #include "json.h"
 
 static void* dicomweb_json_alloc(void* userdata, size_t size) {
 	(void)userdata;
 	return malloc(size);
+}
+
+u8* dicomweb_decode_jpeg_frame_to_bgra(const dicomweb_instance_metadata_t* instance,
+		const dicomweb_frame_t* frame) {
+	if (!instance || !frame || strcmp(frame->media_type, "image/jpeg") != 0 ||
+		strcmp(frame->transfer_syntax_uid, "1.2.840.10008.1.2.4.50") != 0 ||
+		frame->size > UINT32_MAX) {
+		return NULL;
+	}
+
+	// A DICOMweb server may transcode the stored representation. The original instance's
+	// Photometric Interpretation then does not describe the returned JPEG byte stream.
+	// Let libjpeg use JFIF/Adobe markers and component sampling from the response itself.
+	i32 width = 0;
+	i32 height = 0;
+	i32 channels = 0;
+	u8* pixels = jpeg_decode_image((u8*)frame->data, (u32)frame->size,
+	                              &width, &height, &channels);
+	if (pixels && (width != instance->columns || height != instance->rows || channels != 4)) {
+		free(pixels);
+		pixels = NULL;
+	}
+	return pixels;
 }
 
 static struct json_value_s* object_get(struct json_object_s* object, const char* name) {

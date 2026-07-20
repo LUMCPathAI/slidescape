@@ -235,6 +235,18 @@ if (WITH_SIMD EQUAL 1)
     target_compile_definitions(simd PRIVATE SLIDESCAPE_JPEG_WITH_SIMD=1)
 endif()
 
+set(OPENJPEG_SOURCE_FILES
+        thread.c bio.c cio.c dwt.c event.c ht_dec.c image.c invert.c j2k.c jp2.c
+        mct.c mqc.c openjpeg.c opj_clock.c pi.c t1.c t2.c tcd.c tgt.c
+        function_list.c opj_malloc.c sparse_array.c)
+prepend_path(OPENJPEG_SOURCE_FILES deps/openjpeg)
+add_library(slidescape_openjpeg STATIC ${OPENJPEG_SOURCE_FILES})
+target_include_directories(slidescape_openjpeg PUBLIC "${CMAKE_SOURCE_DIR}/deps/openjpeg")
+target_compile_definitions(slidescape_openjpeg PUBLIC OPJ_STATIC=1)
+if(UNIX)
+    target_link_libraries(slidescape_openjpeg PUBLIC m)
+endif()
+
 set(FREETYPE_SOURCE_FILES
         autofit/autofit.c   base/ftbbox.c       base/ftbase.c       base/ftbdf.c        base/ftbitmap.c
         base/ftcid.c        base/ftfstype.c     base/ftgasp.c       base/ftglyph.c      base/ftgxval.c
@@ -300,6 +312,7 @@ set(SLIDESCAPE_NONGUI_BASE_FILES
         src/utils/mathutils.c
         src/utils/memrw.c
         src/utils/jpeg_decoder.c
+        src/utils/jpeg2000_decoder.c
         src/utils/crc32.c
         src/utils/block_allocator.c
         src/utils/timerutils.c
@@ -341,6 +354,7 @@ target_compile_definitions(slidescape_nongui PRIVATE
         IS_SERVER=0
         ISYNTAX_JPEG_DECODER_USE_LIBJPEG=1
 )
+target_link_libraries(slidescape_nongui PUBLIC slidescape_openjpeg)
 
 
 

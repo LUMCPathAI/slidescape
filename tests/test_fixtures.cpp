@@ -86,10 +86,8 @@ static void join_test_path(char* dest, size_t dest_size, const char* lhs, const 
 }
 
 static bool test_fixture_file_exists(const char* path) {
-	FILE* fp = fopen(path, "rb");
-	if (!fp) return false;
-	fclose(fp);
-	return true;
+	struct stat st;
+	return platform_stat(path, &st) == 0;
 }
 
 static size_t split_manifest_line(char* line, char** fields, size_t field_capacity) {
@@ -279,13 +277,23 @@ static image_t* load_dicom_fixture_image(const fixture_t* fixture) {
 
 	file_info_t file = viewer_get_file_info(fixture->path);
 	REQUIRE(file.is_valid);
-	REQUIRE(file.is_regular_file);
-	REQUIRE(file.type == VIEWER_FILE_TYPE_DICOM);
 
 	image_load_options_t options = {};
 	options.resource_id = 3000;
 	options.thread_pool = &global_thread_pool;
-	image_t* image = image_load_from_file(&file, NULL, &options);
+	image_t* image = NULL;
+	if (file.is_directory) {
+		directory_info_t directory = viewer_get_dicom_directory_info(fixture->path);
+		REQUIRE(directory.is_valid);
+		REQUIRE(directory.contains_dicom_files);
+		file.type = VIEWER_FILE_TYPE_DICOM;
+		image = image_load_from_file(&file, &directory, &options);
+		viewer_directory_info_destroy(&directory);
+	} else {
+		REQUIRE(file.is_regular_file);
+		REQUIRE(file.type == VIEWER_FILE_TYPE_DICOM);
+		image = image_load_from_file(&file, NULL, &options);
+	}
 	REQUIRE(image != NULL);
 	REQUIRE(image->is_valid);
 	REQUIRE(image->backend == IMAGE_BACKEND_DICOM);
@@ -321,6 +329,11 @@ TEST_CASE("available WSI fixtures have expected extensions") {
 		} else if (strcmp(fixture.type, "isyntax") == 0) {
 			CHECK(strcmp(extension, "isyntax") == 0);
 		} else if (strcmp(fixture.type, "dicom") == 0) {
+			if (fixture_has_tag(fixture, "dicom-directory")) {
+				file_info_t file = viewer_get_file_info(fixture.path);
+				CHECK(file.is_directory);
+				continue;
+			}
 			u8 header[256] = {};
 			REQUIRE(read_file_prefix(fixture.path, header, sizeof(header)));
 			CHECK(is_file_a_dicom_file(header, sizeof(header)));
@@ -459,6 +472,20 @@ TEST_CASE("open DICOM WSI fixtures through Slidescape DICOM reader") {
 
 		CAPTURE(fixture.id);
 		CAPTURE(fixture.path);
+		if (fixture_has_tag(fixture, "dicom-directory")) {
+			directory_info_t shallow_directory = viewer_get_directory_info(fixture.path);
+			REQUIRE(shallow_directory.is_valid);
+			CHECK_FALSE(shallow_directory.contains_dicom_files);
+			CHECK(arrlen(shallow_directory.directories) == 0);
+			viewer_directory_info_destroy(&shallow_directory);
+
+			directory_info_t directory = viewer_get_dicom_directory_info(fixture.path);
+			REQUIRE(directory.is_valid);
+			CHECK(arrlen(directory.dicom_files) == 0);
+			CHECK(arrlen(directory.directories) > 0);
+			CHECK(directory.contains_dicom_files);
+			viewer_directory_info_destroy(&directory);
+		}
 		image_t* image = load_dicom_fixture_image(&fixture);
 
 		CHECK(image->dicom.wsi.instance_count > 0);
@@ -497,6 +524,40 @@ TEST_CASE("open DICOM WSI fixtures through Slidescape DICOM reader") {
 	}
 }
 
+TEST_CASE("select each slide in a local multi-slide DICOM directory") {
+	const fixture_t* fixture = first_available_fixture("dicom", "dicom-multislide");
+	if (!fixture) {
+		MESSAGE("Skipping local DICOM slide selection check: no multi-slide fixture is present locally.");
+		return;
+	}
+
+	image_t* initial_image = load_dicom_fixture_image(fixture);
+	i32 slide_count = arrlen(initial_image->dicom.slides);
+	REQUIRE(slide_count > 1);
+	dicom_slide_t* slides = (dicom_slide_t*)calloc((size_t)slide_count, sizeof(dicom_slide_t));
+	REQUIRE(slides != NULL);
+	memcpy(slides, initial_image->dicom.slides, (size_t)slide_count * sizeof(dicom_slide_t));
+	image_destroy(initial_image);
+	free(initial_image);
+
+	for (i32 expected_index = 0; expected_index < slide_count; ++expected_index) {
+		fixture_t selected_fixture = *fixture;
+		copy_string(selected_fixture.path, COUNT(selected_fixture.path),
+		            slides[expected_index].representative_filename);
+		image_t* selected_image = load_dicom_fixture_image(&selected_fixture);
+		CAPTURE(expected_index);
+		CAPTURE(selected_fixture.path);
+		CHECK(selected_image->dicom.selected_slide_index == expected_index);
+		REQUIRE(selected_image->dicom.selected_slide_index >= 0);
+		CHECK(strcmp(selected_image->dicom.slides[selected_image->dicom.selected_slide_index]
+		                 .series_instance_uid.value,
+		             slides[expected_index].series_instance_uid.value) == 0);
+		image_destroy(selected_image);
+		free(selected_image);
+	}
+	free(slides);
+}
+
 TEST_CASE("decode a representative DICOM WSI frame") {
 	fixture_manifest_t* manifest = fixture_manifest();
 	bool checked_any = false;
@@ -511,6 +572,17 @@ TEST_CASE("decode a representative DICOM WSI frame") {
 		CAPTURE(fixture.id);
 		CAPTURE(fixture.path);
 		image_t* image = load_dicom_fixture_image(&fixture);
+		if (fixture_has_tag(fixture, "dicom-jpeg2000")) {
+			bool found_jpeg2000 = false;
+			for (i32 i = 0; i < arrlen(image->dicom.instances); ++i) {
+				dicom_uid_enum syntax = image->dicom.instances[i].transfer_syntax_uid.as_enum;
+				if (syntax == DICOM_JPEG2000Lossless || syntax == DICOM_JPEG2000) {
+					found_jpeg2000 = true;
+					break;
+				}
+			}
+			CHECK(found_jpeg2000);
+		}
 
 		level_image_t* level = NULL;
 		i32 level_index = -1;

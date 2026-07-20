@@ -53,6 +53,7 @@
 				<string>scn</string>
 				<string>mrxs</string>
 				<string>bif</string>
+				<string>dcm</string>
 			</array>
 			<key>CFBundleTypeName</key>
 			<string>Whole slide image</string>
