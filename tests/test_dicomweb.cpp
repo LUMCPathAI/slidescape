@@ -2,6 +2,30 @@
 
 #include "dicomweb.h"
 
+#ifndef SLIDESCAPE_TEST_DICOMWEB_FIXTURE_DIR
+#define SLIDESCAPE_TEST_DICOMWEB_FIXTURE_DIR "tests/fixtures/dicomweb"
+#endif
+
+static std::string read_dicomweb_fixture(const char* filename) {
+	char path[1024];
+	snprintf(path, sizeof(path), "%s/%s", SLIDESCAPE_TEST_DICOMWEB_FIXTURE_DIR, filename);
+	FILE* file = fopen(path, "rb");
+	if (!file) return {};
+	fseek(file, 0, SEEK_END);
+	long size = ftell(file);
+	fseek(file, 0, SEEK_SET);
+	if (size < 0) {
+		fclose(file);
+		return {};
+	}
+	std::string contents((size_t)size, '\0');
+	if (size > 0 && fread(contents.data(), 1, (size_t)size, file) != (size_t)size) {
+		contents.clear();
+	}
+	fclose(file);
+	return contents;
+}
+
 TEST_CASE("DICOMweb parses WSI DICOM JSON metadata") {
 	const char* json =
 		"[{"
@@ -115,6 +139,28 @@ TEST_CASE("DICOMweb validates UID syntax") {
 	CHECK_FALSE(dicomweb_is_valid_uid("1.2\r\nX-Test:1", strlen("1.2\r\nX-Test:1")));
 }
 
+TEST_CASE("DICOMweb percent-encodes QIDO matching values") {
+	char encoded[128];
+	REQUIRE(dicomweb_encode_query_value(encoded, sizeof(encoded), "*H&E stain / lung*"));
+	CHECK(strcmp(encoded, "%2AH%26E%20stain%20%2F%20lung%2A") == 0);
+	char too_small[4];
+	CHECK_FALSE(dicomweb_encode_query_value(too_small, sizeof(too_small), "a b"));
+	CHECK(too_small[0] == '\0');
+}
+
+TEST_CASE("DICOMweb builds a bounded server-side study search") {
+	dicomweb_study_search_t search = {};
+	strcpy(search.study_instance_uid, "1.2.3");
+	strcpy(search.patient_id, "patient 7");
+	strcpy(search.study_date, "20260101-20261231");
+	strcpy(search.description, "H&E");
+	char path[512];
+	REQUIRE(dicomweb_build_study_query_path(path, sizeof(path), "/dicom-web", &search));
+	CHECK(strcmp(path,
+	             "/dicom-web/studies?0020000D=1.2.3&00100020=patient%207"
+	             "&00080020=20260101-20261231&00081030=%2AH%26E%2A") == 0);
+}
+
 TEST_CASE("DICOMweb remote image destruction releases dynamic metadata") {
 	dicomweb_remote_image_t remote = {};
 	remote.instances = (dicomweb_instance_metadata_t*)calloc(2, sizeof(*remote.instances));
@@ -176,6 +222,33 @@ TEST_CASE("DICOMweb accepts scoped QIDO instances without repeated parent UIDs")
 	CHECK(ref.series_instance_uid[0] == '\0');
 	CHECK(strcmp(ref.number_of_frames, "437") == 0);
 	CHECK(dicomweb_count_instance_refs(json, strlen(json)) == 1);
+}
+
+TEST_CASE("DICOMweb parses captured IDC scoped QIDO fixture") {
+	std::string json = read_dicomweb_fixture("idc_scoped_instances.json");
+	REQUIRE_FALSE(json.empty());
+	CHECK(dicomweb_count_instance_refs(json.data(), json.size()) == 6);
+	dicomweb_instance_ref_t refs[6] = {};
+	REQUIRE(dicomweb_parse_instance_refs(json.data(), json.size(), refs, COUNT(refs)) == 6);
+	CHECK(refs[0].study_instance_uid[0] == '\0');
+	CHECK(refs[0].series_instance_uid[0] == '\0');
+	CHECK(strcmp(refs[0].sop_instance_uid,
+	             "1.3.6.1.4.1.5962.99.1.208792987.352384958.1640886332827.21.0") == 0);
+	CHECK(strcmp(refs[0].number_of_frames, "437") == 0);
+}
+
+TEST_CASE("DICOMweb parses captured IDC volume metadata fixture") {
+	std::string json = read_dicomweb_fixture("idc_volume_metadata.json");
+	REQUIRE_FALSE(json.empty());
+	dicomweb_instance_metadata_t metadata = {};
+	REQUIRE(dicomweb_parse_instance_metadata(json.data(), json.size(), &metadata));
+	CHECK(strcmp(metadata.image_flavor, "VOLUME") == 0);
+	CHECK(metadata.is_tiled_full);
+	CHECK(metadata.total_pixel_matrix_columns == 4481);
+	CHECK(metadata.total_pixel_matrix_rows == 5345);
+	CHECK(metadata.number_of_frames == 437);
+	CHECK(metadata.is_mpp_known);
+	dicomweb_instance_metadata_destroy(&metadata);
 }
 
 TEST_CASE("DICOMweb maps column-major frames to raster tiles") {

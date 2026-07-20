@@ -51,9 +51,9 @@ The smoke test requires `curl` and `jq`. It uploads only the file passed on the
 command line. Do not pass private data unless local use of that data has been
 approved.
 
-Frame retrieval requests the stored transfer syntax using
-`application/octet-stream; transfer-syntax=*`. This avoids asking the archive to
-transcode the tile and verifies the path a Slidescape client should normally use.
+Frame retrieval explicitly negotiates JPEG Baseline, matching the current viewer
+profile and the dcm4chee test. The smoke test also verifies exact Study Instance UID
+server-side QIDO matching with `limit` and `offset`.
 
 After building `dicomweb_probe`, run the Slidescape protocol parser against live
 Orthanc metadata and frame responses:

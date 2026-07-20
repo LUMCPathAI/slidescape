@@ -398,7 +398,7 @@ bool remote_request(tls_connection_t* connection, const char* request, i32 reque
 	i32 len = request_len;
 
 #ifdef REMOTE_VERBOSE
-	console_print("Writing request: %s", request);
+	console_print("Writing HTTP request (%d bytes)\n", request_len);
 #endif
 
 	while( ( ret = mbedtls_ssl_write( &connection->ssl, (const u8*)request, request_len ) ) <= 0 )
@@ -412,7 +412,7 @@ bool remote_request(tls_connection_t* connection, const char* request, i32 reque
 
 	len = ret;
 #ifdef REMOTE_VERBOSE
-	console_print( " %d bytes written\n\n%s", request_len, request );
+	console_print("%d bytes written\n", request_len);
 #endif
 
 	/*
@@ -746,8 +746,13 @@ tls_connection_t* remote_connection_open(const char* hostname, i32 portno) {
 }
 
 tls_connection_t* remote_connection_open_http(const char* hostname, i32 portno, bool use_tls) {
-    return use_tls ? remote_connection_open(hostname, portno)
-                   : remote_connection_open_plain(hostname, portno);
+	tls_connection_t* connection = use_tls ? remote_connection_open(hostname, portno)
+	                                        : remote_connection_open_plain(hostname, portno);
+	if (connection && mbedtls_net_set_nonblock(&connection->server_fd) != 0) {
+		remote_connection_close_and_free(connection);
+		return NULL;
+	}
+	return connection;
 }
 
 void remote_connection_close_and_free(tls_connection_t* connection) {
@@ -773,11 +778,15 @@ http_response_t* remote_connection_request_with_headers_and_options(
     ASSERT(connection);
 	remote_request_set_error(options, HTTP_RESPONSE_ERROR_NONE);
 
-    u32 read_poll_timeout_ms = options && options->read_poll_timeout_ms
-                               ? options->read_poll_timeout_ms : 250;
-    float total_timeout_seconds = options && options->total_timeout_seconds > 0.0f
-                                  ? options->total_timeout_seconds : 30.0f;
-    i64 request_start_clock = get_clock();
+	u32 read_poll_timeout_ms = options && options->read_poll_timeout_ms
+	                               ? options->read_poll_timeout_ms : 250;
+	float write_timeout_seconds = options && options->write_timeout_seconds > 0.0f
+	                              ? options->write_timeout_seconds : 10.0f;
+	float idle_read_timeout_seconds = options && options->idle_read_timeout_seconds > 0.0f
+	                                  ? options->idle_read_timeout_seconds : 10.0f;
+	float total_timeout_seconds = options && options->total_timeout_seconds > 0.0f
+	                                  ? options->total_timeout_seconds : 30.0f;
+	i64 request_start_clock = get_clock();
     char request[4096];
     i32 request_len = remote_build_get_request_with_headers(request, sizeof(request), host, path,
                                                             accept, extra_headers, close_after_request);
@@ -786,16 +795,21 @@ http_response_t* remote_connection_request_with_headers_and_options(
         return NULL;
     }
 
-    i32 ret = 1;
-    i32 bytes_written = 0;
-    while (bytes_written < request_len) {
+	i32 ret = 1;
+	i32 bytes_written = 0;
+	i64 write_start_clock = get_clock();
+	while (bytes_written < request_len) {
 		if (remote_request_was_cancelled(options)) {
 			remote_request_set_error(options, HTTP_RESPONSE_ERROR_CANCELLED);
 			return NULL;
 		}
-        if (get_seconds_elapsed(request_start_clock, get_clock()) > total_timeout_seconds) {
-			remote_request_set_error(options, HTTP_RESPONSE_ERROR_TIMEOUT);
-            return NULL;
+		if (get_seconds_elapsed(request_start_clock, get_clock()) > total_timeout_seconds) {
+			remote_request_set_error(options, HTTP_RESPONSE_ERROR_TOTAL_TIMEOUT);
+			return NULL;
+		}
+		if (get_seconds_elapsed(write_start_clock, get_clock()) > write_timeout_seconds) {
+			remote_request_set_error(options, HTTP_RESPONSE_ERROR_WRITE_TIMEOUT);
+			return NULL;
         }
         ret = connection->use_tls
               ? mbedtls_ssl_write(&connection->ssl, (const u8*)request + bytes_written,
@@ -817,17 +831,23 @@ http_response_t* remote_connection_request_with_headers_and_options(
 		return NULL;
 	}
 
-    u8 read_buffer[KILOBYTES(16)];
+	u8 read_buffer[KILOBYTES(16)];
+	i64 last_read_clock = get_clock();
 	while (!parser.message_complete) {
 		if (remote_request_was_cancelled(options)) {
 			remote_request_set_error(options, HTTP_RESPONSE_ERROR_CANCELLED);
 			http_response_parser_destroy(&parser);
 			return NULL;
 		}
-        if (get_seconds_elapsed(request_start_clock, get_clock()) > total_timeout_seconds) {
-			remote_request_set_error(options, HTTP_RESPONSE_ERROR_TIMEOUT);
+		if (get_seconds_elapsed(request_start_clock, get_clock()) > total_timeout_seconds) {
+			remote_request_set_error(options, HTTP_RESPONSE_ERROR_TOTAL_TIMEOUT);
 			http_response_parser_destroy(&parser);
-            return NULL;
+			return NULL;
+		}
+		if (get_seconds_elapsed(last_read_clock, get_clock()) > idle_read_timeout_seconds) {
+			remote_request_set_error(options, HTTP_RESPONSE_ERROR_IDLE_READ_TIMEOUT);
+			http_response_parser_destroy(&parser);
+			return NULL;
         }
         ret = connection->use_tls
               ? mbedtls_ssl_read(&connection->ssl, read_buffer, sizeof(read_buffer))
@@ -841,12 +861,13 @@ http_response_t* remote_connection_request_with_headers_and_options(
         if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || ret == 0) {
             break;
         }
-        if (ret < 0) {
+		if (ret < 0) {
             console_print_error("remote_connection_request(): mbedtls_ssl_read returned %d\n", ret);
 			remote_request_set_error(options, HTTP_RESPONSE_ERROR_NETWORK_READ);
 			http_response_parser_destroy(&parser);
             return NULL;
-        }
+		}
+		last_read_clock = get_clock();
 
 		if (!http_response_parser_execute(&parser, read_buffer, (size_t)ret)) {
 			remote_request_set_error(options, parser.error);
@@ -901,7 +922,7 @@ http_response_t* open_remote_uri_with_extra_headers(const char *uri, const char*
     remote_build_get_request(request, sizeof(request), url_info.site, url_info.path, api_token, cookie_header, true);
     i32 request_len = (i32)strlen(request);
 
-    console_print_verbose("%s\n", request);
+	console_print_verbose("Sending remote HTTP request; credentials and URI are redacted.\n");
 
     i32 portno = atoi(url_info.port);
     if (portno == 80 && strcmp(url_info.protocol, "https") == 0) {

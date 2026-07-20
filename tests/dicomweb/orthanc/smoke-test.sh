@@ -76,7 +76,7 @@ echo "Retrieving raw frame 1..."
 request \
 	-D "${headers_file}" \
 	-o "${frame_file}" \
-	-H "Accept: multipart/related; type=\"application/octet-stream\"; transfer-syntax=*" \
+	-H "Accept: multipart/related; type=\"image/jpeg\"; transfer-syntax=1.2.840.10008.1.2.4.50" \
 	"${base_url}/dicom-web/studies/${study_uid}/series/${series_uid}/instances/${instance_uid}/frames/1"
 
 if ! grep -Eiq '^content-type:[[:space:]]*multipart/related' "${headers_file}"; then

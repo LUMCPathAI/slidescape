@@ -26,6 +26,7 @@ target_compile_definitions(slidescape_tests PRIVATE
         IS_SERVER=0
         SLIDESCAPE_TEST_FIXTURE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/manifest.txt"
         SLIDESCAPE_TEST_LOCAL_FIXTURE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/local_manifest.txt"
+        SLIDESCAPE_TEST_DICOMWEB_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/dicomweb"
         ISYNTAX_JPEG_DECODER_USE_LIBJPEG=1
 )
 target_link_libraries(slidescape_tests PRIVATE slidescape_nongui slidescape_jpeg)

@@ -54,6 +54,7 @@ typedef struct dicomweb_async_task_t {
 	char password[256];
 	char study_uid[65];
 	char series_uid[65];
+	dicomweb_study_search_t study_search;
 } dicomweb_async_task_t;
 
 static image_t* dicomweb_prepare_configured_series(
@@ -300,6 +301,12 @@ static http_response_t* dicomweb_get_with_options(
 	bool reuse_worker_connection, const remote_request_options_t* options) {
 	remote_request_options_t effective_options = options ? *options : (remote_request_options_t){0};
 	if (!effective_options.read_poll_timeout_ms) effective_options.read_poll_timeout_ms = 250;
+	if (effective_options.write_timeout_seconds <= 0.0f) {
+		effective_options.write_timeout_seconds = 10.0f;
+	}
+	if (effective_options.idle_read_timeout_seconds <= 0.0f) {
+		effective_options.idle_read_timeout_seconds = 10.0f;
+	}
 	if (effective_options.total_timeout_seconds <= 0.0f) effective_options.total_timeout_seconds = 30.0f;
 	if (!effective_options.max_response_body_size) {
 		effective_options.max_response_body_size = strstr(accept, "image/jpeg")
@@ -365,6 +372,44 @@ static bool configure_archive(dicomweb_remote_image_t* remote, const char* archi
 	return true;
 }
 
+static bool dicomweb_study_date_query_is_valid(const char* value) {
+	if (!value || !value[0]) return true;
+	size_t length = strlen(value);
+	if (length != 8 && length != 9 && length != 17) return false;
+	for (size_t i = 0; i < length; ++i) {
+		bool is_range_separator = value[i] == '-' &&
+		                          ((length == 9 && (i == 0 || i == 8)) ||
+		                           (length == 17 && i == 8));
+		if (!is_range_separator && (value[i] < '0' || value[i] > '9')) return false;
+	}
+	return true;
+}
+
+static bool dicomweb_search_text_is_safe(const char* value, size_t capacity) {
+	if (!value || !memchr(value, '\0', capacity)) return false;
+	for (const u8* p = (const u8*)value; *p; ++p) {
+		if (*p < 0x20 || *p == 0x7f) return false;
+	}
+	return true;
+}
+
+static bool dicomweb_study_search_is_valid(const dicomweb_study_search_t* search) {
+	if (!search) return true;
+	if (!dicomweb_search_text_is_safe(search->study_instance_uid,
+	                                  sizeof(search->study_instance_uid)) ||
+	    !dicomweb_search_text_is_safe(search->patient_id, sizeof(search->patient_id)) ||
+	    !dicomweb_search_text_is_safe(search->accession_number,
+	                                  sizeof(search->accession_number)) ||
+	    !dicomweb_search_text_is_safe(search->study_date, sizeof(search->study_date)) ||
+	    !dicomweb_search_text_is_safe(search->description, sizeof(search->description))) {
+		return false;
+	}
+	if (search->study_instance_uid[0] &&
+	    !dicomweb_is_valid_uid(search->study_instance_uid,
+	                           strlen(search->study_instance_uid))) return false;
+	return dicomweb_study_date_query_is_valid(search->study_date);
+}
+
 static void dicomweb_async_task_func(i32 logical_thread_index, void* userdata) {
 	(void)logical_thread_index;
 	dicomweb_async_task_t* task = *(dicomweb_async_task_t**)userdata;
@@ -418,7 +463,13 @@ static void dicomweb_async_task_func(i32 logical_thread_index, void* userdata) {
 	i32 path_length = 0;
 	switch (task->kind) {
 		case DICOMWEB_ASYNC_QUERY_STUDIES:
-			path_length = snprintf(base_path, sizeof(base_path), "%s/studies", remote.root);
+			if (!dicomweb_build_study_query_path(base_path, sizeof(base_path), remote.root,
+			                                      &task->study_search)) {
+				copy_cstring(result->message, "Invalid or excessive DICOMweb study search.",
+				             sizeof(result->message));
+				goto complete;
+			}
+			path_length = (i32)strlen(base_path);
 			break;
 		case DICOMWEB_ASYNC_QUERY_SERIES:
 			path_length = snprintf(base_path, sizeof(base_path), "%s/studies/%s/series",
@@ -565,13 +616,14 @@ void dicomweb_async_context_destroy(dicomweb_async_context_t* context) {
 	memset(context, 0, sizeof(*context));
 }
 
-i32 dicomweb_async_query(dicomweb_async_context_t* context,
-                         dicomweb_async_query_kind_t kind,
-                         const char* archive_url,
-                         const char* username,
-                         const char* password,
-                         const char* study_uid,
-                         const char* series_uid) {
+static i32 dicomweb_async_query_internal(dicomweb_async_context_t* context,
+	                                     dicomweb_async_query_kind_t kind,
+	                                     const char* archive_url,
+	                                     const char* username,
+	                                     const char* password,
+	                                     const char* study_uid,
+	                                     const char* series_uid,
+	                                     const dicomweb_study_search_t* search) {
 	if (!context || !context->initialized || !archive_url ||
 	    kind <= DICOMWEB_ASYNC_QUERY_NONE || kind > DICOMWEB_ASYNC_OPEN_SERIES) {
 		return 0;
@@ -581,6 +633,8 @@ i32 dicomweb_async_query(dicomweb_async_context_t* context,
 	    (!study_uid || !dicomweb_is_valid_uid(study_uid, strlen(study_uid)))) return 0;
 	if ((kind == DICOMWEB_ASYNC_QUERY_INSTANCES || kind == DICOMWEB_ASYNC_OPEN_SERIES) &&
 	    (!series_uid || !dicomweb_is_valid_uid(series_uid, strlen(series_uid)))) return 0;
+	if (kind != DICOMWEB_ASYNC_QUERY_STUDIES && search) return 0;
+	if (!dicomweb_study_search_is_valid(search)) return 0;
 	dicomweb_async_task_t* task = (dicomweb_async_task_t*)calloc(1, sizeof(*task));
 	if (!task) return 0;
 	task->context = context;
@@ -591,6 +645,7 @@ i32 dicomweb_async_query(dicomweb_async_context_t* context,
 	if (password) copy_cstring(task->password, password, sizeof(task->password));
 	if (study_uid) copy_cstring(task->study_uid, study_uid, sizeof(task->study_uid));
 	if (series_uid) copy_cstring(task->series_uid, series_uid, sizeof(task->series_uid));
+	if (search) task->study_search = *search;
 	dicomweb_async_task_t* task_pointer = task;
 	atomic_increment(&context->active_tasks);
 	if (!thread_pool_submit_task(&global_thread_pool, dicomweb_async_task_func,
@@ -601,6 +656,27 @@ i32 dicomweb_async_query(dicomweb_async_context_t* context,
 		return 0;
 	}
 	return task->generation;
+}
+
+i32 dicomweb_async_query(dicomweb_async_context_t* context,
+	                     dicomweb_async_query_kind_t kind,
+	                     const char* archive_url,
+	                     const char* username,
+	                     const char* password,
+	                     const char* study_uid,
+	                     const char* series_uid) {
+	return dicomweb_async_query_internal(context, kind, archive_url, username, password,
+	                                     study_uid, series_uid, NULL);
+}
+
+i32 dicomweb_async_query_studies(dicomweb_async_context_t* context,
+	                             const char* archive_url,
+	                             const char* username,
+	                             const char* password,
+	                             const dicomweb_study_search_t* search) {
+	return dicomweb_async_query_internal(context, DICOMWEB_ASYNC_QUERY_STUDIES,
+	                                     archive_url, username, password,
+	                                     NULL, NULL, search);
 }
 
 i32 dicomweb_async_open_series_url(dicomweb_async_context_t* context,

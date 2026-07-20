@@ -58,6 +58,11 @@ i32 dicomweb_async_query(dicomweb_async_context_t* context,
                          const char* password,
                          const char* study_uid,
                          const char* series_uid);
+i32 dicomweb_async_query_studies(dicomweb_async_context_t* context,
+                                 const char* archive_url,
+                                 const char* username,
+                                 const char* password,
+                                 const dicomweb_study_search_t* search);
 i32 dicomweb_async_open_series_url(dicomweb_async_context_t* context,
                                    const char* series_url,
                                    const char* username,

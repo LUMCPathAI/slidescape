@@ -25,6 +25,8 @@ typedef struct tls_connection_t tls_connection_t;
 
 typedef struct remote_request_options_t {
 	u32 read_poll_timeout_ms;
+	float write_timeout_seconds;
+	float idle_read_timeout_seconds;
 	float total_timeout_seconds;
 	size_t max_response_body_size;
 	volatile i32* cancellation_generation;

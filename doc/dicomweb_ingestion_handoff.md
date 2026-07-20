@@ -1,7 +1,7 @@
-# DICOMweb WSI Ingestion And Viewer Handoff
+# DICOMweb WSI, Viewer, And Pathology Archive Handoff
 
-Status: prototype implemented; transport and conformance hardening remain
-Last updated: 2026-07-19
+Status: client prototype implemented; transport/conformance closure and native archive design remain
+Last updated: 2026-07-20
 
 This document defines the first implementation path for adding DICOMweb whole-slide
 imaging (WSI) support around Slidescape. It is intended to be both an architectural
@@ -13,11 +13,14 @@ The deliberately narrow first objective is:
 > archives, discover it through QIDO-RS, retrieve its metadata and frames through
 > WADO-RS, and display it through a new Slidescape DICOMweb backend.
 
-MRXS conversion is the next milestone, not part of the first one. The production
-MRXS route should build on Slidescape's native MRXS parser, camera/overlap
-reconstruction, and tile decoder. Existing converters remain valuable as independent
-references and comparison tools, but the OpenSlide path is not the intended source
-reader for Slidescape ingestion.
+MRXS-to-DICOM conversion is an intermediate milestone, not the intended permanent
+storage architecture. The longer-term production direction is a pathology-first
+archive that preserves vendor-native bundles as primary objects and exposes a
+deterministic DICOM/DICOMweb representation around them. Conversion remains useful
+for standards validation, export, interchange, compatibility testing, and optional
+materialized caches. Both conversion and virtual DICOM must build on Slidescape's
+native MRXS parser, camera/overlap reconstruction, and tile decoder. Existing
+converters remain independent references rather than the production source reader.
 
 ## Executive Decisions
 
@@ -31,24 +34,30 @@ The current recommendations are:
 4. Use dcm4chee Archive 5 as the independent interoperability target.
 5. Optionally use the NCI Imaging Data Commons (IDC) DICOMweb endpoint as a
    read-only external test against real pathology data.
-6. Do not build a production DICOMweb server in Slidescape during this phase.
-7. Do not implement virtual DICOM over MRXS in the initial design.
-8. Build the MRXS source side of the converter on Slidescape's native backend.
-   Implement DICOM writing behind a separate converter boundary.
-9. Preserve source MRXS bundles and record their checksums even when conversion
-   succeeds.
-10. Make interoperability with both Orthanc and dcm4chee an acceptance criterion.
+6. Orthanc and dcm4chee are reference implementations and test fixtures, not the
+   presumed long-term production archive.
+7. Build a pathology-first archive after the current client/conformance gate. Keep
+   its storage/index core separate from the Slidescape GUI and from `src/server.c`.
+8. Preserve vendor-native slide bundles as immutable primary objects with manifests,
+   checksums, metadata overlays, and provenance.
+9. Expose native slides through a deterministic virtual DICOM model and standard
+   DICOMweb endpoints. Materialized DICOM is an optional representation, not the
+   only canonical copy.
+10. Build the MRXS source side shared by conversion and virtual serving on
+    Slidescape's native backend. Keep DICOM serialization behind a separate boundary.
+11. Make interoperability with both Orthanc and dcm4chee an acceptance criterion.
     Behaviour observed from only one server must not become the implicit protocol
     specification.
-11. Use `wsidicomizer` and the Orthanc WSI Dicomizer as external comparison
+12. Use `wsidicomizer` and the Orthanc WSI Dicomizer as external comparison
     implementations, not as the production MRXS ingest dependency.
 
-These are implementation decisions, not final product or procurement decisions.
-Orthanc and dcm4chee are initially test fixtures and reference implementations.
+These decisions deliberately separate the public interoperability contract from the
+internal storage representation. DICOMweb is the external clinical imaging API;
+native pathology storage, indexing, and tile delivery are product-owned internals.
 
 ## Implementation Progress
 
-As of 2026-07-19:
+As of 2026-07-20:
 
 - manifest-driven DICOM WSI metadata tests exist in `tests/test_fixtures.cpp`;
 - representative local DICOM frame decoding is covered;
@@ -98,8 +107,13 @@ As of 2026-07-19:
   after the 1,000-result browser safety limit;
 - series opening also paginates instance discovery, with a separate 10,000-instance
   safety limit, so large concatenations are no longer silently cut off;
-- DICOMweb requests poll for cancellation and use a 30-second total request
-  deadline after connecting;
+- the archive browser has bounded server-side study matching for Study Instance UID,
+  Patient ID, accession number, Study Date/range, and wildcard Study Description;
+- the exact Study Instance UID search shape was verified against the public IDC
+  endpoint;
+- DICOMweb requests poll for cancellation and distinguish a 10-second write
+  deadline, 10-second idle-read deadline, and 30-second total request deadline after
+  connecting;
 - the three local UMCU slides were verified to use separate Study and Series
   Instance UIDs and no Concatenation UID; they are selected through the archive
   browser, while their files within each series are pyramid levels rather than
@@ -138,9 +152,19 @@ As of 2026-07-19:
 - the current interactive slice is intentionally limited to `TILED_FULL`,
   JPEG Baseline, brightfield VOLUME instances, one optical path, and one focal
   plane;
-- the next client work is richer logical-slide/technical-detail metadata,
-  QIDO server-side search, separate connect/write/idle-read deadlines, associated
-  images, sparse frame mapping, and OAuth/OIDC bearer-token acquisition;
+- raw HTTP request logging that could expose authorization or cookie headers was
+  removed from the legacy transport path;
+- `tests/dicomweb/credential-redaction-test.sh` verifies with deliberately invalid
+  Basic credentials that verbose headless output does not expose the password marker;
+- curated, de-identified IDC scoped-QIDO and `TILED_FULL` volume metadata captures
+  are offline parser fixtures under `tests/fixtures/dicomweb/`;
+- `tests/dicomweb/run-client-matrix.sh` runs the same parser/search profile against
+  already-populated Orthanc and dcm4chee harnesses;
+- the shared exact-study-search, metadata, and JPEG Baseline frame matrix passed
+  against both populated local Orthanc and dcm4chee harnesses on 2026-07-20;
+- the next client work is richer logical-slide/technical-detail metadata, a bounded
+  and cancellable connect/TLS-handshake phase, associated images, sparse frame
+  mapping, and OAuth/OIDC bearer-token acquisition;
 - the public IDC proxy was exercised against study
   `2.25.211094631316408413440371843585977094852`, series
   `1.3.6.1.4.1.5962.99.1.208792987.352384958.1640886332827.2.0`;
@@ -161,13 +185,47 @@ DICOMweb backend. Both local reference archives now have pinned harnesses and a
 first shared-fixture protocol run; the broader automated M3 conformance matrix
 remains.
 
-## 2026-07-19 Architecture Review
+## 2026-07-20 Architecture Review
 
-The overall direction remains sound: keep the archive as a separate product or
-service, expose standard DICOMweb, prove the viewer against independent servers,
-and postpone native MRXS conversion until the DICOM path is trustworthy. The
-Orthanc plus dcm4chee split is especially valuable and should remain an acceptance
-gate.
+The initial interoperability sequence remains sound, but the long-term archive
+assumption is now explicit: Orthanc and dcm4chee remain independent reference
+servers, while the intended production direction is an owned pathology-first
+archive. That archive should expose standard DICOMweb without requiring every
+vendor-native slide to be permanently expanded into a second, fully materialized
+DICOM WSI copy.
+
+This is a hybrid representation model:
+
+- already-converted DICOM may be stored as immutable Part 10 objects;
+- vendor-native bundles may remain the primary immutable pixel representation;
+- governed clinical metadata and vendor metadata are stored independently of the
+  source bytes, with provenance and versioning;
+- a virtual-instance manifest assigns stable Study, Series, and SOP Instance UIDs
+  and defines the exact DICOM metadata, dimensions, frame order, and transfer syntax;
+- QIDO-RS indexes the governed/virtual DICOM model rather than scanning source files;
+- WADO-RS metadata is generated deterministically from the manifest;
+- WADO-RS frames are served from native compressed data where exact pass-through is
+  valid, or reconstructed/decoded/encoded through the native format adapter where it
+  is not;
+- complete Part 10 instances may be materialized on demand for export, validation,
+  external transfer, or caching.
+
+"Virtual" must not mean approximate. For a given representation version, the UIDs,
+metadata, frame count, frame ordering, geometry, colour profile, lossy-compression
+attributes, and returned frame bytes must form one stable logical DICOM object. A
+later Part 10 materialization must describe the same object, or receive new versioned
+UIDs when its semantics change.
+
+The pathology-first design is motivated by more than storage duplication. It keeps
+vendor metadata available, supports native-format research workflows, permits
+format-specific tile/index optimizations, and avoids forcing expensive whole-slide
+retiling before first publication. It also creates product responsibilities that a
+generic PACS previously supplied: durable object storage, indexing, transactions,
+publication consistency, authorization, audit, retention, migration, backup, and
+disaster recovery.
+
+The Orthanc plus dcm4chee split therefore remains an acceptance gate for the public
+protocol, not a production deployment commitment.
 
 The current code should nevertheless be treated as an interoperability prototype,
 not as completion of M1 or M2. Development should now prioritize the M1 transport
@@ -179,22 +237,32 @@ features. In particular:
 - retain truncated-response regression coverage when the transport is refactored;
 - retain explicit ownership tests around the dynamically allocated backend
   instance and sibling-series storage;
-- separate connect, write, idle-read, and total deadlines and report which one fired;
+- add a bounded/cancellable connect and TLS-handshake phase; post-connect write,
+  idle-read, and total deadlines now report separately;
 - retain configured-URL, UID, and request-injection validation coverage;
-- add QIDO pagination and server-side filters before browsing a cloud-scale archive;
-- make captured IDC QIDO, metadata, and multipart shapes regression fixtures, while
-  keeping live IDC tests optional because the public proxy has quotas and mutable
-  release data;
+- add server-side QIDO filters before browsing a cloud-scale archive;
+- extend the captured IDC regressions when new response shapes affect the parser,
+  while keeping live IDC tests optional because the public proxy has quotas and
+  mutable release data;
 - keep provider/viewer URL translation in a small adapter. Core QIDO/WADO code must
   continue to operate on configured DICOMweb URLs without provider-specific rules;
 - complete associated-image, colour-management, optical-path, focal-plane, sparse,
   and concatenation checks before making broader WSI compatibility claims.
 
-For cloud PACS work, DICOMweb remains the right imaging interface, but it is not the
-whole operational design. Archive selection, identity reconciliation, quarantine,
-publication state, audit, authorization, retention, backup, and disaster recovery
-remain separate production decisions. The proposed ingest coordinator boundary is
-therefore still appropriate.
+Before beginning the archive implementation, close the final narrow transport gate:
+
+- enforce and test a bounded/cancellable connect and TLS-handshake deadline; the
+  post-connect write, idle-read, and total phases now report separately.
+
+A redistributable public DICOM WSI fixture and repeatable provisioning lifecycle are
+still needed before moving the passing black-box matrix into CI. That should not block
+starting the archive service boundary, but it does block an automated conformance
+claim.
+
+Associated images, colour management, multiple optical paths/focal planes, sparse
+tiling, and concatenations remain important compatibility work, but they need not all
+block starting the archive core. They should become explicit capability slices tested
+against all three implementations as support is added.
 
 ## Why DICOM-Only Comes First
 
@@ -234,22 +302,44 @@ or server defect.
 - Display through the existing image, tile cache, worker, and renderer paths.
 - Automated cross-server conformance tests for the subset used by Slidescape.
 
-### Phase 2 Scope
+### Phase 2 Scope: Materialized Conversion And Ingest Semantics
 
 - MRXS bundle validation and conversion.
 - Native MRXS parsing and reconstruction through `src/mrxs/`.
 - DICOM WSI writing from native, non-overlapping logical output tiles.
 - Conversion using an isolated worker process.
 - Conversion fidelity and metadata validation.
-- Retention and provenance for the original MRXS bundle.
+- Immutable retention and provenance for the original MRXS bundle.
 - Resumable upload into a quarantine area.
 - Publication to DICOMweb only after validation succeeds.
+
+Materialized conversion proves that native geometry and governed metadata can form a
+valid DICOM WSI object. It is also an export/interchange feature. It must not make the
+converted copy the only production representation.
+
+### Phase 3 Scope: Pathology-First Archive And Virtual DICOM
+
+- Content-addressed, immutable storage of complete vendor-native bundles and DICOM
+  Part 10 inputs.
+- A transactionally published pathology/clinical metadata index.
+- Stable virtual Study, Series, and SOP Instance manifests with representation
+  versioning and a governed UID policy.
+- QIDO-RS over the indexed virtual DICOM model.
+- WADO-RS metadata and frame retrieval backed by native format adapters.
+- Native compressed-tile pass-through only when codec, colour, geometry, and frame
+  semantics exactly match the advertised DICOM representation.
+- Reconstruction/transcoding and derived-artifact caches when pass-through is not
+  valid.
+- On-demand Part 10 materialization and validation against independent tools and
+  archives.
+- Publication, authorization, audit, retention, migration, backup, and disaster-
+  recovery behavior suitable for an owned archive.
 
 ### Explicit Non-Goals
 
 - Replacing the LIS.
 - Diagnostic production deployment.
-- Implementing a new PACS/archive.
+- Implementing a new PACS/archive during the initial client interoperability phase.
 - Supporting every DICOMweb transaction.
 - Arbitrary rendered-region retrieval.
 - Annotation storage or reporting workflows.
@@ -288,18 +378,21 @@ Relevant code:
 
 ### Current Limitations That Affect This Work
 
-The current HTTP implementation:
+The hardened DICOMweb request path now has verified TLS, caller-selected `Accept`,
+bounded incremental HTTP parsing, selected response headers, cancellation polling,
+and explicit write, idle-read, and total deadlines. It still:
 
-- performs only a narrow GET request shape;
-- has a fixed `Accept` header;
-- discards response headers;
-- buffers entire response bodies;
-- has no MIME multipart parser;
-- has no general POST/STOW support;
+- supports only the narrow GET shapes required by the viewer;
+- buffers each bounded JSON or single-frame response before DICOM parsing;
+- parses multipart after buffering rather than streaming part boundaries;
+- has no general POST/STOW request API;
 - has no OAuth/OIDC token lifecycle;
-- configures TLS certificate verification as optional;
-- does not abort on certificate verification failure;
-- can log complete requests containing bearer tokens.
+- does not provide a separately bounded/cancellable TCP connect and TLS-handshake API;
+- captures only the response headers presently needed by the client.
+
+Older non-DICOMweb callers in `remote.c` still use a legacy request/parser path with
+weaker guarantees. The archive must not inherit that path as its server-side HTTP
+foundation; transport reuse requires an explicit extraction or replacement design.
 
 The local DICOM implementation:
 
@@ -412,45 +505,55 @@ it to CI.
 ## Reference Architecture
 
 ```text
-                          +-----------------------+
-                          | Existing LIS / orders |
-                          +-----------+-----------+
-                                      |
-                                      | later: HL7 v2 / FHIR
-                                      v
-+-------------+          +------------+-------------+
-| Scanner or  |--------->| Ingest coordinator       |
-| lab gateway |          | identity + state machine |
-+-------------+          +------+-------------------+
-                               |
-                  +------------+-------------+
-                  |                          |
-                  v                          v
-          +-------+--------+         +-------+---------+
-          | Quarantine     |         | Conversion      |
-          | object storage |-------->| worker (MRXS)   |
-          +-------+--------+         +-------+---------+
-                  |                          |
-                  +------------+-------------+
-                               |
-                               | validated DICOM Part 10
-                               v
-                    +----------+-----------+
-                    | DICOMweb archive     |
-                    | STOW/QIDO/WADO       |
-                    +----------+-----------+
-                               |
-                               | QIDO + metadata + frames
-                               v
-                    +----------+-----------+
-                    | Slidescape           |
-                    | DICOMweb backend     |
-                    +----------------------+
+                     +-----------------------+
+                     | Existing LIS / orders |
+                     +-----------+-----------+
+                                 |
+                                 | later: HL7 v2 / FHIR
+                                 v
++-------------+     +------------+-------------+
+| Scanner or  |---->| Ingest coordinator       |
+| lab gateway |     | identity + state machine |
++-------------+     +------+-------------------+
+                          |
+                          v
+                 +--------+---------+
+                 | Immutable source |
+                 | object storage   |
+                 | native + DICOM   |
+                 +--------+---------+
+                          |
+             +------------+-------------+
+             |                          |
+             v                          v
+  +----------+-----------+    +---------+------------+
+  | Native format       |    | Governed metadata +  |
+  | adapters/indexers   |    | virtual DICOM model  |
+  +----------+----------+    +---------+------------+
+             |                         |
+             +------------+------------+
+                          |
+                          v
+               +----------+-----------+
+               | Pathology archive    |
+               | QIDO/WADO/STOW +     |
+               | publication policy   |
+               +-----+-----------+----+
+                     |           |
+        native/derived frames    | optional Part 10
+                     |           | materialization/export
+                     v           v
+              +------+-----------+------+
+              | Slidescape and external |
+              | standard DICOMweb clients|
+              +-------------------------+
 ```
 
-For Phase 1, the ingest coordinator, quarantine storage, conversion worker, and LIS
-connection are omitted. Test DICOM instances are sent directly to the archive with
-STOW-RS.
+For Phase 1, the owned archive, ingest coordinator, source storage, and LIS connection
+are omitted. Test DICOM instances are sent directly to Orthanc and dcm4chee with
+STOW-RS. Phase 2 introduces conversion and ingest semantics as validation tools.
+Phase 3 replaces the reference archive in the production path while continuing to
+test its DICOMweb behavior against those independent implementations.
 
 ## Protocol Profile Required By Slidescape
 
@@ -790,11 +893,13 @@ metadata and indexes:
 
 - [OpenSlide MIRAX format](https://openslide.org/formats/mirax/)
 
-### Converter Direction
+### Native Source, Materialization, And Virtual-DICOM Direction
 
 #### Slidescape Native MRXS Converter
 
-This is the intended production direction.
+This is the intended intermediate materializer and export path. The same native
+source adapter is also intended to back the production virtual-DICOM path; permanent
+eager conversion of every source bundle is not.
 
 The native backend already:
 
@@ -807,9 +912,10 @@ The native backend already:
   `mrxs_decode_tile_to_bgra()`;
 - exposes physical resolution and per-level geometry.
 
-That last distinction is central to conversion. The DICOM writer should consume the
-same reconstructed logical image that the viewer displays, not reinterpret raw MRXS
-stored-tile coordinates independently.
+That last distinction is central to both conversion and virtual serving. The DICOM
+writer and virtual frame provider should consume the same reconstructed logical image
+that the viewer displays, not reinterpret raw MRXS stored-tile coordinates
+independently.
 
 Recommended component boundary:
 
@@ -824,16 +930,20 @@ native MRXS source adapter
    |  metadata
    |  associated images
    |  logical non-overlapping BGRA tiles
-   v
-DICOM WSI writer
-   |
-   v
-Part 10 VOLUME / LABEL / OVERVIEW instances
+   +------------------------------+
+   |                              |
+   v                              v
+DICOM WSI writer          virtual DICOM provider
+   |                      (metadata + frame map)
+   v                              |
+Part 10 instances                 v
+                          QIDO/WADO responses
 ```
 
-The converter should be implemented as reusable non-GUI code plus a command-line
-worker entry point. The worker process provides isolation and operational control;
-it does not imply using a different image reader.
+The source adapter and materializer should be reusable non-GUI code. Conversion gets
+a command-line worker entry point for isolation and operational control; virtual
+serving uses the same adapter behind bounded archive workers and caches. Neither path
+implies using a different image reader.
 
 Suggested boundaries:
 
@@ -843,11 +953,15 @@ src/dicom/dicom_write.*   generic DICOM Part 10 writer primitives
 src/dicom/dicom_wsi_write.*
                           WSI IOD, functional groups, frames, dimensions
 src/core/wsi_convert.*    source-to-DICOM orchestration and validation hooks
+server/pathology_archive/ provisional standalone archive service boundary;
+                          repository/layout requires a separate design
 ```
 
-Exact filenames are provisional. The DICOM writer must not depend on GUI or renderer
-state. MRXS runtime tile caches may be reused where safe, but conversion scheduling
-and ownership must remain explicit.
+Exact filenames are provisional. Do not place the archive implementation in the old
+`src/server.c` target merely because it already exists. The DICOM writer and native
+source adapter must not depend on GUI or renderer state. MRXS runtime tile caches may
+be reused where safe, but conversion and request scheduling, resource limits,
+cancellation, and ownership must remain explicit.
 
 Initial native output profile:
 
@@ -877,6 +991,35 @@ The no-concatenation restriction is acceptable only for the initial controlled
 fixtures. Before realistic large MRXS slides are accepted, the writer and upload
 pipeline must either support DICOM concatenations or demonstrate that the chosen
 archive/client combination safely handles the generated large instances.
+
+#### Virtual DICOM Representation
+
+Each accepted native slide needs a persisted virtual-instance manifest rather than
+ad hoc metadata generation on every request. At minimum it records:
+
+- immutable source bundle identity and adapter/version;
+- governed patient, study, specimen, container, and optical-path metadata versions;
+- stable Study, Series, SOP Instance, and Dimension Organization UIDs;
+- logical total-matrix geometry, physical origin/resolution, focal planes, and
+  optical paths;
+- associated-image roles and their source mappings;
+- frame dimensions, ordering, count, transfer syntax, photometric interpretation,
+  ICC profile, and lossy-compression attributes;
+- for every virtual frame, either an exact native byte-range/pass-through mapping or
+  a deterministic reconstruction recipe;
+- representation version, publication state, and invalidation rules for derived
+  caches or materialized Part 10 objects.
+
+Prefer zero-copy native compressed-frame delivery only when the native fragment is
+already a complete frame with exactly the advertised codec, colour interpretation,
+dimensions, and logical geometry. MRXS camera fragments with overlap generally do
+not satisfy that rule and require reconstruction. Other vendor formats may permit
+more pass-through; this must be decided per adapter and proven with tests.
+
+The metadata/index service must answer QIDO without opening or parsing large source
+bundles. Publication is an atomic transition of the source manifest, governed
+metadata, virtual-instance manifests, and searchable index. WADO workers may then
+open native sources lazily using bounded caches.
 
 Costs and risks:
 
@@ -1021,12 +1164,22 @@ CREATED
   -> UPLOADING
   -> UPLOADED
   -> VALIDATING_SOURCE
-  -> READY_FOR_CONVERSION
-  -> CONVERTING
-  -> VALIDATING_DICOM
-  -> STORING
-  -> VERIFYING_ARCHIVE
+  -> STORING_IMMUTABLE_SOURCE
+  -> READY_FOR_REPRESENTATION
+  -> BUILDING_VIRTUAL_INSTANCES
+  -> VALIDATING_REPRESENTATION
+  -> INDEXING
   -> PUBLISHED
+```
+
+Optional materialization branch:
+
+```text
+READY_FOR_REPRESENTATION
+  -> MATERIALIZING_DICOM
+  -> VALIDATING_DICOM
+  -> VERIFYING_REFERENCE_ARCHIVE
+  -> BUILDING_VIRTUAL_INSTANCES
 ```
 
 Failure states:
@@ -1038,20 +1191,27 @@ FAILED_FINAL
 CANCELLED
 ```
 
-Already-converted DICOM enters at `VALIDATING_DICOM` and skips source conversion.
+Already-converted DICOM enters through immutable source storage and DICOM validation,
+then builds its indexed instance model directly. A native bundle does not require
+materialization before publication once the virtual representation path has reached
+production acceptance.
 
 Publication means:
 
-- all required instances were accepted by STOW;
-- QIDO finds the expected study, series, and instances;
-- WADO metadata matches the submitted instances;
+- the complete immutable source bundle and checksums are committed;
+- governed metadata and virtual-instance manifests are committed atomically;
+- QIDO finds exactly the newly published study, series, and instances;
+- WADO metadata matches the persisted virtual-instance manifests;
 - selected frames can be retrieved and decoded;
-- source-to-DICOM validation passed where a source WSI exists;
+- source-to-representation validation passed;
+- when Part 10 was materialized, DICOM structural and source-to-DICOM validation
+  passed and the materialization is linked to the representation version;
 - the ingest record and audit event are committed.
 
-No partially stored slide should appear in a clinical worklist. Archives may expose
-instances immediately after STOW, so the application-level worklist must rely on the
-ingest publication state rather than archive presence alone.
+No partially stored slide should appear in a clinical worklist. The owned QIDO index
+and application worklist must both honor publication state. Reference archives may
+expose instances immediately after STOW, so Phase 2 tests still require an
+application-level publication gate.
 
 ## Conversion Validation
 
@@ -1183,6 +1343,9 @@ network conditions, and client build.
 
 ### M0: Fixture And Server Harness
 
+Status: functionally exercised on both pinned harnesses; shared lifecycle/CI execution
+still needs consolidation.
+
 Deliverables:
 
 - public DICOM WSI fixture entries;
@@ -1201,11 +1364,16 @@ Acceptance:
 
 ### M1: DICOMweb Transport Library
 
+Status: core viewer transport and bounded parsing are implemented. Post-connect
+write, idle-read, and total failures are distinguished, and verbose credential
+redaction has an integration regression. A bounded/cancellable connect and
+TLS-handshake phase remains before closure.
+
 Deliverables:
 
 - strict HTTP/TLS request API;
 - response header support;
-- incremental multipart parser;
+- bounded multipart parser for the required single-frame response profile;
 - DICOM JSON parser for the required subset;
 - unit tests with captured/synthetic responses;
 - credential redaction tests.
@@ -1219,6 +1387,10 @@ Acceptance:
 
 ### M2: DICOMweb Image Backend
 
+Status: the core `TILED_FULL` JPEG Baseline volume path is implemented and has opened
+the same representative slides through independent servers. Associated images and
+the broader optional WSI capability slices remain.
+
 Deliverables:
 
 - open by Study/Series UID;
@@ -1226,7 +1398,8 @@ Deliverables:
 - `TILED_FULL` tile-to-frame mapping;
 - raw JPEG frame fetch and decode;
 - tile cache integration;
-- label/overview loading where present;
+- label/overview loading where present (optional capability slice, not part of the
+  core-volume closure gate);
 - viewer UI or command-line input for a DICOMweb URL and identifiers.
 
 Acceptance:
@@ -1238,6 +1411,10 @@ Acceptance:
 - tests cover one-based DICOM frame numbering.
 
 ### M3: Cross-Implementation Conformance
+
+Status: the shared client matrix passes against both populated local reference
+servers. A redistributable public DICOM WSI fixture, repeatable provisioning, and CI
+execution remain before this milestone is complete.
 
 Deliverables:
 
@@ -1252,7 +1429,10 @@ Acceptance:
 - no server-specific URL logic exists outside configuration/adapter boundaries;
 - unsupported optional behaviour fails clearly.
 
-### M4: Native MRXS-To-DICOM Converter
+### M4: Native MRXS-To-DICOM Materializer
+
+This milestone is an interoperability, validation, and export milestone. It is not a
+decision to make materialized DICOM the only production copy.
 
 Deliverables:
 
@@ -1287,17 +1467,49 @@ Deliverables:
 - resumable upload;
 - quarantine;
 - state machine and idempotency;
-- isolated conversion worker;
-- STOW and archive verification;
+- isolated source adapter and optional conversion worker;
+- virtual-instance manifest and publication orchestration;
+- optional STOW and reference-archive verification;
 - publication event;
 - audit/provenance record.
 
 Acceptance:
 
-- interrupted uploads and conversions resume or fail safely;
+- interrupted uploads, indexing, and optional conversions resume or fail safely;
 - duplicate submissions do not create duplicate clinical slides;
 - incomplete studies never enter the application worklist;
-- every published DICOM instance links to source checksums and converter version.
+- every published virtual or materialized DICOM instance links to source checksums,
+  adapter version, governed metadata version, and representation version.
+
+### M6: Pathology-First Archive And Virtual DICOM
+
+Deliverables:
+
+- standalone archive service boundary and threat model;
+- immutable native-bundle and Part 10 object storage;
+- transactional metadata, virtual-instance, and QIDO index schema;
+- native adapter worker protocol with resource isolation;
+- QIDO-RS study/series/instance search for the required profile;
+- WADO-RS metadata and frame retrieval for native and materialized sources;
+- on-demand Part 10 materialization/export path;
+- derived-frame and metadata cache policy with representation-aware invalidation;
+- authorization, audit, retention, deletion, migration, backup, and recovery design;
+- black-box conformance runner shared with Orthanc and dcm4chee.
+
+Acceptance:
+
+- the same client/conformance suite passes against the owned server and both
+  reference implementations for the claimed profile;
+- a representative MRXS bundle is published without requiring an eager permanent
+  DICOM copy and opens through unmodified standard DICOMweb client paths;
+- QIDO never exposes a partially published representation;
+- virtual metadata, returned frames, and optional Part 10 materialization describe
+  the same versioned logical DICOM instances;
+- source-specific metadata remains retrievable through a governed non-DICOM
+  provenance interface without contaminating standard DICOM attributes;
+- cold/warm frame latency, concurrency, cache behavior, and storage amplification
+  are measured on realistic slides;
+- backup restoration reproduces the same published UIDs and representation manifests.
 
 ## Risks
 
@@ -1337,6 +1549,24 @@ Mitigation: manifest every companion file and checksum before parsing or convers
 Mitigation: require dcm4chee tests from the first functional client milestone and
 use only standard DICOMweb endpoints in production code.
 
+### Virtual DICOM Drifts From Materialized DICOM
+
+Mitigation: generate metadata, frame maps, and Part 10 output from one persisted
+virtual-instance manifest. Version semantic changes, use new UIDs where required,
+and run byte/metadata/frame conformance comparisons in CI.
+
+### Native Optimization Produces Non-Conformant Frames
+
+Mitigation: make compressed pass-through an explicit per-format capability with
+strict codec, colour, dimension, and geometry predicates. Fall back to deterministic
+reconstruction/transcoding when any predicate is not proven.
+
+### Vendor Adapter Defect Affects The Archive Process
+
+Mitigation: parse and decode native formats in isolated, resource-bounded workers.
+Treat source bytes and embedded metadata as untrusted input; never load a vendor
+parser directly into the public request process.
+
 ### Scope Expands Into A PACS/LIS Rewrite
 
 Mitigation: keep the first deliverable to already-converted DICOM WSI viewing. New
@@ -1357,10 +1587,16 @@ These must be resolved by evidence or stakeholder choice:
 - Which system is authoritative for patient, accession, specimen, and stain data?
 - What colour-management and visual-fidelity criteria are required for diagnostic
   use?
-- Is the production archive expected to be built, bought, or operated as an
-  existing product?
-- What retention policy applies to original MRXS bundles after validated DICOM
-  conversion?
+- Which service/repository boundary and implementation language should own the
+  pathology archive? Reusing Slidescape parsing code must not couple the service to
+  GUI state or the experimental `src/server.c` target.
+- Which vendor formats and scanner versions enter the first virtual-DICOM profile?
+- Which source formats allow exact compressed-frame pass-through, and which require
+  reconstruction or re-encoding?
+- Which complete-instance WADO, rendered retrieval, STOW, deletion, and lifecycle
+  transactions must the first owned server claim beyond the Slidescape viewer subset?
+- What retention, legal-hold, and deletion policy applies to immutable native source
+  bundles, derived caches, and optional materialized DICOM objects?
 
 ## Handoff Instructions For Future Agents
 
@@ -1368,8 +1604,9 @@ Before changing code:
 
 1. Read this document and `doc/tile_streamer_handoff.md`.
 2. Inspect `git status` and preserve unrelated user files.
-3. Confirm the current milestone; do not begin MRXS conversion work while M0-M3
-   remain unproven unless explicitly instructed.
+3. Confirm the current milestone. Close the narrow client/conformance gate documented
+   in the architecture review before beginning the archive implementation; broader
+   optional WSI capabilities may continue in parallel.
 4. Check the current DICOM standard and the conformance statement/version of each
    test server. DICOMweb implementations evolve.
 5. Use public fixture manifests; never make private WSI required for public tests.
@@ -1398,12 +1635,30 @@ When adding MRXS ingestion:
 - make the DICOM writer consume the reconstructed logical tile grid rather than raw
   stored MRXS tile positions;
 - run conversion outside the request process;
-- never publish before source, DICOM, and archive round-trip validation;
+- never publish before source and virtual-representation validation; when DICOM is
+  materialized, also require DICOM and reference-archive round-trip validation;
 - record converter name, version, arguments, metadata input, and output checksums;
 - validate native MPP, objective power, bounds, camera origin, and overlap handling
   against representative scanner files and known geometry;
 - use OpenSlide/wsidicomizer/Orthanc outputs only as independent comparisons, not as
   authoritative MRXS interpretations.
+
+When adding the pathology archive:
+
+- treat Orthanc and dcm4chee as black-box protocol oracles, not production libraries;
+- keep the service separate from the GUI and the experimental `src/server.c` target;
+- persist virtual-instance manifests; do not derive identifiers or frame semantics
+  opportunistically inside request handlers;
+- answer QIDO from a transactional index, never by scanning vendor bundles;
+- isolate native parsers/decoders in bounded workers;
+- make publication atomic across source, governed metadata, manifests, and index;
+- key derived caches and materialized DICOM by immutable representation version;
+- require standard clients to use standard DICOMweb paths without provider-specific
+  knowledge of the underlying native format;
+- retain vendor-specific metadata in a governed provenance interface rather than
+  inventing private or incorrect standard DICOM values;
+- run the same black-box conformance cases against the owned server, Orthanc, and
+  dcm4chee.
 
 ## Primary References
 

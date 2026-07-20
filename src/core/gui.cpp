@@ -59,6 +59,7 @@ typedef struct dicomweb_browser_state_t {
 	char username[256];
 	char password[256];
 	char filter[256];
+	dicomweb_study_search_t study_search;
 	char status[512];
 	dicomweb_browser_load_state_t load_state;
 	dicomweb_async_query_kind_t pending_kind;
@@ -121,9 +122,15 @@ static void dicomweb_browser_start_query(dicomweb_async_query_kind_t kind) {
 	const char* series_uid = dicomweb_browser.selected_series >= 0
 	                         ? dicomweb_browser.series[dicomweb_browser.selected_series].series_instance_uid
 	                         : NULL;
-	i32 generation = dicomweb_async_query(
-		&dicomweb_browser.async, kind, dicomweb_browser.archive_url,
-		dicomweb_browser.username, dicomweb_browser.password, study_uid, series_uid);
+	i32 generation = kind == DICOMWEB_ASYNC_QUERY_STUDIES
+	                 ? dicomweb_async_query_studies(
+		                 &dicomweb_browser.async, dicomweb_browser.archive_url,
+		                 dicomweb_browser.username, dicomweb_browser.password,
+		                 &dicomweb_browser.study_search)
+	                 : dicomweb_async_query(
+		                 &dicomweb_browser.async, kind, dicomweb_browser.archive_url,
+		                 dicomweb_browser.username, dicomweb_browser.password,
+		                 study_uid, series_uid);
 	if (!generation) {
 		dicomweb_browser.load_state = DICOMWEB_BROWSER_ERROR;
 		copy_cstring(dicomweb_browser.status, "Could not schedule the DICOMweb request.",
@@ -144,6 +151,7 @@ static void dicomweb_browser_connect(const char* archive_url,
 	             sizeof(dicomweb_browser.username));
 	copy_cstring(dicomweb_browser.password, password ? password : "",
 	             sizeof(dicomweb_browser.password));
+	memset(&dicomweb_browser.study_search, 0, sizeof(dicomweb_browser.study_search));
 	free(dicomweb_browser.studies);
 	dicomweb_browser.studies = NULL;
 	dicomweb_browser.study_count = 0;
@@ -264,6 +272,48 @@ static void gui_draw_dicomweb_archive_window(app_state_t* app_state) {
 		} else {
 			ImGui::TextDisabled("%s", dicomweb_browser.status);
 		}
+	}
+	if (ImGui::CollapsingHeader("Server-side study search")) {
+		ImGui::SetNextItemWidth(310.0f);
+		ImGui::InputTextWithHint("##dicomweb_search_uid", "Study Instance UID",
+		                         dicomweb_browser.study_search.study_instance_uid,
+		                         sizeof(dicomweb_browser.study_search.study_instance_uid));
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(210.0f);
+		ImGui::InputTextWithHint("##dicomweb_search_patient", "Patient ID",
+		                         dicomweb_browser.study_search.patient_id,
+		                         sizeof(dicomweb_browser.study_search.patient_id));
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(210.0f);
+		ImGui::InputTextWithHint("##dicomweb_search_accession", "Accession number",
+		                         dicomweb_browser.study_search.accession_number,
+		                         sizeof(dicomweb_browser.study_search.accession_number));
+		ImGui::SetNextItemWidth(310.0f);
+		ImGui::InputTextWithHint("##dicomweb_search_description", "Study description contains",
+		                         dicomweb_browser.study_search.description,
+		                         sizeof(dicomweb_browser.study_search.description));
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(210.0f);
+		ImGui::InputTextWithHint("##dicomweb_search_date", "Study date or range",
+		                         dicomweb_browser.study_search.study_date,
+		                         sizeof(dicomweb_browser.study_search.study_date));
+		ImGui::SameLine();
+		if (dicomweb_browser.load_state != DICOMWEB_BROWSER_LOADING &&
+		    ImGui::Button("Search server")) {
+			dicomweb_browser.selected_study = -1;
+			dicomweb_browser_clear_series();
+			dicomweb_browser_start_query(DICOMWEB_ASYNC_QUERY_STUDIES);
+		}
+		ImGui::SameLine();
+		if (dicomweb_browser.load_state != DICOMWEB_BROWSER_LOADING &&
+		    ImGui::Button("Clear search")) {
+			memset(&dicomweb_browser.study_search, 0,
+			       sizeof(dicomweb_browser.study_search));
+			dicomweb_browser.selected_study = -1;
+			dicomweb_browser_clear_series();
+			dicomweb_browser_start_query(DICOMWEB_ASYNC_QUERY_STUDIES);
+		}
+		ImGui::TextDisabled("Fields are combined with AND; description uses wildcard matching.");
 	}
 	ImGui::Separator();
 

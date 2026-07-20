@@ -491,6 +491,68 @@ bool dicomweb_is_valid_uid(const char* value, size_t length) {
 	return true;
 }
 
+bool dicomweb_encode_query_value(char* dest, size_t dest_size, const char* value) {
+	static const char hex[] = "0123456789ABCDEF";
+	if (!dest || !dest_size || !value) return false;
+	size_t used = 0;
+	for (const u8* source = (const u8*)value; *source; ++source) {
+		bool unreserved = (*source >= 'a' && *source <= 'z') ||
+		                  (*source >= 'A' && *source <= 'Z') ||
+		                  (*source >= '0' && *source <= '9') ||
+		                  *source == '-' || *source == '.' ||
+		                  *source == '_' || *source == '~';
+		size_t required = unreserved ? 1 : 3;
+		if (required >= dest_size - used) {
+			dest[0] = '\0';
+			return false;
+		}
+		if (unreserved) {
+			dest[used++] = (char)*source;
+		} else {
+			dest[used++] = '%';
+			dest[used++] = hex[*source >> 4];
+			dest[used++] = hex[*source & 15];
+		}
+	}
+	dest[used] = '\0';
+	return true;
+}
+
+static bool append_query_parameter(char* path, size_t path_size,
+	                               const char* tag, const char* value) {
+	if (!value || !value[0]) return true;
+	char encoded[512];
+	if (!dicomweb_encode_query_value(encoded, sizeof(encoded), value)) return false;
+	size_t used = strlen(path);
+	if (used >= path_size) return false;
+	i32 length = snprintf(path + used, path_size - used, "%c%s=%s",
+	                      strchr(path, '?') ? '&' : '?', tag, encoded);
+	return length > 0 && (size_t)length < path_size - used;
+}
+
+bool dicomweb_build_study_query_path(char* dest, size_t dest_size,
+	                                 const char* root,
+	                                 const dicomweb_study_search_t* search) {
+	if (!dest || !dest_size || !root) return false;
+	i32 length = snprintf(dest, dest_size, "%s/studies", root);
+	if (length <= 0 || (size_t)length >= dest_size) return false;
+	if (!search) return true;
+	char description_pattern[sizeof(search->description) + 3];
+	description_pattern[0] = '\0';
+	if (search->description[0]) {
+		length = snprintf(description_pattern, sizeof(description_pattern), "*%s*",
+		                  search->description);
+		if (length <= 0 || (size_t)length >= sizeof(description_pattern)) return false;
+	}
+	return append_query_parameter(dest, dest_size, "0020000D",
+	                              search->study_instance_uid) &&
+	       append_query_parameter(dest, dest_size, "00100020", search->patient_id) &&
+	       append_query_parameter(dest, dest_size, "00080050",
+	                              search->accession_number) &&
+	       append_query_parameter(dest, dest_size, "00080020", search->study_date) &&
+	       append_query_parameter(dest, dest_size, "00081030", description_pattern);
+}
+
 bool dicomweb_resolve_series_url(char* dest, size_t dest_size, const char* url) {
 	if (!dest || !dest_size || !url) return false;
 	static const char idc_viewer_prefix[] =

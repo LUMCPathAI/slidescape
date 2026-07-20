@@ -64,6 +64,14 @@ typedef struct dicomweb_study_ref_t {
 	char description[129];
 } dicomweb_study_ref_t;
 
+typedef struct dicomweb_study_search_t {
+	char study_instance_uid[65];
+	char patient_id[65];
+	char accession_number[65];
+	char study_date[18];
+	char description[129];
+} dicomweb_study_search_t;
+
 typedef struct dicomweb_series_ref_t {
 	char series_instance_uid[65];
 	char series_number[17];
@@ -117,6 +125,11 @@ bool dicomweb_build_frame_path(char* dest, size_t dest_size,
                                u32 one_based_frame_number);
 bool dicomweb_resolve_series_url(char* dest, size_t dest_size, const char* url);
 bool dicomweb_is_valid_uid(const char* value, size_t length);
+bool dicomweb_encode_query_value(char* dest, size_t dest_size,
+                                 const char* value);
+bool dicomweb_build_study_query_path(char* dest, size_t dest_size,
+                                     const char* root,
+                                     const dicomweb_study_search_t* search);
 
 #ifdef __cplusplus
 }

@@ -1,0 +1,53 @@
+name: slidescape-dcm4chee
+
+services:
+  ldap:
+    image: dcm4che/slapd-dcm4chee:2.6.13-35.0
+    platform: linux/amd64
+    environment:
+      ARCHIVE_HOST: arc
+      STORAGE_DIR: /storage/fs1
+    volumes:
+      - ldap-data:/var/lib/openldap/openldap-data
+      - ldap-config:/etc/openldap/slapd.d
+    restart: "no"
+
+  db:
+    image: dcm4che/postgres-dcm4chee:18.3-35
+    platform: linux/amd64
+    environment:
+      POSTGRES_DB: pacsdb
+      POSTGRES_USER: pacs
+      POSTGRES_PASSWORD: pacs
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    restart: "no"
+
+  arc:
+    image: dcm4che/dcm4chee-arc-psql:5.35.0
+    platform: linux/amd64
+    ports:
+      - "127.0.0.1:18080:8080"
+    environment:
+      WILDFLY_DEPLOY_UI: "false"
+      WILDFLY_PACSDS_USE_CCM: "false"
+      WILDFLY_WAIT_FOR: "ldap:389 db:5432"
+      POSTGRES_DB: pacsdb
+      POSTGRES_USER: pacs
+      POSTGRES_PASSWORD: pacs
+      WILDFLY_CHOWN: /storage
+    depends_on:
+      - ldap
+      - db
+    volumes:
+      - wildfly-data:/opt/wildfly/standalone
+      - archive-storage:/storage
+    restart: "no"
+
+volumes:
+  ldap-data:
+  ldap-config:
+  postgres-data:
+  wildfly-data:
+  archive-storage:
