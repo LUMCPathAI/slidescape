@@ -517,9 +517,9 @@ bool slide_score_open_remote_image(app_state_t* app_state, const char* server_ur
     image_t* image = (image_t*)calloc(1, sizeof(image_t));
     image->resource_id = global_next_resource_id++;
     bool is_valid = init_image_from_slide_score(image, &remote, false);
-    if (image->is_valid) {
-        platform_mutex_init(&image->lock);
-        image->lock_initialized = true;
+    if (image->is_valid && !image_initialize_runtime(image)) {
+        image->is_valid = false;
+        is_valid = false;
     }
     if (is_valid) {
         unload_all_images(app_state);
@@ -607,9 +607,9 @@ bool slide_score_open_qupath_metadata_url(app_state_t* app_state, const char* ur
         image_t* image = (image_t*)calloc(1, sizeof(image_t));
         image->resource_id = global_next_resource_id++;
         bool is_valid = init_image_from_slide_score(image, &remote, false);
-        if (image->is_valid) {
-            platform_mutex_init(&image->lock);
-            image->lock_initialized = true;
+        if (image->is_valid && !image_initialize_runtime(image)) {
+            image->is_valid = false;
+            is_valid = false;
         }
         if (is_valid) {
             unload_all_images(app_state);

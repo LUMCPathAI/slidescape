@@ -450,9 +450,8 @@ image_t* image_load_from_file(file_info_t* file, directory_info_t* directory, im
 		image_try_load_with_openslide(image, filename, options, is_overlay);
 	}
 
-	if (image->is_valid) {
-		platform_mutex_init(&image->lock);
-		image->lock_initialized = true;
+	if (image->is_valid && !image_initialize_runtime(image)) {
+		image->is_valid = false;
 	}
 
 	return image;

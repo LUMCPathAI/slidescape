@@ -54,7 +54,7 @@ renderer_texture_handle_t renderer_get_dummy_texture();
 renderer_texture_handle_t renderer_get_transparent_texture();
 renderer_texture_handle_t renderer_create_texture(void* pixels, i32 width, i32 height, renderer_pixel_format_t pixel_format);
 void renderer_destroy_texture(renderer_texture_handle_t texture);
-void renderer_destroy_image_resources(image_t* image);
+void renderer_destroy_image_resources(app_state_t* app_state, image_t* image);
 pixel_transfer_state_t* renderer_submit_texture_upload(app_state_t *app_state, i32 width, i32 height,
 														i32 bytes_per_pixel, u8 *pixels, bool finalize);
 void renderer_finalize_texture_upload(pixel_transfer_state_t* transfer_state);

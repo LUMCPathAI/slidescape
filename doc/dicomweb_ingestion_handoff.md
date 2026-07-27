@@ -212,9 +212,10 @@ hardening. The following findings should guide further work:
 - Dynamic browser storage and bounded HTTP parsing remove earlier prototype limits.
 - The provider-specific IDC URL translation is acceptably isolated; it must remain
   outside core QIDO/WADO behavior.
-- Tile-cache scheduling is newer than the old handoff described. Its principal open
-  issue is now thread-safe state/lifetime ownership, not reintroducing the standalone
-  streamer; see `doc/tile_streamer_handoff.md`.
+- Tile-cache scheduling, locking, result ownership, read leases, and shutdown
+  lifetimes are implemented. Accounting and eviction remain viewer performance work,
+  not a reason to reintroduce the standalone streamer; see
+  `doc/tile_streamer_handoff.md`.
 - Part 10 now uses the transactional SQLite/object-store boundary; virtual-shell
   representation publication must join that contract rather than rely on manifest
   renames.
@@ -229,24 +230,22 @@ decisions are made explicitly.
 
 Proceed in this order:
 
-1. Complete the shared tile-cache locking and lifetime contract, starting with
-   deterministic duplicate-suppression, generation, hard-demand, pin, stale-result,
-   and result-draining tests. Four-frame DICOMweb batching has been restored as a
-   small preceding performance regression fix; do not add more aggressive merging or
-   eviction before cache ownership is race-free.
-2. Close the pinned MRXS v2 semantic profile before making it durable: validate the
+The shared tile-cache locking/lifetime prerequisite and bounded four-frame DICOMweb
+batching are complete. Continue with:
+
+1. Close the pinned MRXS v2 semantic profile before making it durable: validate the
    admitted JPEG profile, photometric/subsampling agreement, lossy-compression and
    derivation metadata, ICC/color policy, missing-versus-corrupt tile handling, and
    sampled native/virtual/materialized parity.
-3. Exercise idempotent replay, conflicting SOP Instance UIDs, interrupted aggregate
+2. Exercise idempotent replay, conflicting SOP Instance UIDs, interrupted aggregate
    publication, and failing repair jobs. Reject unsupported published adapter
    versions at `check`/startup rather than exposing them through QIDO and failing
    later with a generic metadata conflict. Treat cross-process cloud repair as
    durable background work rather than a responsibility of public request handlers.
-4. Replace the MRXS development locator with transactional owned source-bundle
+3. Replace the MRXS development locator with transactional owned source-bundle
    ingestion and object-based native locators.
-5. Add STOW and source-bundle admission on top of the hardened publication contract.
-6. Broaden native profiles and the viewer's normalized WSI model only after color,
+4. Add STOW and source-bundle admission on top of the hardened publication contract.
+5. Broaden native profiles and the viewer's normalized WSI model only after color,
    associated-image, sparse tiling, concatenation, optical-path, focal-plane,
    overlap, specimen-governance, and scanner-variant policies are explicit.
 

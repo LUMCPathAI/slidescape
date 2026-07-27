@@ -1189,7 +1189,8 @@ static image_t* dicomweb_prepare_configured_series(
 	      compare_instance_width_descending);
 
 	image_t* image = (image_t*)calloc(1, sizeof(image_t));
-	if (!image || !init_image_from_dicomweb(image, &remote, false)) {
+	if (!image || !init_image_from_dicomweb(image, &remote, false) ||
+	    !image_initialize_runtime(image)) {
 		if (image) {
 			if (image->backend == IMAGE_BACKEND_DICOMWEB) image_destroy(image);
 			else dicomweb_remote_image_destroy(&remote);
@@ -1201,8 +1202,6 @@ static image_t* dicomweb_prepare_configured_series(
 		             message_size);
 		return NULL;
 	}
-	platform_mutex_init(&image->lock);
-	image->lock_initialized = true;
 	snprintf(message, message_size, "Opened DICOMweb series with %d pyramid instances.",
 	         remote.instance_count);
 	return image;

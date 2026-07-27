@@ -54,6 +54,8 @@ struct tile_cache_t {
 	image_t* image;
 	platform_mutex_t lock;
 	bool8 lock_initialized;
+	bool8 stopping;
+	i32 active_read_count;
 	completion_queue_t result_queue;
 	i32 viewer_generation;
 	bool8 viewer_state_initialized;
@@ -129,8 +131,12 @@ static bool tile_cache_has_hard_demand_locked(tile_cache_tile_t* tile) {
 	if (!tile) {
 		return false;
 	}
+	u32 hard_cpu_pin_count = tile->cpu_pin_count;
+	if (tile->upload_cpu_pinned && hard_cpu_pin_count > 0) {
+		--hard_cpu_pin_count;
+	}
 	return tile->read_region_pin_count > 0 || tile->export_pin_count > 0 ||
-	       tile->registration_pin_count > 0 || tile->cpu_pin_count > 0 ||
+	       tile->registration_pin_count > 0 || hard_cpu_pin_count > 0 ||
 	       tile->gpu_pin_count > 0;
 }
 
@@ -177,6 +183,22 @@ static u8* tile_cache_detach_unpinned_cpu_pixels_locked(tile_cache_tile_t* tile)
 	return pixels;
 }
 
+/* cache->lock must be held. */
+static u8* tile_cache_release_upload_cpu_pin_locked(tile_cache_tile_t* tile, bool release_pixels) {
+	if (!tile || !tile->upload_cpu_pinned) {
+		return NULL;
+	}
+	tile->upload_cpu_pinned = false;
+	if (tile->cpu_pin_count > 0) {
+		--tile->cpu_pin_count;
+	}
+	return release_pixels ? tile_cache_detach_unpinned_cpu_pixels_locked(tile) : NULL;
+}
+
+static bool tile_cache_accepts_work_locked(tile_cache_t* cache) {
+	return cache && (!cache->stopping || cache->active_read_count > 0);
+}
+
 tile_cache_t* tile_cache_create(image_t* image) {
 	if (!image) {
 		return NULL;
@@ -207,13 +229,62 @@ tile_cache_t* tile_cache_create(image_t* image) {
 }
 
 tile_cache_t* tile_cache_get_or_create(image_t* image) {
-	if (!image) {
+	if (!image || image->is_deleted) {
 		return NULL;
 	}
 	if (!image->tile_cache) {
 		image->tile_cache = tile_cache_create(image);
 	}
 	return image->tile_cache;
+}
+
+void tile_cache_begin_shutdown(image_t* image) {
+	tile_cache_t* cache = image ? image->tile_cache : NULL;
+	if (!cache) {
+		return;
+	}
+	platform_mutex_lock(&cache->lock);
+	cache->stopping = true;
+	platform_mutex_unlock(&cache->lock);
+}
+
+bool tile_cache_begin_read(image_t* image) {
+	tile_cache_t* cache = tile_cache_get_or_create(image);
+	if (!cache) {
+		return false;
+	}
+	platform_mutex_lock(&cache->lock);
+	if (cache->stopping) {
+		platform_mutex_unlock(&cache->lock);
+		return false;
+	}
+	++cache->active_read_count;
+	platform_mutex_unlock(&cache->lock);
+	return true;
+}
+
+void tile_cache_end_read(image_t* image) {
+	tile_cache_t* cache = image ? image->tile_cache : NULL;
+	if (!cache) {
+		return;
+	}
+	platform_mutex_lock(&cache->lock);
+	ASSERT(cache->active_read_count > 0);
+	if (cache->active_read_count > 0) {
+		--cache->active_read_count;
+	}
+	platform_mutex_unlock(&cache->lock);
+}
+
+i32 tile_cache_get_active_read_count(image_t* image) {
+	tile_cache_t* cache = image ? image->tile_cache : NULL;
+	if (!cache) {
+		return 0;
+	}
+	platform_mutex_lock(&cache->lock);
+	i32 result = cache->active_read_count;
+	platform_mutex_unlock(&cache->lock);
+	return result;
 }
 
 void tile_cache_destroy(tile_cache_t* cache) {
@@ -306,12 +377,119 @@ bool tile_cache_poll_load_result(image_t* image, tile_cache_result_t* out_task) 
 	return true;
 }
 
+bool tile_cache_apply_result(image_t* image, tile_cache_result_t* result,
+                             bool renderer_available, tile_cache_result_action_t* out_action) {
+	if (!out_action) {
+		return false;
+	}
+	*out_action = (tile_cache_result_action_t){0};
+	tile_cache_t* cache = image ? image->tile_cache : NULL;
+	if (!cache || !result) {
+		if (result) {
+			out_action->pixels_to_free = result->pixel_memory;
+		}
+		return false;
+	}
+
+	platform_mutex_lock(&cache->lock);
+	tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, result->level, result->tile_index);
+	if (!tile) {
+		out_action->pixels_to_free = result->pixel_memory;
+		platform_mutex_unlock(&cache->lock);
+		return false;
+	}
+
+	bool stale = result->stale;
+	if (!stale && tile->generation > 0 && !tile_cache_has_hard_demand_locked(tile)) {
+		stale = tile->generation != cache->viewer_generation;
+	}
+
+	if (result->upload_from_cached_pixels) {
+		if (stale || !renderer_available || !result->want_gpu_residency ||
+		    !tile->cpu_resident || !tile->pixels) {
+			tile->upload_pending = false;
+			/*
+			 * A non-renderer consumer retains cached pixels so the viewer can
+			 * reserve a new upload. Stale/invalid work releases viewer-only data.
+			 */
+			bool release_pixels = stale || !tile->cpu_resident || !tile->pixels;
+			out_action->pixels_to_free =
+					tile_cache_release_upload_cpu_pin_locked(tile, release_pixels);
+		} else {
+			out_action->upload_pixels = tile->pixels;
+			out_action->should_upload = true;
+			out_action->release_upload_cpu_pin = true;
+		}
+		platform_mutex_unlock(&cache->lock);
+		return true;
+	}
+
+	tile->decode_in_flight = false;
+	if (stale) {
+		if (!tile->cpu_resident && !tile->gpu_resident) {
+			tile->request_state = TILE_CACHE_UNREQUESTED;
+		}
+		out_action->pixels_to_free = result->pixel_memory;
+		platform_mutex_unlock(&cache->lock);
+		return true;
+	}
+
+	if (!result->pixel_memory) {
+		tile->request_state = result->failed ? TILE_CACHE_FAILED : TILE_CACHE_READY;
+		out_action->mark_empty = result->failed || result->is_empty;
+		platform_mutex_unlock(&cache->lock);
+		return true;
+	}
+
+	tile->request_state = TILE_CACHE_READY;
+	bool retain_cpu_pixels = tile->cpu_pin_count > 0 || (!renderer_available &&
+	                         (result->want_cpu_residency || result->want_gpu_residency));
+	bool cache_owns_result_pixels = false;
+	if (retain_cpu_pixels) {
+		if (!tile->pixels) {
+			tile->pixels = result->pixel_memory;
+			tile->cpu_resident = true;
+			tile->last_cpu_access_time = get_clock();
+			cache_owns_result_pixels = true;
+		} else if (tile->pixels == result->pixel_memory) {
+			cache_owns_result_pixels = true;
+		} else if (tile->pixels != result->pixel_memory) {
+			out_action->pixels_to_free = result->pixel_memory;
+		}
+	}
+
+	if (renderer_available && result->want_gpu_residency) {
+		tile->upload_pending = true;
+		out_action->upload_pixels = result->pixel_memory;
+		out_action->should_upload = true;
+		out_action->free_upload_pixels = !cache_owns_result_pixels;
+		if (cache_owns_result_pixels) {
+			ASSERT(!tile->upload_cpu_pinned);
+			tile->upload_cpu_pinned = true;
+			++tile->cpu_pin_count;
+			out_action->release_upload_cpu_pin = true;
+		}
+		if (out_action->pixels_to_free == result->pixel_memory) {
+			out_action->pixels_to_free = NULL;
+		}
+	} else if (!retain_cpu_pixels) {
+		out_action->pixels_to_free = result->pixel_memory;
+	}
+
+	platform_mutex_unlock(&cache->lock);
+	return true;
+}
+
 void tile_cache_pin_cpu_tile(image_t* image, i32 level, i32 tile_index, u32 demand_flags) {
 	tile_cache_t* cache = tile_cache_get_or_create(image);
 	if (!cache) {
 		return;
 	}
 	platform_mutex_lock(&cache->lock);
+	if (!tile_cache_accepts_work_locked(cache)) {
+		platform_mutex_unlock(&cache->lock);
+		return;
+	}
 	tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, level, tile_index);
 	if (!tile) {
 		platform_mutex_unlock(&cache->lock);
@@ -389,7 +567,9 @@ bool tile_cache_try_begin_decode(image_t* image, i32 level, i32 tile_index, u32 
 	}
 	platform_mutex_lock(&cache->lock);
 	tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, level, tile_index);
-	if (!tile || tile->decode_in_flight || tile->upload_pending) {
+	if (!tile_cache_accepts_work_locked(cache) || !tile ||
+	    tile->decode_in_flight || tile->upload_pending ||
+	    tile->cpu_resident || tile->gpu_resident) {
 		platform_mutex_unlock(&cache->lock);
 		return false;
 	}
@@ -409,7 +589,9 @@ bool tile_cache_try_begin_upload(image_t* image, i32 level, i32 tile_index, u32 
 	}
 	platform_mutex_lock(&cache->lock);
 	tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, level, tile_index);
-	if (!tile || tile->decode_in_flight || tile->upload_pending || !tile->cpu_resident || !tile->pixels) {
+	if (!tile_cache_accepts_work_locked(cache) || !tile ||
+	    tile->decode_in_flight || tile->upload_pending ||
+	    !tile->cpu_resident || !tile->pixels) {
 		platform_mutex_unlock(&cache->lock);
 		return false;
 	}
@@ -454,13 +636,7 @@ void tile_cache_cancel_upload(image_t* image, i32 level, i32 tile_index) {
 		return;
 	}
 	tile->upload_pending = false;
-	if (tile->upload_cpu_pinned) {
-		tile->upload_cpu_pinned = false;
-		if (tile->cpu_pin_count > 0) {
-			--tile->cpu_pin_count;
-		}
-		pixels_to_free = tile_cache_detach_unpinned_cpu_pixels_locked(tile);
-	}
+	pixels_to_free = tile_cache_release_upload_cpu_pin_locked(tile, true);
 	platform_mutex_unlock(&cache->lock);
 	free(pixels_to_free);
 }
@@ -472,65 +648,9 @@ void tile_cache_release_upload_cpu_pin(image_t* image, i32 level, i32 tile_index
 	}
 	platform_mutex_lock(&cache->lock);
 	tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, level, tile_index);
-	u8* pixels_to_free = NULL;
-	if (tile && tile->upload_cpu_pinned) {
-		tile->upload_cpu_pinned = false;
-		if (tile->cpu_pin_count > 0) {
-			--tile->cpu_pin_count;
-		}
-		pixels_to_free = tile_cache_detach_unpinned_cpu_pixels_locked(tile);
-	}
+	u8* pixels_to_free = tile_cache_release_upload_cpu_pin_locked(tile, true);
 	platform_mutex_unlock(&cache->lock);
 	free(pixels_to_free);
-}
-
-void tile_cache_mark_decode_finished(image_t* image, i32 level, i32 tile_index, bool failed) {
-	tile_cache_t* cache = image ? image->tile_cache : NULL;
-	if (!cache) {
-		return;
-	}
-	platform_mutex_lock(&cache->lock);
-	tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, level, tile_index);
-	if (!tile) {
-		platform_mutex_unlock(&cache->lock);
-		return;
-	}
-	tile->decode_in_flight = false;
-	tile->request_state = failed ? TILE_CACHE_FAILED : TILE_CACHE_READY;
-	platform_mutex_unlock(&cache->lock);
-}
-
-void tile_cache_mark_upload_pending(image_t* image, i32 level, i32 tile_index) {
-	tile_cache_t* cache = image ? image->tile_cache : NULL;
-	if (!cache) {
-		return;
-	}
-	platform_mutex_lock(&cache->lock);
-	tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, level, tile_index);
-	if (!tile) {
-		platform_mutex_unlock(&cache->lock);
-		return;
-	}
-	tile->upload_pending = true;
-	tile->demand_mask |= TILE_CACHE_DEMAND_GPU_RESIDENCY;
-	platform_mutex_unlock(&cache->lock);
-}
-
-void tile_cache_mark_upload_finished(image_t* image, i32 level, i32 tile_index) {
-	tile_cache_t* cache = image ? image->tile_cache : NULL;
-	if (!cache) {
-		return;
-	}
-	platform_mutex_lock(&cache->lock);
-	tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, level, tile_index);
-	if (!tile) {
-		platform_mutex_unlock(&cache->lock);
-		return;
-	}
-	tile->upload_pending = false;
-	tile->gpu_resident = true;
-	tile->last_gpu_access_time = get_clock();
-	platform_mutex_unlock(&cache->lock);
 }
 
 renderer_texture_handle_t tile_cache_get_gpu_texture(image_t* image, i32 level, i32 tile_index) {
@@ -721,6 +841,10 @@ i32 tile_cache_request_viewer_tiles(image_t* image, tile_cache_viewer_request_t*
 		return 0;
 	}
 	platform_mutex_lock(&cache->lock);
+	if (!tile_cache_accepts_work_locked(cache)) {
+		platform_mutex_unlock(&cache->lock);
+		return 0;
+	}
 	tile_cache_update_viewer_generation(cache, request);
 
 	i32 inflight_room = cache->policy.max_inflight_tiles - tile_cache_count_inflight_viewer_tiles_locked(image);

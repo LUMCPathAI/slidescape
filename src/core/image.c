@@ -1189,7 +1189,8 @@ void do_invert_colors(u8* pixels, i32 w, i32 h, enum pixel_format_enum pixel_for
 	}
 }
 
-bool image_read_region(image_t* image, i32 level, i32 x, i32 y, i32 w, i32 h, void* dest, pixel_format_enum desired_pixel_format) {
+static bool image_read_region_impl(image_t* image, i32 level, i32 x, i32 y, i32 w, i32 h,
+                                   void* dest, pixel_format_enum desired_pixel_format) {
     ASSERT(dest != NULL);
 
 	// TODO: make inverting colors configurable
@@ -1337,24 +1338,14 @@ bool image_read_region(image_t* image, i32 level, i32 x, i32 y, i32 w, i32 h, vo
 					if (tile_cache_poll_load_result(image, &cache_result)) {
 						platform_mutex_lock(&image->lock);
 						++tile_loads_completed;
-						tile_cache_result_t* task = &cache_result;
-						if (task->stale) {
-							tile_cache_cancel_decode(image, task->level, task->tile_index);
-						} else if (task->pixel_memory) {
-							tile_t* tile = get_tile_from_tile_index(image, task->level, task->tile_index);
-							tile_cache_mark_decode_finished(image, task->level, task->tile_index, false);
-							if (task->want_cpu_residency || task->want_gpu_residency ||
-							    tile_cache_tile_is_cpu_pinned(image, task->level, task->tile_index)) {
-								tile_cache_store_cpu_pixels(image, task->level, task->tile_index, task->pixel_memory);
-							} else {
-								free(task->pixel_memory);
-							}
-						} else if (task->failed || task->is_empty) {
-							tile_t* tile = get_tile_from_tile_index(image, task->level, task->tile_index);
-							tile_cache_mark_decode_finished(image, task->level, task->tile_index, task->failed);
+						tile_cache_result_action_t action = {0};
+						tile_cache_apply_result(image, &cache_result, false, &action);
+						if (action.mark_empty) {
+							tile_t* tile = get_tile_from_tile_index(image, cache_result.level, cache_result.tile_index);
 							tile->is_empty = true;
 						}
 						platform_mutex_unlock(&image->lock);
+						free(action.pixels_to_free);
 					} else {
 						bool all_tiles_ready = true;
 						i32 retry_tiles_to_load = 0;
@@ -1578,6 +1569,16 @@ bool image_read_region(image_t* image, i32 level, i32 x, i32 y, i32 w, i32 h, vo
     return success;
 }
 
+bool image_read_region(image_t* image, i32 level, i32 x, i32 y, i32 w, i32 h,
+                       void* dest, pixel_format_enum desired_pixel_format) {
+	if (!tile_cache_begin_read(image)) {
+		return false;
+	}
+	bool result = image_read_region_impl(image, level, x, y, w, h, dest, desired_pixel_format);
+	tile_cache_end_read(image);
+	return result;
+}
+
 void do_level_image_indexing(image_t* image, level_image_t* level_image, i32 scale) {
     if (image->backend == IMAGE_BACKEND_DICOM) {
         if (dicom_wsi_index_level(&image->dicom, level_image->pyramid_image_index)) {
@@ -1614,6 +1615,29 @@ void begin_level_image_indexing(image_t* image, level_image_t* level_image, i32 
 	};
 }
 
+bool image_initialize_runtime(image_t* image) {
+	if (!image || !image->is_valid) {
+		return false;
+	}
+	bool initialized_lock = false;
+	if (!image->lock_initialized) {
+		platform_mutex_init(&image->lock);
+		image->lock_initialized = true;
+		initialized_lock = true;
+	}
+	if (!image->tile_cache) {
+		image->tile_cache = tile_cache_create(image);
+		if (!image->tile_cache) {
+			if (initialized_lock) {
+				platform_mutex_destroy(&image->lock);
+				image->lock_initialized = false;
+			}
+			return false;
+		}
+	}
+	return true;
+}
+
 static bool check_image_texture_destroyed(renderer_texture_handle_t texture) {
     if (texture == 0) {
         return true;
@@ -1625,6 +1649,17 @@ static bool check_image_texture_destroyed(renderer_texture_handle_t texture) {
 }
 
 void image_destroy(image_t* image) {
+	if (!image) {
+		return;
+	}
+	tile_cache_begin_shutdown(image);
+	while (tile_cache_get_active_read_count(image) > 0) {
+		if (thread_pool_is_work_waiting_to_start(&global_thread_pool)) {
+			thread_pool_do_work(&global_thread_pool);
+		} else {
+			platform_sleep(1);
+		}
+	}
     image->is_deleted = true;
     while (image->refcount > 0) {
 //		console_print_error("refcount = %d\n", image->refcount);

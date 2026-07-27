@@ -100,8 +100,25 @@ void add_image(app_state_t* app_state, image_t* image, bool need_zoom_reset, boo
     copy_cstring(app_state->last_active_directory, image->directory, COUNT(app_state->last_active_directory));
 }
 
-void renderer_destroy_image_resources(image_t* image) {
+void renderer_destroy_image_resources(app_state_t* app_state, image_t* image) {
 	if (!image) return;
+
+	tile_cache_begin_shutdown(image);
+	if (app_state) {
+		for (i32 i = 0; i < COUNT(app_state->pixel_transfer_states); ++i) {
+			pixel_transfer_state_t* transfer_state = app_state->pixel_transfer_states + i;
+			if (transfer_state->image != image) {
+				continue;
+			}
+			renderer_finalize_texture_upload(transfer_state);
+			if (transfer_state->texture) {
+				renderer_destroy_texture(transfer_state->texture);
+				transfer_state->texture = 0;
+			}
+			tile_cache_cancel_upload(image, transfer_state->level, transfer_state->tile_index);
+			transfer_state->image = NULL;
+		}
+	}
 
 	if (image->backend == IMAGE_BACKEND_STBI) {
 		renderer_texture_handle_t simple_destroyed_texture_handle = 0;
@@ -151,7 +168,7 @@ void unload_all_images(app_state_t *app_state) {
 		ASSERT(app_state->loaded_images);
 		for (i32 i = 0; i < current_image_count; ++i) {
 			image_t* old_image = app_state->loaded_images[i];
-			renderer_destroy_image_resources(old_image);
+			renderer_destroy_image_resources(app_state, old_image);
 			image_destroy(old_image);
             free(old_image);
 		}
@@ -284,56 +301,46 @@ static bool viewer_process_loaded_tile(app_state_t* app_state, image_t* image, t
 		return false;
 	}
 
-	tile_t* tile = get_tile_from_tile_index(image, task->level, task->tile_index);
-	ASSERT(tile);
-	if (task->stale) {
-		tile_cache_cancel_decode(image, task->level, task->tile_index);
+	/*
+	 * Generic backends create the cache before submitting work. iSyntax still
+	 * uses its legacy streamer/global completion queue, so its first viewer
+	 * completion is the boundary where it joins cache-backed texture storage.
+	 */
+	if (!tile_cache_get_or_create(image)) {
+		free(task->pixel_memory);
 		return false;
 	}
-	if (!task->upload_from_cached_pixels) {
-		tile_cache_mark_decode_finished(image, task->level, task->tile_index, task->failed);
+
+	tile_cache_result_action_t action = {};
+	tile_cache_apply_result(image, task, true, &action);
+	if (action.mark_empty) {
+		platform_mutex_lock(&image->lock);
+		tile_t* tile = get_tile_from_tile_index(image, task->level, task->tile_index);
+		ASSERT(tile);
+		tile->is_empty = true;
+		platform_mutex_unlock(&image->lock);
 	}
 
-	u8* upload_pixels = task->pixel_memory;
-	if (task->upload_from_cached_pixels) {
-		upload_pixels = tile_cache_get_cpu_pixels(image, task->level, task->tile_index);
-		if (!upload_pixels) {
-			tile_cache_cancel_upload(image, task->level, task->tile_index);
-			return false;
+	if (action.should_upload && action.upload_pixels) {
+		pixel_transfer_state_t* transfer_state =
+				renderer_submit_texture_upload(app_state, task->tile_width, task->tile_height,
+				                               4, action.upload_pixels, finalize_textures_immediately);
+		submitted_texture_upload = true;
+		if (finalize_textures_immediately) {
+			tile_cache_store_gpu_texture(image, task->level, task->tile_index, transfer_state->texture);
+		} else {
+			transfer_state->image = image;
+			transfer_state->level = task->level;
+			transfer_state->tile_index = task->tile_index;
 		}
-	}
-
-	if (upload_pixels) {
-		bool need_free_pixel_memory = true;
-		if (task->want_gpu_residency) {
-			pixel_transfer_state_t* transfer_state =
-					renderer_submit_texture_upload(app_state, task->tile_width, task->tile_height,
-					                               4, upload_pixels, finalize_textures_immediately);
-			submitted_texture_upload = true;
-			if (finalize_textures_immediately) {
-				tile_cache_store_gpu_texture(image, task->level, task->tile_index, transfer_state->texture);
-				tile_cache_mark_upload_finished(image, task->level, task->tile_index);
-			} else {
-				transfer_state->image = image;
-				transfer_state->level = task->level;
-				transfer_state->tile_index = task->tile_index;
-				tile_cache_mark_upload_pending(image, task->level, task->tile_index);
-			}
-		}
-		if (task->upload_from_cached_pixels) {
-			need_free_pixel_memory = false;
+		if (action.release_upload_cpu_pin) {
 			tile_cache_release_upload_cpu_pin(image, task->level, task->tile_index);
-		} else if (task->want_cpu_residency || tile_cache_tile_is_cpu_pinned(image, task->level, task->tile_index)) {
-			need_free_pixel_memory = false;
-			tile_cache_store_cpu_pixels(image, task->level, task->tile_index, task->pixel_memory);
 		}
-		if (need_free_pixel_memory) {
-			free(task->pixel_memory);
+		if (action.free_upload_pixels) {
+			free(action.upload_pixels);
 		}
-	} else {
-		// TODO: handle possible I/O errors? Don't just assume the tile was empty!
-		tile->is_empty = true; // failed; don't resubmit!
 	}
+	free(action.pixels_to_free);
 	return submitted_texture_upload;
 }
 
@@ -349,7 +356,6 @@ void viewer_process_completion_queue(app_state_t* app_state) {
 				renderer_finalize_texture_upload(transfer_state);
 				if (transfer_state->image) {
 					tile_cache_store_gpu_texture(transfer_state->image, transfer_state->level, transfer_state->tile_index, transfer_state->texture);
-					tile_cache_mark_upload_finished(transfer_state->image, transfer_state->level, transfer_state->tile_index);
 					transfer_state->image = NULL;
 				}
 			}

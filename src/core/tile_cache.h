@@ -79,14 +79,29 @@ typedef struct tile_cache_result_t {
 	bool8 upload_from_cached_pixels;
 } tile_cache_result_t;
 
+typedef struct tile_cache_result_action_t {
+	u8* upload_pixels;
+	u8* pixels_to_free;
+	bool8 should_upload;
+	bool8 free_upload_pixels;
+	bool8 release_upload_cpu_pin;
+	bool8 mark_empty;
+} tile_cache_result_action_t;
+
 tile_cache_t* tile_cache_create(image_t* image);
 /* The caller must serialize first creation; worker/result paths never create a cache. */
 tile_cache_t* tile_cache_get_or_create(image_t* image);
+void tile_cache_begin_shutdown(image_t* image);
+bool tile_cache_begin_read(image_t* image);
+void tile_cache_end_read(image_t* image);
+i32 tile_cache_get_active_read_count(image_t* image);
 void tile_cache_destroy(tile_cache_t* cache);
 tile_cache_policy_t tile_cache_get_policy(image_t* image);
 bool tile_cache_post_load_result(image_t* image, tile_cache_result_t* task);
 bool tile_cache_post_stale_result(image_t* image, i32 resource_id, i32 level, i32 tile_index);
 bool tile_cache_poll_load_result(image_t* image, tile_cache_result_t* out_task);
+bool tile_cache_apply_result(image_t* image, tile_cache_result_t* result,
+                             bool renderer_available, tile_cache_result_action_t* out_action);
 void tile_cache_pin_cpu_tile(image_t* image, i32 level, i32 tile_index, u32 demand_flags);
 void tile_cache_unpin_cpu_tile(image_t* image, i32 level, i32 tile_index, u32 demand_flags);
 bool tile_cache_tile_has_cpu_pixels(image_t* image, i32 level, i32 tile_index);
@@ -97,9 +112,6 @@ bool tile_cache_try_begin_upload(image_t* image, i32 level, i32 tile_index, u32 
 void tile_cache_cancel_decode(image_t* image, i32 level, i32 tile_index);
 void tile_cache_cancel_upload(image_t* image, i32 level, i32 tile_index);
 void tile_cache_release_upload_cpu_pin(image_t* image, i32 level, i32 tile_index);
-void tile_cache_mark_decode_finished(image_t* image, i32 level, i32 tile_index, bool failed);
-void tile_cache_mark_upload_pending(image_t* image, i32 level, i32 tile_index);
-void tile_cache_mark_upload_finished(image_t* image, i32 level, i32 tile_index);
 renderer_texture_handle_t tile_cache_get_gpu_texture(image_t* image, i32 level, i32 tile_index);
 void tile_cache_store_gpu_texture(image_t* image, i32 level, i32 tile_index, renderer_texture_handle_t texture);
 renderer_texture_handle_t tile_cache_take_gpu_texture(image_t* image, i32 level, i32 tile_index);

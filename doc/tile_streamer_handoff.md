@@ -2,8 +2,8 @@
 
 Status: generation-aware viewer scheduling is integrated into the shared tile cache;
 DICOMweb submits bounded four-tile batches, cache state transitions and result
-polling are locked, while atomic completion application, shutdown, integration tests,
-and eviction remain unfinished.
+application and lifetimes are locked, while accounting and eviction remain
+unfinished.
 Last reviewed: 2026-07-26
 
 ## Current Design
@@ -28,7 +28,9 @@ already been restored in the cache-owned model:
 
 Do not restore the removed standalone generic tile streamer. iSyntax still has its
 own streamer and global completion path; that is an explicit exception, not the
-model for other backends.
+model for other backends. Its viewer-completion bridge still stores GPU texture
+handles in the per-image cache used by rendering, so that bridge must create the
+cache before applying the first legacy iSyntax completion.
 
 DICOMweb batching is intentionally different from delayed request coalescing. The
 cache submits up to four tiles already selected in one scheduler tick, and the worker
@@ -45,6 +47,13 @@ producers but only one consumer cursor. Hard-demand pin types have independent
 reference counts, and cached CPU pixels receive an upload pin from reservation until
 the renderer has consumed them.
 
+Viewer and read-region consumers apply a result through one cache transition. That
+transition rechecks generation/hard demand, releases the decode reservation, adopts
+or rejects CPU ownership, and reserves renderer upload before unlocking. Slow
+renderer/free work is returned as an explicit action. If a read-region consumer takes
+a cached-upload event from the shared queue, it releases that reservation without
+wedging the tile and retains the CPU copy for a later viewer upload.
+
 The contract is:
 
 - cache state transitions and ownership changes occur under `cache->lock`;
@@ -54,36 +63,32 @@ The contract is:
 - renderer texture destruction remains on the renderer-owning thread;
 - cache destruction first prevents new work and drains/joins outstanding work.
 
-The principal remaining correctness gap is completion application. Viewer and
-read-region consumers still perform "mark decode finished", CPU adoption, and GPU
-upload transition as separate cache calls. Those must become one locked cache
-transition that returns slow follow-up work to perform after unlocking. Cache creation
-also remains lazy, and destruction does not yet mark the cache stopping before
-draining workers, consumers, and deferred renderer uploads.
+Normal image-loading paths create their cache after level metadata and the image lock
+are initialized. `image_read_region()` holds an active-read lease. Shutdown marks the
+cache stopping, rejects new viewer/read reservations, lets existing read leases
+finish, stops queued workers through the image deletion flag, drains worker references
+and queued results, and only then frees cache storage. Deferred GPU transfers for the
+image are finalized and destroyed on the renderer-owning thread before cache teardown.
 
 ## Remaining Work
 
 In priority order:
 
-1. Add the first integration regression: `image_read_region()` joins a tile already
-   requested by the viewer.
-2. Replace split completion handling with one atomic cache transition. Add the
-   generation-change/decode-completion/read-pin concurrency regression.
-3. Make cache creation eager, add a stopping state, prevent new reservations, and
-   drain workers, result consumers, and renderer-owned uploads before destruction.
-4. Simplify `load_tile_task_t`; it still carries compatibility fields that overlap
+1. Simplify `load_tile_task_t`; it still carries compatibility fields that overlap
    cache state.
-5. Add CPU/GPU byte accounting and configurable budgets.
-6. Add conservative LRU eviction. Never evict pinned or in-flight resources, and
+2. Add CPU/GPU byte accounting and configurable budgets.
+3. Add conservative LRU eviction. Never evict pinned or in-flight resources, and
    destroy GPU resources on the renderer thread.
-7. Add view/generation/backend-aware eviction scoring only after the simple policy is
+4. Add view/generation/backend-aware eviction scoring only after the simple policy is
    measured.
-8. Decide separately whether adapting iSyntax to the shared scheduler is worthwhile.
+5. Decide separately whether adapting iSyntax to the shared scheduler is worthwhile.
 
 Deterministic tests now cover sequential and competing duplicate suppression,
 generation staleness versus hard demand, overlapping hard-demand pin types, nested
-CPU pins, cached-upload pinning, ordered result draining, and exact-once concurrent
-result consumption.
+CPU pins, atomic result adoption/upload reservation, cached-upload pinning and
+cross-consumer handling, generation-completion/read-pin races, ordered result
+draining, exact-once concurrent result consumption, viewer-in-flight/read-region
+joining, and shutdown admission/read-draining behavior.
 
 ## Target Invariants
 

@@ -373,22 +373,21 @@ Part 10 shell/provider path remains unchanged, and a linked source is rehashed o
 first cache admission. This is explicitly external ownership, not durable archive
 storage.
 
-The next implementation slices are:
+The viewer tile-cache locking/lifetime prerequisite and bounded four-frame DICOMweb
+batching are complete. The next implementation slices are:
 
-1. Finish the viewer tile-cache locking/lifetime contract after restoring bounded
-   four-frame DICOMweb batching.
-2. Close the MRXS v2 DICOM-semantic profile: JPEG admission validation,
+1. Close the MRXS v2 DICOM-semantic profile: JPEG admission validation,
    photometric/subsampling agreement, lossy and derivation metadata, ICC/color
    policy, absent-versus-corrupt tile behavior, and pixel/geometry parity tests.
-3. Exercise idempotent replay, conflicting UIDs, interrupted aggregate publication,
+2. Exercise idempotent replay, conflicting UIDs, interrupted aggregate publication,
    failing repair jobs, and fail-fast adapter-version validation. Keep request-local
    coalescing bounded; implement cross-process cloud repair through durable jobs and
    telemetry.
-4. Import native source bundles into durable object ownership and replace filesystem
+3. Import native source bundles into durable object ownership and replace filesystem
    paths in provider recipes with logical object locators.
-5. Add STOW and source-bundle admission only after publication failure semantics are
+4. Add STOW and source-bundle admission only after publication failure semantics are
    established.
-6. Expand pinned native profiles and the normalized viewer WSI model after associated
+5. Expand pinned native profiles and the normalized viewer WSI model after associated
    images, sparse tiling, concatenations, optical paths/focal planes, overlap
    reconstruction, scanner variants, specimen governance, and color policy have
    acceptance tests.
