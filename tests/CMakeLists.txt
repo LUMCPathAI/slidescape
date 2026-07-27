@@ -11,6 +11,7 @@ add_executable(slidescape_tests
         test_slide_score.cpp
         test_support.cpp
         test_stringutils.cpp
+        test_tile_cache.cpp
         test_work_queue.cpp
         ../src/core/slide_score.c
 )
