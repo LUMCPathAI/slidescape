@@ -322,9 +322,7 @@ static bool viewer_process_loaded_tile(app_state_t* app_state, image_t* image, t
 		}
 		if (task->upload_from_cached_pixels) {
 			need_free_pixel_memory = false;
-			if (!task->want_cpu_residency) {
-				tile_cache_release_cpu_pixels_if_unpinned(image, task->level, task->tile_index);
-			}
+			tile_cache_release_upload_cpu_pin(image, task->level, task->tile_index);
 		} else if (task->want_cpu_residency || tile_cache_tile_is_cpu_pinned(image, task->level, task->tile_index)) {
 			need_free_pixel_memory = false;
 			tile_cache_store_cpu_pixels(image, task->level, task->tile_index, task->pixel_memory);
@@ -522,6 +520,7 @@ void update_and_render_image(app_state_t* app_state, image_t* image) {
 				level_image_t* level_image = image->level_images + 0;
 				ASSERT(level_image->tiles && level_image->tile_count > 0);
 				tile_t* tile = level_image->tiles + 0;
+				tile_cache_get_or_create(image); // TODO(pvalkema): why? we don't really need a full tile-cache for the STBI backend (which has no tiles), do we?
 				tile_cache_store_gpu_texture(image, 0, 0, image->simple.texture);
 			}
 

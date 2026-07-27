@@ -89,8 +89,9 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 			++intermittent;
 			if (intermittent % intermittent_interval == 0) {
 				i32 policy_batch_size = TILE_LOAD_BATCH_MAX;
-				if (image->tile_cache && image->tile_cache->policy.batch_size > 0) {
-					policy_batch_size = image->tile_cache->policy.batch_size;
+				tile_cache_policy_t policy = tile_cache_get_policy(image);
+				if (policy.batch_size > 0) {
+					policy_batch_size = policy.batch_size;
 				}
 				policy_batch_size = CLAMP(policy_batch_size, 1, TILE_LOAD_BATCH_MAX);
 				for (i32 first_tile = 0; first_tile < tiles_to_load; first_tile += policy_batch_size) {

@@ -36,10 +36,10 @@ TEST_CASE("DICOMweb tile-cache policy enables bounded multi-frame batches") {
 	image.backend = IMAGE_BACKEND_DICOMWEB;
 	image.tile_cache = tile_cache_create(&image);
 	REQUIRE(image.tile_cache != nullptr);
-	CHECK(image.tile_cache->policy.batch_size == DICOMWEB_FRAME_BATCH_MAX);
-	CHECK(image.tile_cache->policy.batch_size <= TILE_LOAD_BATCH_MAX);
-	CHECK(image.tile_cache->policy.max_submit_per_tick >=
-	      image.tile_cache->policy.batch_size);
+	tile_cache_policy_t policy = tile_cache_get_policy(&image);
+	CHECK(policy.batch_size == DICOMWEB_FRAME_BATCH_MAX);
+	CHECK(policy.batch_size <= TILE_LOAD_BATCH_MAX);
+	CHECK(policy.max_submit_per_tick >= policy.batch_size);
 	tile_cache_destroy(image.tile_cache);
 	image.tile_cache = nullptr;
 }

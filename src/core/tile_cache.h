@@ -79,44 +79,11 @@ typedef struct tile_cache_result_t {
 	bool8 upload_from_cached_pixels;
 } tile_cache_result_t;
 
-typedef struct tile_cache_tile_t {
-	u8 request_state;
-	u32 demand_mask;
-	u32 cpu_pin_count;
-	u32 gpu_pin_count;
-	bool8 cpu_resident;
-	bool8 gpu_resident;
-	bool8 decode_in_flight;
-	bool8 upload_pending;
-	bool8 is_empty;
-	u8* pixels;
-	renderer_texture_handle_t texture;
-	i32 generation;
-	i32 priority;
-	i64 last_cpu_access_time;
-	i64 last_gpu_access_time;
-} tile_cache_tile_t;
-
-typedef struct tile_cache_t {
-	image_t* image;
-	platform_mutex_t lock;
-	bool8 lock_initialized;
-	completion_queue_t result_queue;
-	i32 viewer_generation;
-	bool8 viewer_state_initialized;
-	bounds2f last_camera_bounds;
-	bounds2f last_crop_bounds;
-	v2f last_camera_center;
-	i32 last_zoom_level;
-	bool8 last_is_cropped;
-	tile_cache_policy_t policy;
-	tile_cache_tile_t* level_tiles[IMAGE_PYRAMID_MAX_LEVELS];
-} tile_cache_t;
-
 tile_cache_t* tile_cache_create(image_t* image);
+/* The caller must serialize first creation; worker/result paths never create a cache. */
 tile_cache_t* tile_cache_get_or_create(image_t* image);
 void tile_cache_destroy(tile_cache_t* cache);
-tile_cache_tile_t* tile_cache_get_tile_state(image_t* image, i32 level, i32 tile_index);
+tile_cache_policy_t tile_cache_get_policy(image_t* image);
 bool tile_cache_post_load_result(image_t* image, tile_cache_result_t* task);
 bool tile_cache_post_stale_result(image_t* image, i32 resource_id, i32 level, i32 tile_index);
 bool tile_cache_poll_load_result(image_t* image, tile_cache_result_t* out_task);
@@ -129,12 +96,14 @@ bool tile_cache_try_begin_decode(image_t* image, i32 level, i32 tile_index, u32 
 bool tile_cache_try_begin_upload(image_t* image, i32 level, i32 tile_index, u32 demand_flags, i32 priority, i32 generation);
 void tile_cache_cancel_decode(image_t* image, i32 level, i32 tile_index);
 void tile_cache_cancel_upload(image_t* image, i32 level, i32 tile_index);
+void tile_cache_release_upload_cpu_pin(image_t* image, i32 level, i32 tile_index);
 void tile_cache_mark_decode_finished(image_t* image, i32 level, i32 tile_index, bool failed);
 void tile_cache_mark_upload_pending(image_t* image, i32 level, i32 tile_index);
 void tile_cache_mark_upload_finished(image_t* image, i32 level, i32 tile_index);
 renderer_texture_handle_t tile_cache_get_gpu_texture(image_t* image, i32 level, i32 tile_index);
 void tile_cache_store_gpu_texture(image_t* image, i32 level, i32 tile_index, renderer_texture_handle_t texture);
 renderer_texture_handle_t tile_cache_take_gpu_texture(image_t* image, i32 level, i32 tile_index);
+/* The returned pointer is valid only while the caller's CPU pin remains held. */
 u8* tile_cache_get_cpu_pixels(image_t* image, i32 level, i32 tile_index);
 void tile_cache_store_cpu_pixels(image_t* image, i32 level, i32 tile_index, u8* pixels);
 void tile_cache_release_cpu_pixels_if_unpinned(image_t* image, i32 level, i32 tile_index);
