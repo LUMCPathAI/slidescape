@@ -291,8 +291,20 @@ tls_connection_t* open_remote_connection(const char* hostname, i32 portno, void*
 		goto exit;
 	}
 
+	/*
+	 * The vendored Mbed TLS 2.26 net_recv_timeout() uses net_poll(), whose
+	 * POSIX fd < FD_SETSIZE check is invalid for opaque Winsock SOCKET values
+	 * and can fail a valid connection with MBEDTLS_ERR_NET_POLL_FAILED.
+	 * Restore the blocking receive callback used before handshake timeouts
+	 * were added; requests switch the socket to nonblocking mode below.
+	 */
+#if WINDOWS
+	mbedtls_ssl_set_bio( &connection->ssl, &connection->server_fd, mbedtls_net_send,
+	                     mbedtls_net_recv, NULL );
+#else
 	mbedtls_ssl_set_bio( &connection->ssl, &connection->server_fd, mbedtls_net_send,
 	                     mbedtls_net_recv, mbedtls_net_recv_timeout );
+#endif
 
 	/*
 	 * 4. Handshake
