@@ -140,7 +140,7 @@ typedef struct dicomweb_async_task_t {
 
 static image_t* dicomweb_prepare_configured_series(
 	dicomweb_remote_image_t remote, const remote_request_options_t* request_options,
-	char* message, size_t message_size);
+	i32* http_status, char* message, size_t message_size);
 
 static size_t dicomweb_async_item_size(dicomweb_async_query_kind_t kind) {
 	switch (kind) {
@@ -539,7 +539,8 @@ static void dicomweb_async_task_func(i32 logical_thread_index, void* userdata) {
 		copy_cstring(remote.series_instance_uid, task->series_uid,
 		             sizeof(remote.series_instance_uid));
 		result->image = dicomweb_prepare_configured_series(
-			remote, &request_options, result->message, sizeof(result->message));
+			remote, &request_options, &result->http_status,
+			result->message, sizeof(result->message));
 		if (task->generation != task->context->generation) {
 			result->cancelled = true;
 			copy_cstring(result->message, "Open cancelled.", sizeof(result->message));
@@ -1007,9 +1008,10 @@ static bool dicomweb_query_instance_refs_all(
 	const dicomweb_remote_image_t* remote, const char* base_path,
 	const remote_request_options_t* request_options,
 	dicomweb_instance_ref_t** out_refs, i32* out_count,
-	char* message, size_t message_size) {
+	i32* http_status, char* message, size_t message_size) {
 	*out_refs = NULL;
 	*out_count = 0;
+	if (http_status) *http_status = 0;
 	char previous_page_first_uid[65] = {0};
 	for (i32 offset = 0; offset < DICOMWEB_QIDO_OPEN_INSTANCE_LIMIT;) {
 		char path[1500];
@@ -1024,6 +1026,7 @@ static bool dicomweb_query_instance_refs_all(
 			remote, path, "application/dicom+json", false, request_options);
 		if (!response || response->status_code < 200 || response->status_code >= 300) {
 			if (response) {
+				if (http_status) *http_status = response->status_code;
 				snprintf(message, message_size,
 				         "DICOMweb QIDO-RS request failed (HTTP %d).",
 				         response->status_code);
@@ -1091,7 +1094,8 @@ fail:
 
 static image_t* dicomweb_prepare_configured_series(
 	dicomweb_remote_image_t remote, const remote_request_options_t* request_options,
-	char* message, size_t message_size) {
+	i32* http_status, char* message, size_t message_size) {
+	if (http_status) *http_status = 0;
 	load_available_series(&remote, request_options);
 	char path[1400];
 	i32 length = snprintf(path, sizeof(path), "%s/studies/%s/series/%s/instances%s",
@@ -1105,7 +1109,8 @@ static image_t* dicomweb_prepare_configured_series(
 	dicomweb_instance_ref_t* refs = NULL;
 	i32 ref_count = 0;
 	if (!dicomweb_query_instance_refs_all(&remote, path, request_options,
-	                                      &refs, &ref_count, message, message_size)) {
+	                                      &refs, &ref_count, http_status,
+	                                      message, message_size)) {
 		dicomweb_remote_image_destroy(&remote);
 		return NULL;
 	}
@@ -1163,6 +1168,7 @@ static image_t* dicomweb_prepare_configured_series(
 	if (remote.instance_count == 0) {
 		if (metadata_request_failures > 0) {
 			if (last_metadata_http_status) {
+				if (http_status) *http_status = last_metadata_http_status;
 				snprintf(message, message_size,
 				         "DICOMweb could not retrieve metadata for %d instance%s (last HTTP status: %d).",
 				         metadata_request_failures, metadata_request_failures == 1 ? "" : "s",
@@ -1211,7 +1217,7 @@ static bool dicomweb_open_configured_series(app_state_t* app_state,
                                             dicomweb_remote_image_t remote) {
 	char message[512];
 	image_t* image = dicomweb_prepare_configured_series(
-		remote, NULL, message, sizeof(message));
+		remote, NULL, NULL, message, sizeof(message));
 	if (!image) {
 		set_status("%s", message);
 		console_print_error("%s\n", message);

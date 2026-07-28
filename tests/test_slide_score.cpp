@@ -143,4 +143,5 @@ TEST_CASE("Slide Score URI parser recognizes QuPath metadata with custom scheme"
 	bool got_expected_status = strstr(slide_score_get_last_status(), "QuPath metadata URL") != NULL;
 	CHECK(recognized);
 	CHECK(got_expected_status);
+	CHECK_FALSE(slide_score_last_open_succeeded());
 }

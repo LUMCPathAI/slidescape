@@ -146,6 +146,7 @@ static const char* slide_score_api_names[SLIDE_SCORE_API_LAST] = {
 };
 
 static char slide_score_last_status[512];
+static bool slide_score_open_succeeded;
 
 static void slide_score_set_last_status(const char* fmt, ...) {
     va_list args;
@@ -158,6 +159,10 @@ static void slide_score_set_last_status(const char* fmt, ...) {
 
 const char* slide_score_get_last_status(void) {
     return slide_score_last_status;
+}
+
+bool slide_score_last_open_succeeded(void) {
+    return slide_score_open_succeeded;
 }
 
 
@@ -716,12 +721,14 @@ bool slide_score_uri_is_supported(const char* uri) {
 }
 
 bool slide_score_try_open_uri(app_state_t* app_state, const char* uri, const char* api_token) {
+    slide_score_open_succeeded = false;
     i32 image_id = 0;
     slide_score_uri_parts_t parts = {};
     if (!slide_score_get_uri_parts(uri, &parts)) return false;
 
     if (strstr(parts.path, "SlideScoreMetadata.json")) {
-        slide_score_open_qupath_metadata_url(app_state, parts.effective_uri);
+        slide_score_open_succeeded =
+            slide_score_open_qupath_metadata_url(app_state, parts.effective_uri);
         return true;
     }
 
@@ -731,7 +738,8 @@ bool slide_score_try_open_uri(app_state_t* app_state, const char* uri, const cha
         return true;
     }
 
-    slide_score_open_remote_image(app_state, parts.server, api_token, image_id);
+    slide_score_open_succeeded =
+        slide_score_open_remote_image(app_state, parts.server, api_token, image_id);
     return true;
 }
 

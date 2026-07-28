@@ -75,6 +75,9 @@ A known slide can also be opened directly:
 http://127.0.0.1:18080/dcm4chee-arc/aets/DCM4CHEE/rs/studies/{StudyInstanceUID}/series/{SeriesInstanceUID}
 ```
 
+After a known series opens successfully, the **Open URI** dialog closes; the
+archive browser is not opened for a direct series URL.
+
 ## Inspect
 
 ```sh

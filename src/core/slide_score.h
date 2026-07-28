@@ -182,6 +182,7 @@ bool slide_score_open_remote_image(app_state_t* app_state, const char* server_ur
 bool slide_score_open_qupath_metadata_url(app_state_t* app_state, const char* uri);
 bool slide_score_uri_is_supported(const char* uri);
 bool slide_score_try_open_uri(app_state_t* app_state, const char* uri, const char* api_token);
+bool slide_score_last_open_succeeded(void);
 bool init_image_from_slide_score(image_t* image, slide_score_remote_image_t* remote, bool is_overlay);
 char* slide_score_build_tile_url(char* buffer, size_t buffer_size, slide_score_remote_image_t* remote, i32 level, i32 tile_x, i32 tile_y);
 char* slide_score_build_qupath_tile_path(char* buffer, size_t buffer_size, slide_score_remote_image_t* remote, i32 level, i32 tile_x, i32 tile_y, i32 tile_width, i32 tile_height, i64 level_width, i64 level_height);

@@ -76,9 +76,12 @@ the series URL:
 http://127.0.0.1:8042/dicom-web/studies/{StudyInstanceUID}/series/{SeriesInstanceUID}
 ```
 
-Enter the local development username and password shown above. Slidescape allows
-unencrypted DICOMweb only for a loopback host; non-local archives must use
-verified HTTPS.
+Enter the local development username and password shown above under **Options**,
+or supply them when Slidescape prompts after the first authentication failure.
+Slidescape allows unencrypted DICOMweb only for a loopback host; non-local
+archives must use verified HTTPS. After a known series opens successfully, the
+**Open URI** dialog closes; the archive browser is not opened for a direct
+series URL.
 
 To browse instead of opening a known series, enter only the archive root:
 
