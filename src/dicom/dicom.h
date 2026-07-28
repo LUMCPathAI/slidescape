@@ -327,6 +327,7 @@ typedef struct dicom_general_study_t {
 
 typedef struct dicom_general_series_t {
     dicom_cs_t Modality;
+    dicom_lo_t SeriesDescription;
     dicom_ui_t SeriesInstanceUID;
 } dicom_general_series_t;
 
@@ -535,6 +536,7 @@ typedef struct dicom_wsi_t {
 
 typedef struct dicom_slide_t {
 	dicom_ui_t series_instance_uid;
+	char series_description[65];
 	char representative_filename[512];
 	u32 representative_width;
 } dicom_slide_t;
@@ -544,6 +546,7 @@ typedef struct dicom_series_t {
 	i64 bytes_read;
 	dicom_transfer_syntax_enum encoding;
 	FILE* debug_output_file;
+	char source_directory[512];
 	dicom_instance_t* instances; // array
 	dicom_slide_t* slides; // array
 	i32 selected_slide_index;

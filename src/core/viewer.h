@@ -281,6 +281,8 @@ typedef struct app_state_t {
 void add_image(app_state_t* app_state, image_t* image, bool need_zoom_reset, bool need_image_registration);
 void unload_all_images(app_state_t* app_state);
 bool load_generic_file(app_state_t* app_state, const char* filename, u32 filetype_hint);
+bool load_dicom_file_from_directory(app_state_t* app_state, const char* filename,
+		const char* directory, u32 filetype_hint);
 bool app_load_input(app_state_t* app_state, const char* input, u32 filetype_hint);
 bool app_get_slide_score_api_key_filename(char* buffer, size_t buffer_size);
 void app_read_slide_score_api_key(char* buffer, size_t buffer_size);

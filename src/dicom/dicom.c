@@ -638,6 +638,9 @@ static void dicom_interpret_top_level_data_element(dicom_instance_t* instance, d
                 case DICOM_Modality: {
                     instance->general_series.Modality = dicom_parse_code_string(str, NULL);
                 } break;
+				case DICOM_SeriesDescription: {
+					instance->general_series.SeriesDescription = dicom_parse_long_string(str);
+				} break;
 
                 case DICOM_ContentDate: {
                     // not handled right now
@@ -1375,6 +1378,7 @@ static void dicom_load_instances_from_directory_tree(dicom_series_t* dicom, dire
 
 bool dicom_open_from_directory(dicom_series_t* dicom, directory_info_t* directory, const file_info_t* selected_file) {
 	i64 start = get_clock();
+	copy_cstring(dicom->source_directory, directory->path, sizeof(dicom->source_directory));
 
 	#if DO_DEBUG
 	if (is_verbose_mode) {
@@ -1413,11 +1417,19 @@ bool dicom_open_from_directory(dicom_series_t* dicom, directory_info_t* director
 			if (slide_index < 0) {
 				dicom_slide_t slide = {};
 				slide.series_instance_uid = instance->general_series.SeriesInstanceUID;
+				copy_cstring(slide.series_description,
+				             instance->general_series.SeriesDescription.value,
+				             sizeof(slide.series_description));
 				copy_cstring(slide.representative_filename, instance->filename, sizeof(slide.representative_filename));
 				slide.representative_width = instance->total_pixel_matrix_columns;
 				arrput(dicom->slides, slide);
 				slide_index = arrlen(dicom->slides) - 1;
 			} else if (instance->total_pixel_matrix_columns > dicom->slides[slide_index].representative_width) {
+				if (instance->general_series.SeriesDescription.value[0]) {
+					copy_cstring(dicom->slides[slide_index].series_description,
+					             instance->general_series.SeriesDescription.value,
+					             sizeof(dicom->slides[slide_index].series_description));
+				}
 				copy_cstring(dicom->slides[slide_index].representative_filename, instance->filename,
 				             sizeof(dicom->slides[slide_index].representative_filename));
 				dicom->slides[slide_index].representative_width = instance->total_pixel_matrix_columns;

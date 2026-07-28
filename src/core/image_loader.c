@@ -276,6 +276,7 @@ static void viewer_join_path(char* dest, size_t dest_size, const char* directory
 static directory_info_t viewer_get_directory_info_internal(const char* path,
 		i32 dicom_recursion_levels_remaining, bool dicom_only) {
 	directory_info_t directory = {0};
+	copy_cstring(directory.path, path, sizeof(directory.path));
 	directory_listing_t* listing = create_directory_listing_and_find_first_file(path, NULL);
 	if (listing) {
 		directory.is_valid = true;
@@ -397,9 +398,14 @@ image_t* image_load_from_file(file_info_t* file, directory_info_t* directory, im
 	} else if (file->type == VIEWER_FILE_TYPE_DICOM) {
 		if (file->is_regular_file) {
 			dicom_series_t dicom = {0};
-			directory_info_t parent_directory = viewer_get_directory_info(file->filename_prefix);
-			if (parent_directory.is_valid &&
-			    dicom_open_from_directory(&dicom, &parent_directory, file)) {
+			directory_info_t parent_directory = {0};
+			directory_info_t* dicom_directory = directory;
+			if (!dicom_directory) {
+				parent_directory = viewer_get_directory_info(file->filename_prefix);
+				dicom_directory = &parent_directory;
+			}
+			if (dicom_directory->is_valid &&
+			    dicom_open_from_directory(&dicom, dicom_directory, file)) {
 				init_image_from_dicom(image, &dicom, is_overlay);
 			} else {
 				dicom_destroy(&dicom);

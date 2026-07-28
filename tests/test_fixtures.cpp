@@ -843,6 +843,30 @@ static image_t* load_dicom_fixture_image(const fixture_t* fixture) {
 	return image;
 }
 
+static image_t* load_selected_dicom_fixture_image(const fixture_t* directory_fixture,
+		const char* selected_filename) {
+	ensure_dicom_initialized();
+	ensure_image_read_region_thread_pool();
+
+	file_info_t file = viewer_get_file_info(selected_filename);
+	REQUIRE(file.is_valid);
+	REQUIRE(file.is_regular_file);
+	REQUIRE(file.type == VIEWER_FILE_TYPE_DICOM);
+	directory_info_t directory = viewer_get_dicom_directory_info(directory_fixture->path);
+	REQUIRE(directory.is_valid);
+	REQUIRE(directory.contains_dicom_files);
+
+	image_load_options_t options = {};
+	options.resource_id = 3000;
+	options.thread_pool = &global_thread_pool;
+	image_t* image = image_load_from_file(&file, &directory, &options);
+	viewer_directory_info_destroy(&directory);
+	REQUIRE(image != NULL);
+	REQUIRE(image->is_valid);
+	REQUIRE(image->backend == IMAGE_BACKEND_DICOM);
+	return image;
+}
+
 TEST_CASE("fixture manifest is readable") {
 	fixture_manifest_t* manifest = fixture_manifest();
 	REQUIRE(manifest->fixture_count > 0);
@@ -1422,6 +1446,12 @@ TEST_CASE("select each slide in a local multi-slide DICOM directory") {
 	image_t* initial_image = load_dicom_fixture_image(fixture);
 	i32 slide_count = arrlen(initial_image->dicom.slides);
 	REQUIRE(slide_count > 1);
+	if (fixture_has_tag(*fixture, "dicom-jpeg2000")) {
+		for (i32 slide_index = 0; slide_index < slide_count; ++slide_index) {
+			CAPTURE(slide_index);
+			CHECK(trim_whitespace(initial_image->dicom.slides[slide_index].series_description)[0] != '\0');
+		}
+	}
 	dicom_slide_t* slides = (dicom_slide_t*)calloc((size_t)slide_count, sizeof(dicom_slide_t));
 	REQUIRE(slides != NULL);
 	memcpy(slides, initial_image->dicom.slides, (size_t)slide_count * sizeof(dicom_slide_t));
@@ -1429,12 +1459,11 @@ TEST_CASE("select each slide in a local multi-slide DICOM directory") {
 	free(initial_image);
 
 	for (i32 expected_index = 0; expected_index < slide_count; ++expected_index) {
-		fixture_t selected_fixture = *fixture;
-		copy_string(selected_fixture.path, COUNT(selected_fixture.path),
-		            slides[expected_index].representative_filename);
-		image_t* selected_image = load_dicom_fixture_image(&selected_fixture);
+		image_t* selected_image = load_selected_dicom_fixture_image(
+			fixture, slides[expected_index].representative_filename);
 		CAPTURE(expected_index);
-		CAPTURE(selected_fixture.path);
+		CAPTURE(slides[expected_index].representative_filename);
+		CHECK(arrlen(selected_image->dicom.slides) == slide_count);
 		CHECK(selected_image->dicom.selected_slide_index == expected_index);
 		REQUIRE(selected_image->dicom.selected_slide_index >= 0);
 		CHECK(strcmp(selected_image->dicom.slides[selected_image->dicom.selected_slide_index]

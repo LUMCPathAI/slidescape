@@ -449,10 +449,15 @@ static void draw_dicom_slides_window(app_state_t* app_state) {
 			dicomweb_series_ref_t* remote_series =
 				is_dicomweb ? image->dicomweb.available_series + i : NULL;
 			char remote_label[256];
+			char local_label[640];
 			const char* label = NULL;
 			if (is_local_dicom) {
-				label = one_past_last_slash(slide->representative_filename,
-				                           strlen(slide->representative_filename));
+				const char* filename = one_past_last_slash(
+					slide->representative_filename, strlen(slide->representative_filename));
+				const char* description = trim_whitespace(slide->series_description);
+				snprintf(local_label, sizeof(local_label), "%s##local_slide_%d",
+				         description[0] ? description : filename, i);
+				label = local_label;
 			} else {
 				const char* primary = remote_series->series_number[0]
 				                      ? remote_series->series_number
@@ -472,8 +477,12 @@ static void draw_dicom_slides_window(app_state_t* app_state) {
 			if (ImGui::Selectable(label, selected) && !selected) {
 				if (is_local_dicom) {
 					char filename[512];
+					char source_directory[512];
 					copy_cstring(filename, slide->representative_filename, sizeof(filename));
-					load_generic_file(app_state, filename, FILETYPE_HINT_BASE_IMAGE);
+					copy_cstring(source_directory, image->dicom.source_directory,
+					             sizeof(source_directory));
+					load_dicom_file_from_directory(app_state, filename, source_directory,
+					                               FILETYPE_HINT_BASE_IMAGE);
 				} else {
 					dicomweb_open_related_series(app_state, image, i);
 				}

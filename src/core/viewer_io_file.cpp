@@ -302,6 +302,29 @@ bool load_generic_file(app_state_t* app_state, const char* filename, u32 filetyp
 
 }
 
+bool load_dicom_file_from_directory(app_state_t* app_state, const char* filename,
+		const char* directory_path, u32 filetype_hint) {
+	file_info_t file = viewer_get_file_info(filename);
+	if (!file.is_valid || !file.is_regular_file || file.type != VIEWER_FILE_TYPE_DICOM) {
+		console_print_error("Could not load DICOM file '%s'\n", filename);
+		gui_add_modal_message_popup("Error##load_dicom_file_from_directory",
+		                            "Could not load '%s'.\n", filename);
+		return false;
+	}
+
+	directory_info_t directory = viewer_get_dicom_directory_info(directory_path);
+	bool success = directory.is_valid && directory.contains_dicom_files &&
+	               viewer_load_new_image(app_state, &file, &directory, filetype_hint);
+	viewer_directory_info_destroy(&directory);
+	if (!success) {
+		console_print_error("Could not load '%s' from DICOM directory '%s'\n",
+		                    filename, directory_path);
+		gui_add_modal_message_popup("Error##load_dicom_file_from_directory",
+		                            "Could not load '%s'.\n", filename);
+	}
+	return success;
+}
+
 const char* get_active_directory(app_state_t* app_state) {
 	if (arrlen(app_state->loaded_images) > 0) {
 		for (i32 i = 0; i < arrlen(app_state->loaded_images); ++i) {

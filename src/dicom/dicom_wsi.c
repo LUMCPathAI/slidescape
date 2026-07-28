@@ -847,7 +847,9 @@ u8* dicom_wsi_decode_tile_to_bgra(dicom_series_t* dicom_series, i32 instance_ind
 		i64 data_size = dicom_defragment_encapsulated_pixel_data_frame(tile_data, bytes_read);
 		bool is_jpeg_baseline = instance->transfer_syntax_uid.as_enum == DICOM_JPEGBaseline8Bit;
 		bool is_jpeg2000 = instance->transfer_syntax_uid.as_enum == DICOM_JPEG2000Lossless ||
-		                   instance->transfer_syntax_uid.as_enum == DICOM_JPEG2000;
+		                   instance->transfer_syntax_uid.as_enum == DICOM_JPEG2000 ||
+		                   instance->transfer_syntax_uid.as_enum == DICOM_JPEG2000MCLossless ||
+		                   instance->transfer_syntax_uid.as_enum == DICOM_JPEG2000MC;
 		if (data_size > 0 && is_jpeg_baseline) {
 			// JPEG compression
 			i32 width = 0;

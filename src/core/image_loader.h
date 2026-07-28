@@ -53,6 +53,7 @@ typedef struct file_info_t {
 } file_info_t;
 
 typedef struct directory_info_t {
+	char path[512];
 	file_info_t* dicom_files; // array
 	file_info_t* nondicom_files; // array
 	directory_info_t* directories; // array
