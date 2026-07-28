@@ -87,6 +87,7 @@ static i32 on_body(http_parser* parser, const char* data, size_t size) {
 static i32 on_message_complete(http_parser* parser) {
 	http_response_parser_t* context = (http_response_parser_t*)parser->data;
 	if (context->last_was_header_value) commit_header(context);
+	context->response->connection_reusable = http_should_keep_alive(parser) != 0;
 	context->message_complete = true;
 	return 0;
 }
@@ -124,6 +125,15 @@ bool http_response_parser_execute(http_response_parser_t* context, const void* d
 
 void http_response_parser_finish(http_response_parser_t* context) {
 	if (!context || context->error != HTTP_RESPONSE_ERROR_NONE) return;
+	/*
+	 * A response without Content-Length or chunked transfer coding is delimited by
+	 * the peer closing the connection. http-parser only completes that message
+	 * after an explicit zero-length execute call. This is how dcm4chee frames QIDO
+	 * responses when the request contains "Connection: close".
+	 */
+	if (!context->message_complete) {
+		http_response_parser_execute(context, "", 0);
+	}
 	if (!context->message_complete) context->error = HTTP_RESPONSE_ERROR_TRUNCATED;
 }
 

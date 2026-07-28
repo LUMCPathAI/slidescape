@@ -16,6 +16,8 @@ extern "C" {
 typedef struct app_state_t app_state_t;
 typedef struct image_t image_t;
 
+#define DICOMWEB_FRAME_BATCH_MAX 4
+
 typedef enum dicomweb_async_query_kind_t {
 	DICOMWEB_ASYNC_QUERY_NONE = 0,
 	DICOMWEB_ASYNC_QUERY_STUDIES,
@@ -88,6 +90,7 @@ i32 dicomweb_query_instances(const char* archive_url, const char* username, cons
 bool dicomweb_build_series_url(char* dest, size_t dest_size, const char* archive_url,
                                const char* study_uid, const char* series_uid);
 const char* dicomweb_get_last_status(void);
+void dicomweb_print_tile_stats(void);
 void dicomweb_load_tile_batch_func(i32 logical_thread_index, void* userdata);
 
 #ifdef __cplusplus

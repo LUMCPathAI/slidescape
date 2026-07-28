@@ -273,9 +273,13 @@ typedef struct dicom_lo_t {
     bool present;
 } dicom_lo_t;
 
+typedef struct dicom_st_t {
+	char value[1025];
+	bool present;
+} dicom_st_t;
+
 typedef struct dicom_pn_t {
-    dicom_lo_t components[5];
-    u8 component_count;
+	char value[321];
     bool present;
 } dicom_pn_t;
 
@@ -326,13 +330,81 @@ typedef struct dicom_general_series_t {
     dicom_ui_t SeriesInstanceUID;
 } dicom_general_series_t;
 
+typedef struct dicom_code_t {
+	dicom_sh_t CodeValue;
+	dicom_sh_t CodingSchemeDesignator;
+	dicom_lo_t CodeMeaning;
+} dicom_code_t;
+
+typedef enum dicom_content_value_type_t {
+	DICOM_CONTENT_VALUE_UNKNOWN = 0,
+	DICOM_CONTENT_VALUE_CODE = 1,
+	DICOM_CONTENT_VALUE_TEXT = 2,
+	DICOM_CONTENT_VALUE_NUM = 3,
+	DICOM_CONTENT_VALUE_UID = 4,
+	DICOM_CONTENT_VALUE_DATETIME = 5,
+	DICOM_CONTENT_VALUE_DATE = 6,
+	DICOM_CONTENT_VALUE_TIME = 7,
+	DICOM_CONTENT_VALUE_PNAME = 8,
+} dicom_content_value_type_t;
+
+typedef struct dicom_content_code_t {
+	char* value;
+	char* coding_scheme;
+	char* coding_scheme_version;
+	char* meaning;
+} dicom_content_code_t;
+
+typedef struct dicom_specimen_preparation_item_t {
+	u32 parent_index;
+	u32 parser_item_number;
+	u16 parser_sequence_level;
+	dicom_content_value_type_t value_type;
+	char* relationship_type;
+	dicom_content_code_t concept_name;
+	dicom_content_code_t code_value;
+	dicom_content_code_t measurement_units;
+	char* scalar_value;
+} dicom_specimen_preparation_item_t;
+
+typedef struct dicom_specimen_preparation_step_t {
+	dicom_specimen_preparation_item_t* items;
+} dicom_specimen_preparation_step_t;
+
+typedef enum dicom_optical_field_t {
+	DICOM_OPTICAL_LIGHT_FILTER_PASS = 1 << 0,
+	DICOM_OPTICAL_LIGHT_FILTER_BAND = 1 << 1,
+	DICOM_OPTICAL_IMAGE_FILTER_PASS = 1 << 2,
+	DICOM_OPTICAL_IMAGE_FILTER_BAND = 1 << 3,
+	DICOM_OPTICAL_OBJECTIVE_POWER = 1 << 4,
+	DICOM_OPTICAL_OBJECTIVE_APERTURE = 1 << 5,
+} dicom_optical_field_t;
+
 typedef struct dicom_optical_path_t {
-    i32 illumination_type; // TODO: implement
+    dicom_code_t illumination_type;
+    dicom_code_t illumination_color;
     float illumination_wavelength;
+	bool illumination_wavelength_present;
     u8* icc_profile;
     u32 icc_profile_size;
     dicom_sh_t OpticalPathIdentifier;
+	dicom_st_t OpticalPathDescription;
+    dicom_cs_t ColorSpace;
+	u16 light_path_filter_pass_through_wavelength;
+	u16 light_path_filter_pass_band[2];
+	u16 image_path_filter_pass_through_wavelength;
+	u16 image_path_filter_pass_band[2];
+	float objective_lens_power;
+	float objective_lens_numerical_aperture;
+	u32 present_fields;
 } dicom_optical_path_t;
+
+typedef struct dicom_specimen_t {
+	dicom_lo_t SpecimenIdentifier;
+	dicom_ui_t SpecimenUID;
+	dicom_lo_t SpecimenShortDescription;
+	dicom_specimen_preparation_step_t* preparation_steps;
+} dicom_specimen_t;
 
 typedef struct dicom_series_t dicom_series_t; // fwd declaration
 typedef struct dicom_instance_t dicom_instance_t; // fwd declaration
@@ -377,10 +449,13 @@ typedef struct dicom_instance_t {
 	i32 nested_item_numbers[8];
 //	u32 current_item_number;
 	dicom_transfer_syntax_enum encoding;
+    dicom_patient_t patient;
     dicom_general_study_t general_study;
     dicom_general_series_t general_series;
     dicom_optical_path_t current_optical_path;
     dicom_optical_path_t* optical_paths; // array
+    dicom_lo_t ContainerIdentifier;
+    dicom_specimen_t* specimens; // array
 	u8* data;
 	i64 bytes_read_from_file;
 	i64 total_bytes_in_stream;
@@ -421,17 +496,30 @@ typedef struct dicom_instance_t {
 	float imaged_volume_width;
 	float imaged_volume_height;
 	float imaged_volume_depth;
+	u16 number_of_focal_planes;
+	float distance_between_focal_planes_um;
+	u32 number_of_optical_paths;
+	u32 total_pixel_matrix_focal_planes;
 	v2f pixel_spacing;
 	u32 total_pixel_matrix_columns;
 	u32 total_pixel_matrix_rows;
+	bool is_tiled_full;
 	i32 tile_count;
 	i32 width_in_tiles;
 	i32 height_in_tiles;
 	float downsample_factor;
 	i32 downsample_level;
 	v2f origin_offset;
+	bool is_total_pixel_matrix_origin_known;
+	u8 total_pixel_matrix_origin_component_mask;
+	float total_pixel_matrix_origin_x_mm;
+	float total_pixel_matrix_origin_y_mm;
+	float total_pixel_matrix_origin_z_mm;
+	bool is_image_orientation_slide_known;
+	float image_orientation_slide[6];
 	dicom_tile_t* tiles; // malloc'ed
 	dicom_plane_position_slide_t* per_frame_plane_position_slide; // array
+	dicom_sh_t* per_frame_optical_path_identifiers; // array
 } dicom_instance_t;
 
 typedef struct dicom_wsi_t {
@@ -472,8 +560,17 @@ void dicom_instance_destroy(dicom_instance_t* instance);
 bool is_file_a_dicom_file(u8* file_header_data, size_t file_header_data_len);
 bool dicom_open_from_directory(dicom_series_t* dicom, directory_info_t* directory, const file_info_t* selected_file);
 bool dicom_open_from_file(dicom_series_t* dicom, file_info_t* file);
+/*
+ * Archive/service-facing entry point for one immutable Part 10 object. Unlike
+ * dicom_open_from_directory(), this does not assemble a viewer pyramid or require
+ * directory discovery. The parsed instance is owned by `dicom` and released by
+ * dicom_destroy().
+ */
+bool dicom_open_single_instance_from_path(dicom_series_t* dicom, const char* filename);
 dicom_data_element_t dicom_read_data_element(u8* data_start, i64 data_offset, dicom_transfer_syntax_enum encoding, i64 bytes_available);
 dicom_ui_t dicom_parse_uid(str_t s);
+dicom_lo_t dicom_parse_long_string(str_t s);
+dicom_pn_t dicom_parse_person_name(str_t s);
 i64 dicom_parse_integer_string(str_t s, str_t* next);
 float dicom_parse_decimal_string(str_t s, str_t* next);
 dicom_cs_t dicom_parse_code_string(str_t s, str_t* next);
@@ -482,6 +579,13 @@ dicom_da_t dicom_parse_date(str_t s);
 dicom_tm_t dicom_parse_time(str_t s);
 i64 dicom_defragment_encapsulated_pixel_data_frame(u8* data, i64 len);
 bool dicom_instance_index_pixel_data(dicom_instance_t* instance);
+/*
+ * Reads one zero-based frame in the instance's stored transfer syntax. Encapsulated
+ * fragment item headers are removed, but the JPEG/JPEG 2000 codestream is not decoded
+ * or transcoded. The caller owns `*data` and must free it.
+ */
+bool dicom_instance_read_encoded_frame(dicom_instance_t* instance, u32 frame_index,
+		u8** data, size_t* size, size_t maximum_size);
 bool dicom_wsi_index_level(dicom_series_t* dicom_series, i32 instance_index);
 
 // globals

@@ -3,6 +3,7 @@ add_executable(slidescape_tests
         test_main.cpp
         test_fixtures.cpp
         test_dicomweb.cpp
+        test_archive.cpp
         test_http_response_parser.cpp
         test_mathutils.cpp
         test_memrw.cpp
@@ -29,7 +30,7 @@ target_compile_definitions(slidescape_tests PRIVATE
         SLIDESCAPE_TEST_DICOMWEB_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/dicomweb"
         ISYNTAX_JPEG_DECODER_USE_LIBJPEG=1
 )
-target_link_libraries(slidescape_tests PRIVATE slidescape_nongui slidescape_jpeg)
+target_link_libraries(slidescape_tests PRIVATE slidescape_nongui slidescape_jpeg slidescape_archive_core)
 if (WIN32)
         target_link_libraries(slidescape_tests PRIVATE winmm)
 endif()
@@ -39,6 +40,7 @@ add_test(NAME slidescape_tests COMMAND slidescape_tests)
 add_executable(dicomweb_probe
         dicomweb_probe.c
         test_stb_sprintf.cpp
+        test_support.cpp
 )
 target_include_directories(dicomweb_probe PRIVATE
         ../src
@@ -46,4 +48,4 @@ target_include_directories(dicomweb_probe PRIVATE
         ../src/third_party
         ../src/utils
 )
-target_link_libraries(dicomweb_probe PRIVATE slidescape_nongui)
+target_link_libraries(dicomweb_probe PRIVATE slidescape_nongui slidescape_jpeg)

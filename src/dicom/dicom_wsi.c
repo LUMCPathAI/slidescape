@@ -30,6 +30,204 @@
        : 0), \
    (array) + (index))
 
+static void dicom_wsi_parse_code_element(dicom_code_t* code,
+		dicom_data_element_t element, str_t value) {
+	if (!code) return;
+	switch (element.tag.as_u32) {
+		case DICOM_CodeValue:
+			code->CodeValue = dicom_parse_short_string(value);
+			break;
+		case DICOM_CodingSchemeDesignator:
+			code->CodingSchemeDesignator = dicom_parse_short_string(value);
+			break;
+		case DICOM_CodeMeaning:
+			code->CodeMeaning = dicom_parse_long_string(value);
+			break;
+		default:
+			break;
+	}
+}
+
+static bool dicom_wsi_content_sequence_tag(u32 tag) {
+	return tag == DICOM_SpecimenPreparationStepContentItemSequence ||
+	       tag == DICOM_ContentSequence;
+}
+
+static char* dicom_wsi_copy_content_string(const u8* data, u32 size) {
+	while (size && (data[size - 1] == ' ' || data[size - 1] == '\0')) --size;
+	if ((u64)size + 1 > SIZE_MAX) return NULL;
+	char* result = malloc((size_t)size + 1);
+	if (!result) return NULL;
+	memcpy(result, data, size);
+	result[size] = '\0';
+	return result;
+}
+
+static void dicom_wsi_replace_content_string(
+		char** destination, const u8* data, u32 size) {
+	char* replacement = dicom_wsi_copy_content_string(data, size);
+	if (!replacement) return;
+	free(*destination);
+	*destination = replacement;
+}
+
+static i32 dicom_wsi_find_sequence_level(
+		const dicom_instance_t* instance, u32 tag, i32 before_level) {
+	i32 start = MIN(before_level, instance->nesting_level - 1);
+	for (i32 level = start; level >= 0; --level) {
+		if (instance->pos_stack[level].element.vr == DICOM_VR_SQ &&
+		    instance->pos_stack[level].element.tag.as_u32 == tag) return level;
+	}
+	return -1;
+}
+
+static dicom_specimen_preparation_item_t*
+dicom_wsi_get_specimen_preparation_item(dicom_instance_t* instance) {
+	i32 specimen_level = dicom_wsi_find_sequence_level(
+		instance, DICOM_SpecimenDescriptionSequence, instance->nesting_level);
+	i32 preparation_level = dicom_wsi_find_sequence_level(
+		instance, DICOM_SpecimenPreparationSequence, instance->nesting_level);
+	if (specimen_level < 0 || preparation_level <= specimen_level ||
+	    specimen_level + 1 >= instance->nesting_level ||
+	    preparation_level + 1 >= instance->nesting_level) return NULL;
+	u32 specimen_index =
+		(u32)instance->pos_stack[specimen_level + 1].item_number;
+	u32 step_index =
+		(u32)instance->pos_stack[preparation_level + 1].item_number;
+	dicom_specimen_t* specimen =
+		array_last_maybe_expand(instance->specimens, specimen_index);
+	dicom_specimen_preparation_step_t* step =
+		array_last_maybe_expand(specimen->preparation_steps, step_index);
+	u32 parent_index = UINT32_MAX;
+	dicom_specimen_preparation_item_t* current = NULL;
+	for (i32 level = preparation_level + 2;
+	     level < instance->nesting_level; ++level) {
+		if (instance->pos_stack[level].element.vr != DICOM_VR_SQ ||
+		    !dicom_wsi_content_sequence_tag(
+			    instance->pos_stack[level].element.tag.as_u32) ||
+		    level + 1 >= instance->nesting_level) continue;
+		u32 item_number =
+			(u32)instance->pos_stack[level + 1].item_number;
+		current = NULL;
+		for (i32 i = 0; i < arrlen(step->items); ++i) {
+			dicom_specimen_preparation_item_t* candidate = step->items + i;
+			if (candidate->parent_index == parent_index &&
+			    candidate->parser_item_number == item_number &&
+			    candidate->parser_sequence_level == (u16)level) {
+				current = candidate;
+				break;
+			}
+		}
+		if (!current) {
+			dicom_specimen_preparation_item_t item = {0};
+			item.parent_index = parent_index;
+			item.parser_item_number = item_number;
+			item.parser_sequence_level = (u16)level;
+			arrput(step->items, item);
+			current = step->items + arrlen(step->items) - 1;
+		}
+		parent_index = (u32)(current - step->items);
+	}
+	return current;
+}
+
+static dicom_content_code_t* dicom_wsi_content_code_for_element(
+		dicom_instance_t* instance,
+		dicom_specimen_preparation_item_t* item) {
+	for (i32 level = instance->nesting_level - 1; level >= 0; --level) {
+		if (instance->pos_stack[level].element.vr != DICOM_VR_SQ) continue;
+		switch (instance->pos_stack[level].element.tag.as_u32) {
+			case DICOM_ConceptNameCodeSequence:
+				return &item->concept_name;
+			case DICOM_ConceptCodeSequence:
+				return &item->code_value;
+			case DICOM_MeasurementUnitsCodeSequence:
+				return &item->measurement_units;
+			default:
+				break;
+		}
+	}
+	return NULL;
+}
+
+static void dicom_wsi_parse_specimen_preparation_element(
+		dicom_instance_t* instance, dicom_data_element_t element) {
+	dicom_specimen_preparation_item_t* item =
+		dicom_wsi_get_specimen_preparation_item(instance);
+	if (!item) return;
+	u8* data = instance->data + element.data_offset;
+	if (element.tag.as_u32 == DICOM_ValueType) {
+		char value_type[17] = {0};
+		u32 size = MIN(element.length, (u32)sizeof(value_type) - 1);
+		memcpy(value_type, data, size);
+		while (size && (value_type[size - 1] == ' ' ||
+		                value_type[size - 1] == '\0'))
+			value_type[--size] = '\0';
+		if (strcmp(value_type, "CODE") == 0)
+			item->value_type = DICOM_CONTENT_VALUE_CODE;
+		else if (strcmp(value_type, "TEXT") == 0)
+			item->value_type = DICOM_CONTENT_VALUE_TEXT;
+		else if (strcmp(value_type, "NUM") == 0)
+			item->value_type = DICOM_CONTENT_VALUE_NUM;
+		else if (strcmp(value_type, "UIDREF") == 0)
+			item->value_type = DICOM_CONTENT_VALUE_UID;
+		else if (strcmp(value_type, "DATETIME") == 0)
+			item->value_type = DICOM_CONTENT_VALUE_DATETIME;
+		else if (strcmp(value_type, "DATE") == 0)
+			item->value_type = DICOM_CONTENT_VALUE_DATE;
+		else if (strcmp(value_type, "TIME") == 0)
+			item->value_type = DICOM_CONTENT_VALUE_TIME;
+		else if (strcmp(value_type, "PNAME") == 0)
+			item->value_type = DICOM_CONTENT_VALUE_PNAME;
+		return;
+	}
+	if (element.tag.as_u32 == DICOM_RelationshipType) {
+		dicom_wsi_replace_content_string(
+			&item->relationship_type, data, element.length);
+		return;
+	}
+	dicom_content_code_t* code =
+		dicom_wsi_content_code_for_element(instance, item);
+	if (code) {
+		switch (element.tag.as_u32) {
+			case DICOM_CodeValue:
+			case DICOM_LongCodeValue:
+			case DICOM_URNCodeValue:
+				dicom_wsi_replace_content_string(
+					&code->value, data, element.length);
+				return;
+			case DICOM_CodingSchemeDesignator:
+				dicom_wsi_replace_content_string(
+					&code->coding_scheme, data, element.length);
+				return;
+			case DICOM_CodingSchemeVersion:
+				dicom_wsi_replace_content_string(
+					&code->coding_scheme_version, data, element.length);
+				return;
+			case DICOM_CodeMeaning:
+				dicom_wsi_replace_content_string(
+					&code->meaning, data, element.length);
+				return;
+			default:
+				break;
+		}
+	}
+	switch (element.tag.as_u32) {
+		case DICOM_TextValue:
+		case DICOM_NumericValue:
+		case DICOM_UID:
+		case DICOM_DateTime:
+		case DICOM_Date:
+		case DICOM_Time:
+		case DICOM_PersonName:
+			dicom_wsi_replace_content_string(
+				&item->scalar_value, data, element.length);
+			break;
+		default:
+			break;
+	}
+}
+
 // C.8.12.6.1 Plane Position (Slide) Macro
 // https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.8.12.6.html#sect_C.8.12.6.1
 
@@ -90,6 +288,10 @@ void dicom_wsi_interpret_top_level_data_element(dicom_instance_t* instance, dico
 	const char* data_str = (const char*)data;
 
 	switch(element.tag.as_u32) {
+		case DICOM_ContainerIdentifier: {
+			instance->ContainerIdentifier =
+				dicom_parse_long_string((str_t){data_str, element.length});
+		} break;
 		case DICOM_ImageType: {
 			// Type 1
 			// Image identification characteristics.
@@ -266,11 +468,13 @@ void dicom_wsi_interpret_top_level_data_element(dicom_instance_t* instance, dico
 			// Type 1C
 			// Number of acquisition focal planes used for extended depth of field.
 			// Required if Extended Depth of Field (0048,0012) value is YES
+			instance->number_of_focal_planes = *(u16*)data;
 		} break;
 		case DICOM_DistanceBetweenFocalPlanes: {
 			// Type 1C
 			// Distance between acquisition focal planes used for extended depth of field, in µm.
 			// Required if Extended Depth of Field (0048,0012) value is YES
+			instance->distance_between_focal_planes_um = *(float*)data;
 		} break;
 		case DICOM_AcquisitionDeviceProcessingDescription: {
 			// Type 3
@@ -298,6 +502,32 @@ void dicom_wsi_interpret_top_level_data_element(dicom_instance_t* instance, dico
 			// Total number of rows in pixel matrix; i.e., height of total imaged volume in pixels.
 			instance->total_pixel_matrix_rows = *(u32*)data;
 		} break;
+		case DICOM_DimensionOrganizationType: {
+			dicom_cs_t organization = dicom_parse_code_string(
+				(str_t){data_str, element.length}, NULL);
+			instance->is_tiled_full = strcmp(organization.value, "TILED_FULL") == 0;
+		} break;
+		case DICOM_NumberOfOpticalPaths: {
+			instance->number_of_optical_paths = *(u32*)data;
+		} break;
+		case DICOM_TotalPixelMatrixFocalPlanes: {
+			instance->total_pixel_matrix_focal_planes = *(u32*)data;
+		} break;
+		case DICOM_ImageOrientationSlide: {
+			// Type 1
+			// Direction cosines of the first row and first column with respect to the Slide Coordinate System.
+			str_t next = {data_str, element.length};
+			bool complete = true;
+			for (i32 i = 0; i < 6; ++i) {
+				if (!next.s) {
+					complete = false;
+					break;
+				}
+				instance->image_orientation_slide[i] =
+					dicom_parse_decimal_string(next, &next);
+			}
+			instance->is_image_orientation_slide_known = complete;
+		} break;
 	}
 }
 
@@ -306,29 +536,156 @@ void dicom_wsi_interpret_nested_data_element(dicom_instance_t* instance, dicom_d
 	u8* data = instance->data + element.data_offset;
 	switch(instance->nested_sequences[0].as_u32) {
 		default: break;
+		case DICOM_TotalPixelMatrixOriginSequence: {
+			switch(element.tag.as_u32) {
+				default: break;
+				case DICOM_XOffsetInSlideCoordinateSystem: {
+					instance->total_pixel_matrix_origin_x_mm =
+						dicom_parse_decimal_string((str_t){(char*)data, element.length}, NULL);
+					instance->total_pixel_matrix_origin_component_mask |= 1;
+				} break;
+				case DICOM_YOffsetInSlideCoordinateSystem: {
+					instance->total_pixel_matrix_origin_y_mm =
+						dicom_parse_decimal_string((str_t){(char*)data, element.length}, NULL);
+					instance->total_pixel_matrix_origin_component_mask |= 2;
+				} break;
+				case DICOM_ZOffsetInSlideCoordinateSystem: {
+					instance->total_pixel_matrix_origin_z_mm =
+						dicom_parse_decimal_string((str_t){(char*)data, element.length}, NULL);
+					instance->total_pixel_matrix_origin_component_mask |= 4;
+				} break;
+			}
+			instance->is_total_pixel_matrix_origin_known =
+				(instance->total_pixel_matrix_origin_component_mask & 3) == 3;
+		} break;
 		case DICOM_OpticalPathSequence: {
-			dicom_optical_path_t* optical_path = array_last_maybe_expand(instance->optical_paths, instance->pos_stack[1].item_number);
-			// TODO: why doesn't instance->nested_sequences[0].as_u32 work properly?
+			str_t value = {(char*)data, element.length};
 			switch(instance->pos_stack[2].element.tag.as_enum) {
 				default: break;
 				case DICOM_IlluminationTypeCodeSequence: {
-					//TODO
+					dicom_optical_path_t* optical_path = array_last_maybe_expand(
+						instance->optical_paths, instance->pos_stack[1].item_number);
+					dicom_wsi_parse_code_element(
+						&optical_path->illumination_type, element, value);
 				} break;
 					// Either IlluminationWaveLength or IlluminationColorCodeSequence is required to be present
 				case DICOM_IlluminationWaveLength: {
-					optical_path->illumination_wavelength = *(float*)data;
+					dicom_optical_path_t* optical_path = array_last_maybe_expand(
+						instance->optical_paths, instance->pos_stack[1].item_number);
+					if (element.length >= sizeof(float)) {
+						memcpy(&optical_path->illumination_wavelength, data, sizeof(float));
+						optical_path->illumination_wavelength_present = true;
+					}
 				} break;
 				case DICOM_IlluminationColorCodeSequence: {
-					// TODO
+					dicom_optical_path_t* optical_path = array_last_maybe_expand(
+						instance->optical_paths, instance->pos_stack[1].item_number);
+					dicom_wsi_parse_code_element(
+						&optical_path->illumination_color, element, value);
 				} break;
 				case DICOM_ICCProfile: {
+					dicom_optical_path_t* optical_path = array_last_maybe_expand(
+						instance->optical_paths, instance->pos_stack[1].item_number);
 					optical_path->icc_profile = malloc(element.length);
 					optical_path->icc_profile_size = element.length;
 					memcpy(optical_path->icc_profile, data, element.length);
 				} break;
 				case DICOM_OpticalPathIdentifier: {
+					dicom_optical_path_t* optical_path = array_last_maybe_expand(
+						instance->optical_paths, instance->pos_stack[1].item_number);
 					optical_path->OpticalPathIdentifier = dicom_parse_short_string((str_t){(char*)data, element.length});
 				} break;
+				case DICOM_OpticalPathDescription: {
+					dicom_optical_path_t* optical_path = array_last_maybe_expand(
+						instance->optical_paths, instance->pos_stack[1].item_number);
+					u32 length = element.length;
+					while (length && (data[length - 1] == ' ' || data[length - 1] == '\0'))
+						--length;
+					length = MIN(length, sizeof(optical_path->OpticalPathDescription.value) - 1);
+					memcpy(optical_path->OpticalPathDescription.value, data, length);
+					optical_path->OpticalPathDescription.value[length] = '\0';
+					optical_path->OpticalPathDescription.present = true;
+				} break;
+				case DICOM_ColorSpace: {
+					dicom_optical_path_t* optical_path = array_last_maybe_expand(
+						instance->optical_paths, instance->pos_stack[1].item_number);
+					optical_path->ColorSpace =
+						dicom_parse_code_string(value, NULL);
+				} break;
+				case DICOM_LightPathFilterPassThroughWavelength: {
+					dicom_optical_path_t* optical_path = array_last_maybe_expand(
+						instance->optical_paths, instance->pos_stack[1].item_number);
+					if (element.length >= sizeof(u16)) {
+						memcpy(&optical_path->light_path_filter_pass_through_wavelength,
+						       data, sizeof(u16));
+						optical_path->present_fields |= DICOM_OPTICAL_LIGHT_FILTER_PASS;
+					}
+				} break;
+				case DICOM_LightPathFilterPassBand: {
+					dicom_optical_path_t* optical_path = array_last_maybe_expand(
+						instance->optical_paths, instance->pos_stack[1].item_number);
+					if (element.length >= sizeof(optical_path->light_path_filter_pass_band)) {
+						memcpy(optical_path->light_path_filter_pass_band, data,
+						       sizeof(optical_path->light_path_filter_pass_band));
+						optical_path->present_fields |= DICOM_OPTICAL_LIGHT_FILTER_BAND;
+					}
+				} break;
+				case DICOM_ImagePathFilterPassThroughWavelength: {
+					dicom_optical_path_t* optical_path = array_last_maybe_expand(
+						instance->optical_paths, instance->pos_stack[1].item_number);
+					if (element.length >= sizeof(u16)) {
+						memcpy(&optical_path->image_path_filter_pass_through_wavelength,
+						       data, sizeof(u16));
+						optical_path->present_fields |= DICOM_OPTICAL_IMAGE_FILTER_PASS;
+					}
+				} break;
+				case DICOM_ImagePathFilterPassBand: {
+					dicom_optical_path_t* optical_path = array_last_maybe_expand(
+						instance->optical_paths, instance->pos_stack[1].item_number);
+					if (element.length >= sizeof(optical_path->image_path_filter_pass_band)) {
+						memcpy(optical_path->image_path_filter_pass_band, data,
+						       sizeof(optical_path->image_path_filter_pass_band));
+						optical_path->present_fields |= DICOM_OPTICAL_IMAGE_FILTER_BAND;
+					}
+				} break;
+				case DICOM_ObjectiveLensPower: {
+					dicom_optical_path_t* optical_path = array_last_maybe_expand(
+						instance->optical_paths, instance->pos_stack[1].item_number);
+					optical_path->objective_lens_power =
+						dicom_parse_decimal_string(value, NULL);
+					optical_path->present_fields |= DICOM_OPTICAL_OBJECTIVE_POWER;
+				} break;
+				case DICOM_ObjectiveLensNumericalAperture: {
+					dicom_optical_path_t* optical_path = array_last_maybe_expand(
+						instance->optical_paths, instance->pos_stack[1].item_number);
+					optical_path->objective_lens_numerical_aperture =
+						dicom_parse_decimal_string(value, NULL);
+					optical_path->present_fields |= DICOM_OPTICAL_OBJECTIVE_APERTURE;
+				} break;
+			}
+		} break;
+		case DICOM_SpecimenDescriptionSequence: {
+			dicom_wsi_parse_specimen_preparation_element(instance, element);
+			str_t value = {(char*)data, element.length};
+			switch (instance->pos_stack[2].element.tag.as_enum) {
+				case DICOM_SpecimenIdentifier: {
+					dicom_specimen_t* specimen = array_last_maybe_expand(
+						instance->specimens, instance->pos_stack[1].item_number);
+					specimen->SpecimenIdentifier = dicom_parse_long_string(value);
+				} break;
+				case DICOM_SpecimenUID: {
+					dicom_specimen_t* specimen = array_last_maybe_expand(
+						instance->specimens, instance->pos_stack[1].item_number);
+					specimen->SpecimenUID = dicom_parse_uid(value);
+				} break;
+				case DICOM_SpecimenShortDescription: {
+					dicom_specimen_t* specimen = array_last_maybe_expand(
+						instance->specimens, instance->pos_stack[1].item_number);
+					specimen->SpecimenShortDescription =
+						dicom_parse_long_string(value);
+				} break;
+				default:
+					break;
 			}
 		} break;
 		case DICOM_PerFrameFunctionalGroupsSequence: {
@@ -338,12 +695,13 @@ void dicom_wsi_interpret_nested_data_element(dicom_instance_t* instance, dicom_d
 					dicom_interpret_data_element_in_plane_position_slide_sq_item(instance, element);
 				} break;
                 case DICOM_OpticalPathIdentificationSequence: {
-                    switch(instance->nested_sequences[2].as_u32) {
-                        default: break;
-                        case DICOM_OpticalPathIdentifier: {
-                            // TODO: split frames over each optical path
-                        } break;
-                    }
+					if (element.tag.as_u32 == DICOM_OpticalPathIdentifier) {
+						dicom_sh_t* identifier = array_last_maybe_expand(
+							instance->per_frame_optical_path_identifiers,
+							instance->pos_stack[2].item_number);
+						*identifier = dicom_parse_short_string(
+							(str_t){(char*)data, element.length});
+					}
                 } break;
 			}
 		} break;

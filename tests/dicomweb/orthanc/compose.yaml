@@ -17,7 +17,9 @@ services:
       ORTHANC__DICOM_WEB__SERIES_METADATA: "Full"
       ORTHANC__DICOM_WEB__ENABLE_METADATA_CACHE: "true"
       ORTHANC__DICOM_WEB__METADATA_WORKER_THREADS_COUNT: "4"
-      ORTHANC__DICOM_WEB__WADO_RS_LOADER_THREADS_COUNT: "4"
+      # Local storage does not benefit from parallel WADO-RS file loading. Keep
+      # Orthanc's sequential default to avoid multiplying peak memory use.
+      ORTHANC__DICOM_WEB__WADO_RS_LOADER_THREADS_COUNT: "0"
     volumes:
       - orthanc-db:/var/lib/orthanc/db
     healthcheck:
@@ -30,4 +32,3 @@ services:
 
 volumes:
   orthanc-db:
-

@@ -51,9 +51,10 @@ The smoke test requires `curl` and `jq`. It uploads only the file passed on the
 command line. Do not pass private data unless local use of that data has been
 approved.
 
-Frame retrieval explicitly negotiates JPEG Baseline, matching the current viewer
-profile and the dcm4chee test. The smoke test also verifies exact Study Instance UID
-server-side QIDO matching with `limit` and `offset`.
+Frame retrieval explicitly negotiates JPEG Baseline, matching the fixture and the
+dcm4chee test. The client smoke test checks both single-frame retrieval and an ordered
+three-frame response. The smoke test also verifies exact Study Instance UID server-side
+QIDO matching with `limit` and `offset`.
 
 After building `dicomweb_probe`, run the Slidescape protocol parser against live
 Orthanc metadata and frame responses:
@@ -102,10 +103,29 @@ SLIDESCAPE_DICOMWEB_PASSWORD=slidescape-local \
 ```
 
 The current viewer slice supports `TILED_FULL` brightfield VOLUME instances with
-JPEG Baseline frames. It discovers all instances in the series, builds the
-pyramid from their Total Pixel Matrix dimensions, maps frames using their
-per-frame matrix positions, and retrieves native frames on demand. Tile workers
-reuse HTTP/TLS connections.
+JPEG Baseline or JPEG 2000 frames. It discovers all instances in the series, builds
+the pyramid from their Total Pixel Matrix dimensions, maps frames using their
+per-frame matrix positions, and retrieves native frames on demand. Tile workers reuse
+HTTP/TLS connections and combine up to four consecutive, non-stale requests for the
+same instance into one multi-frame retrieval. A missing or invalid part is retried as
+an individual frame request.
+
+Use a moderate-size DICOM WSI for interactive frame testing. Orthanc 1.12.11 with
+the DICOMweb 1.23 plugin can consume more than the 8 GB Docker VM while retrieving
+even one native frame from the local 487 MB / 38,478-frame UMCU instance used by
+Slidescape's private parser tests. Docker then reports `OOMKilled=true` and exit 137.
+The same instance's metadata and smaller pyramid levels work, and both single- and
+multi-frame retrieval work for the smaller levels. This is an Orthanc DICOMweb
+large-instance limitation, not a Slidescape frame-map or multipart failure; do not
+use that top-level instance as the interactive Orthanc frame oracle.
+
+The Compose profile keeps `WadoRsLoaderThreadsCount` at Orthanc's sequential default.
+The Orthanc documentation recommends values above one only for distributed storage;
+parallel local reads needlessly increase peak memory pressure.
+
+The console prints cumulative DICOMweb tile statistics on the first request, first
+multi-frame request, every 16 requests, and whenever a fallback occurs. Enter
+`dicomweb-stats` in the Slidescape console to print the current counters on demand.
 
 Credentials can alternatively be passed as command-line options:
 

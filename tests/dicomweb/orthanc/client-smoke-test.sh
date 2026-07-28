@@ -30,8 +30,11 @@ printf "%s" "${study_search}" | jq -e --arg uid "${study_uid}" \
 metadata_file="$(mktemp "${TMPDIR:-/tmp}/slidescape-dicomweb-metadata.XXXXXX")"
 frame_file="$(mktemp "${TMPDIR:-/tmp}/slidescape-dicomweb-frame.XXXXXX")"
 headers_file="$(mktemp "${TMPDIR:-/tmp}/slidescape-dicomweb-headers.XXXXXX")"
+multiframe_file="$(mktemp "${TMPDIR:-/tmp}/slidescape-dicomweb-multiframe.XXXXXX")"
+multiframe_headers_file="$(mktemp "${TMPDIR:-/tmp}/slidescape-dicomweb-multiframe-headers.XXXXXX")"
 cleanup() {
-	rm -f "${metadata_file}" "${frame_file}" "${headers_file}"
+	rm -f "${metadata_file}" "${frame_file}" "${headers_file}" \
+		"${multiframe_file}" "${multiframe_headers_file}"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -46,5 +49,12 @@ request -H "Accept: multipart/related; type=\"image/jpeg\"; transfer-syntax=1.2.
 	"${base_url}/dicom-web/${instance_path}/frames/1"
 content_type="$(sed -n 's/^[Cc]ontent-[Tt]ype:[[:space:]]*//p' "${headers_file}" | tr -d '\r' | tail -1)"
 "${probe}" frame "${frame_file}" "${content_type}"
+
+request -H "Accept: multipart/related; type=\"image/jpeg\"; transfer-syntax=1.2.840.10008.1.2.4.50" \
+	-D "${multiframe_headers_file}" \
+	-o "${multiframe_file}" \
+	"${base_url}/dicom-web/${instance_path}/frames/3,1,2"
+multiframe_content_type="$(sed -n 's/^[Cc]ontent-[Tt]ype:[[:space:]]*//p' "${multiframe_headers_file}" | tr -d '\r' | tail -1)"
+"${probe}" frames "${multiframe_file}" "${multiframe_content_type}"
 
 echo "Slidescape DICOMweb protocol smoke test passed."

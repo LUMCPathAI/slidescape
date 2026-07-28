@@ -17,9 +17,28 @@ TEST_CASE("HTTP response parser accepts split messages") {
 	CHECK(response->status_code == 200);
 	CHECK(response->content_length == 2);
 	CHECK(strcmp(response->content_type, "application/dicom+json") == 0);
+	CHECK(response->connection_reusable);
 	CHECK(memcmp(response->buffer.data, "[]", 2) == 0);
 	memrw_destroy(&response->buffer);
 	free(response);
+	http_response_parser_destroy(&parser);
+}
+
+TEST_CASE("HTTP response parser exposes server connection-close semantics") {
+	http_response_parser_t parser = {};
+	REQUIRE(http_response_parser_init(&parser, 1024));
+	const char* response =
+		"HTTP/1.1 200 OK\r\n"
+		"Content-Length: 2\r\n"
+		"Connection: close\r\n\r\n"
+		"[]";
+	REQUIRE(http_response_parser_execute(&parser, response, strlen(response)));
+	http_response_parser_finish(&parser);
+	http_response_t* parsed = http_response_parser_take_response(&parser);
+	REQUIRE(parsed != nullptr);
+	CHECK_FALSE(parsed->connection_reusable);
+	memrw_destroy(&parsed->buffer);
+	free(parsed);
 	http_response_parser_destroy(&parser);
 }
 
@@ -51,6 +70,28 @@ TEST_CASE("HTTP response parser rejects truncated messages") {
 	http_response_parser_finish(&parser);
 	CHECK(parser.error == HTTP_RESPONSE_ERROR_TRUNCATED);
 	CHECK(http_response_parser_take_response(&parser) == nullptr);
+	http_response_parser_destroy(&parser);
+}
+
+TEST_CASE("HTTP response parser accepts a connection-close delimited body") {
+	http_response_parser_t parser = {};
+	REQUIRE(http_response_parser_init(&parser, 1024));
+	const char* response =
+		"HTTP/1.1 200 OK\r\n"
+		"Connection: close\r\n"
+		"Content-Type: application/dicom+json\r\n\r\n"
+		"[{\"00080005\":{\"vr\":\"CS\"}}]";
+	REQUIRE(http_response_parser_execute(&parser, response, strlen(response)));
+	CHECK_FALSE(parser.message_complete);
+	http_response_parser_finish(&parser);
+	http_response_t* parsed = http_response_parser_take_response(&parser);
+	REQUIRE(parsed != nullptr);
+	CHECK(parsed->status_code == 200);
+	CHECK(parsed->content_length == strlen("[{\"00080005\":{\"vr\":\"CS\"}}]"));
+	CHECK(strcmp(parsed->content_type, "application/dicom+json") == 0);
+	CHECK_FALSE(parsed->connection_reusable);
+	memrw_destroy(&parsed->buffer);
+	free(parsed);
 	http_response_parser_destroy(&parser);
 }
 

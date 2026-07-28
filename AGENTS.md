@@ -63,7 +63,11 @@ The project uses CMake. Common targets include:
 - `slidescape_console`: Windows console build for command-line output.
 - `slidescape_nongui`: internal non-GUI library used by tests and shared format/core code.
 - `slidescape_tests`: doctest-based test executable registered with CTest.
-- `slideserver`: unmaintained WIP server executable, gated behind `BUILD_SLIDESERVER=ON`. Do not use this as a routine build-health check unless the task is specifically about server functionality.
+- `slidescape_archive`: early pathology-first archive service, gated behind
+  `BUILD_SLIDESCAPE_ARCHIVE=ON`. Its current loopback-only HTTP slice exposes health,
+  study/series/instance QIDO plus a Part 10 provider for instance/series metadata and
+  negotiated ordered multi-frame WADO; STOW and broader generated representations
+  remain. Build it for archive work, not as a routine viewer health check.
 - `dicom_dict_gen`: DICOM dictionary generation tool.
 
 Suggested local checks:

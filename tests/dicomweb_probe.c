@@ -33,7 +33,7 @@ static u8* read_entire_file(const char* filename, size_t* out_size) {
 
 int main(int argc, char** argv) {
 	if (argc < 3) {
-		fprintf(stderr, "Usage: %s metadata FILE | frame FILE CONTENT_TYPE\n", argv[0]);
+		fprintf(stderr, "Usage: %s metadata FILE | frame FILE CONTENT_TYPE | frames FILE CONTENT_TYPE\n", argv[0]);
 		return 2;
 	}
 	size_t size = 0;
@@ -58,6 +58,19 @@ int main(int argc, char** argv) {
 		if (dicomweb_parse_multipart_frame(data, size, argv[3], &frame)) {
 			printf("frame: %zu bytes, %s, transfer syntax %s\n", frame.size,
 			       frame.media_type, frame.transfer_syntax_uid);
+			result = 0;
+		}
+	} else if (strcmp(argv[1], "frames") == 0 && argc == 4) {
+		dicomweb_frame_t frames[64] = {0};
+		i32 count = dicomweb_parse_multipart_frames(data, size, argv[3],
+		                                            frames, COUNT(frames));
+		if (count > 0) {
+			printf("frames: %d part%s", count, count == 1 ? "" : "s");
+			for (i32 i = 0; i < count; ++i) {
+				printf("%s%u", i ? "," : " (", frames[i].frame_number);
+			}
+			printf("), %s, transfer syntax %s\n", frames[0].media_type,
+			       frames[0].transfer_syntax_uid);
 			result = 0;
 		}
 	}

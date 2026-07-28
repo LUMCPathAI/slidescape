@@ -10,7 +10,9 @@
 
 #include "dicomweb.h"
 
+#include "dicom_uid.h"
 #include "jpeg_decoder.h"
+#include "jpeg2000_decoder.h"
 #include "json.h"
 
 static void* dicomweb_json_alloc(void* userdata, size_t size) {
@@ -18,27 +20,44 @@ static void* dicomweb_json_alloc(void* userdata, size_t size) {
 	return malloc(size);
 }
 
-u8* dicomweb_decode_jpeg_frame_to_bgra(const dicomweb_instance_metadata_t* instance,
+u8* dicomweb_decode_frame_to_bgra(const dicomweb_instance_metadata_t* instance,
 		const dicomweb_frame_t* frame) {
-	if (!instance || !frame || strcmp(frame->media_type, "image/jpeg") != 0 ||
-		strcmp(frame->transfer_syntax_uid, "1.2.840.10008.1.2.4.50") != 0 ||
-		frame->size > UINT32_MAX) {
+	if (!instance || !frame || !frame->data || !frame->size || frame->size > UINT32_MAX) {
 		return NULL;
 	}
 
-	// A DICOMweb server may transcode the stored representation. The original instance's
-	// Photometric Interpretation then does not describe the returned JPEG byte stream.
-	// Let libjpeg use JFIF/Adobe markers and component sampling from the response itself.
 	i32 width = 0;
 	i32 height = 0;
-	i32 channels = 0;
-	u8* pixels = jpeg_decode_image((u8*)frame->data, (u32)frame->size,
-	                              &width, &height, &channels);
-	if (pixels && (width != instance->columns || height != instance->rows || channels != 4)) {
+	u8* pixels = NULL;
+	if (strcmp(frame->media_type, "image/jpeg") == 0 &&
+	    strcmp(frame->transfer_syntax_uid, "1.2.840.10008.1.2.4.50") == 0) {
+		/* A server may transcode the stored representation. The source Photometric
+		 * Interpretation then does not describe the returned JPEG byte stream; let
+		 * libjpeg use its JFIF/Adobe markers and component sampling. */
+		i32 channels = 0;
+		pixels = jpeg_decode_image((u8*)frame->data, (u32)frame->size,
+		                           &width, &height, &channels);
+		if (pixels && channels != 4) {
+			free(pixels);
+			pixels = NULL;
+		}
+	} else if (strcmp(frame->media_type, "image/jp2") == 0 &&
+	           (strcmp(frame->transfer_syntax_uid, "1.2.840.10008.1.2.4.90") == 0 ||
+	            strcmp(frame->transfer_syntax_uid, "1.2.840.10008.1.2.4.91") == 0)) {
+		pixels = jpeg2000_decode_image_to_bgra(frame->data, frame->size, &width, &height);
+	}
+	if (pixels && (width != instance->columns || height != instance->rows)) {
 		free(pixels);
 		pixels = NULL;
 	}
 	return pixels;
+}
+
+u8* dicomweb_decode_jpeg_frame_to_bgra(const dicomweb_instance_metadata_t* instance,
+		const dicomweb_frame_t* frame) {
+	if (!frame || strcmp(frame->media_type, "image/jpeg") != 0 ||
+	    strcmp(frame->transfer_syntax_uid, "1.2.840.10008.1.2.4.50") != 0) return NULL;
+	return dicomweb_decode_frame_to_bgra(instance, frame);
 }
 
 static struct json_value_s* object_get(struct json_object_s* object, const char* name) {
@@ -412,8 +431,24 @@ static const u8* find_bytes(const u8* haystack, size_t haystack_size,
 	return NULL;
 }
 
+static char ascii_lower(char value) {
+	return value >= 'A' && value <= 'Z' ? (char)(value + ('a' - 'A')) : value;
+}
+
+static const char* find_ascii_case_insensitive(const char* text, const char* needle) {
+	size_t needle_length = strlen(needle);
+	if (!needle_length) return text;
+	for (const char* candidate = text; *candidate; ++candidate) {
+		size_t i = 0;
+		while (i < needle_length && candidate[i] &&
+		       ascii_lower(candidate[i]) == ascii_lower(needle[i])) ++i;
+		if (i == needle_length) return candidate;
+	}
+	return NULL;
+}
+
 static bool copy_parameter(const char* text, const char* name, char* dest, size_t dest_size) {
-	const char* start = strstr(text, name);
+	const char* start = find_ascii_case_insensitive(text, name);
 	if (!start) return false;
 	start += strlen(name);
 	if (*start == '"') ++start;
@@ -426,56 +461,115 @@ static bool copy_parameter(const char* text, const char* name, char* dest, size_
 	return true;
 }
 
-bool dicomweb_parse_multipart_frame(const u8* body, size_t body_size,
-                                    const char* response_content_type,
-                                    dicomweb_frame_t* out) {
-	static const size_t max_part_header_size = KILOBYTES(16);
-	if (!body || !body_size || !response_content_type || !out) return false;
-	memset(out, 0, sizeof(*out));
-	char boundary[256];
-	if (!copy_parameter(response_content_type, "boundary=", boundary, sizeof(boundary))) return false;
-	char marker[260];
-	i32 marker_length = snprintf(marker, sizeof(marker), "--%s", boundary);
-	if (marker_length <= 2 || marker_length >= sizeof(marker)) return false;
-	const u8* part = find_bytes(body, body_size, marker, (size_t)marker_length);
-	if (!part) return false;
-	const u8* headers = part + marker_length;
-	size_t remaining = body_size - (size_t)(headers - body);
-	size_t header_search_size = MIN(remaining, max_part_header_size + 4);
-	const u8* payload = find_bytes(headers, header_search_size, "\r\n\r\n", 4);
-	if (!payload) return false;
-	payload += 4;
-	remaining = body_size - (size_t)(payload - body);
-	char end_marker[264];
-	i32 end_marker_length = snprintf(end_marker, sizeof(end_marker), "\r\n--%s", boundary);
-	const u8* end = find_bytes(payload, remaining, end_marker, (size_t)end_marker_length);
-	if (!end || end <= payload) return false;
+static bool parse_frame_number_from_location(const char* headers, u32* frame_number) {
+	const char* location = find_ascii_case_insensitive(headers, "Content-Location:");
+	if (!location) return false;
+	const char* line_end = strstr(location, "\r\n");
+	if (!line_end) line_end = location + strlen(location);
+	const char* frames = NULL;
+	for (const char* candidate = location; candidate < line_end; ++candidate) {
+		if ((size_t)(line_end - candidate) >= 8 &&
+		    strncmp(candidate, "/frames/", 8) == 0) frames = candidate + 8;
+	}
+	if (!frames || frames >= line_end) return false;
+	u64 value = 0;
+	const char* cursor = frames;
+	while (cursor < line_end && *cursor >= '0' && *cursor <= '9') {
+		value = value * 10 + (u64)(*cursor - '0');
+		if (value > UINT32_MAX) return false;
+		++cursor;
+	}
+	if (cursor == frames || cursor != line_end || value == 0) return false;
+	*frame_number = (u32)value;
+	return true;
+}
 
-	size_t header_size = (size_t)(payload - 4 - headers);
-	if (header_size > max_part_header_size) return false;
+static bool parse_multipart_part_headers(const u8* headers, size_t header_size,
+                                         dicomweb_frame_t* frame) {
 	char* header_text = (char*)malloc(header_size + 1);
 	if (!header_text) return false;
 	memcpy(header_text, headers, header_size);
 	header_text[header_size] = '\0';
-	const char* content_type = strstr(header_text, "Content-Type:");
-	if (!content_type) content_type = strstr(header_text, "content-type:");
+	const char* content_type = find_ascii_case_insensitive(header_text, "Content-Type:");
 	if (content_type) {
 		content_type += strlen("Content-Type:");
-		while (*content_type == ' ') ++content_type;
+		while (*content_type == ' ' || *content_type == '\t') ++content_type;
 		const char* media_end = content_type;
 		while (*media_end && *media_end != ';' && *media_end != '\r') ++media_end;
 		size_t length = (size_t)(media_end - content_type);
-		if (length < sizeof(out->media_type)) {
-			memcpy(out->media_type, content_type, length);
-			out->media_type[length] = '\0';
+		while (length && (content_type[length - 1] == ' ' ||
+		                  content_type[length - 1] == '\t')) --length;
+		if (length && length < sizeof(frame->media_type)) {
+			memcpy(frame->media_type, content_type, length);
+			frame->media_type[length] = '\0';
 		}
-		copy_parameter(content_type, "transfer-syntax=", out->transfer_syntax_uid,
-		               sizeof(out->transfer_syntax_uid));
+		copy_parameter(content_type, "transfer-syntax=", frame->transfer_syntax_uid,
+		               sizeof(frame->transfer_syntax_uid));
 	}
+	parse_frame_number_from_location(header_text, &frame->frame_number);
 	free(header_text);
-	out->data = payload;
-	out->size = (size_t)(end - payload);
-	return out->size > 0;
+	return frame->media_type[0] != '\0';
+}
+
+static i32 dicomweb_parse_multipart_frames_internal(const u8* body, size_t body_size,
+		const char* response_content_type, dicomweb_frame_t* out, i32 capacity,
+		bool allow_additional_parts) {
+	static const size_t max_part_header_size = KILOBYTES(16);
+	if (!body || !body_size || !response_content_type || !out || capacity <= 0) return -1;
+	memset(out, 0, (size_t)capacity * sizeof(*out));
+	char boundary[256];
+	if (!copy_parameter(response_content_type, "boundary=", boundary, sizeof(boundary))) return -1;
+	char marker[260];
+	i32 marker_length = snprintf(marker, sizeof(marker), "--%s", boundary);
+	if (marker_length <= 2 || marker_length >= sizeof(marker)) return -1;
+	const u8* part = find_bytes(body, body_size, marker, (size_t)marker_length);
+	if (!part) return -1;
+	char end_marker[264];
+	i32 end_marker_length = snprintf(end_marker, sizeof(end_marker), "\r\n--%s", boundary);
+	if (end_marker_length <= 4 || end_marker_length >= sizeof(end_marker)) return -1;
+	i32 count = 0;
+	for (;;) {
+		const u8* after_marker = part + marker_length;
+		size_t after_marker_size = body_size - (size_t)(after_marker - body);
+		if (after_marker_size >= 2 && after_marker[0] == '-' && after_marker[1] == '-') {
+			return count > 0 ? count : -1;
+		}
+		if (after_marker_size < 2 || after_marker[0] != '\r' || after_marker[1] != '\n') return -1;
+		const u8* headers = after_marker + 2;
+		size_t remaining = body_size - (size_t)(headers - body);
+		size_t header_search_size = MIN(remaining, max_part_header_size + 4);
+		const u8* payload_separator = find_bytes(headers, header_search_size, "\r\n\r\n", 4);
+		if (!payload_separator) return -1;
+		size_t header_size = (size_t)(payload_separator - headers);
+		if (header_size > max_part_header_size) return -1;
+		const u8* payload = payload_separator + 4;
+		remaining = body_size - (size_t)(payload - body);
+		const u8* next_marker = find_bytes(payload, remaining, end_marker,
+		                                  (size_t)end_marker_length);
+		if (!next_marker || next_marker <= payload) return -1;
+		if (count == capacity) return allow_additional_parts ? count : -1;
+		dicomweb_frame_t* frame = out + count;
+		if (!parse_multipart_part_headers(headers, header_size, frame)) return -1;
+		frame->data = payload;
+		frame->size = (size_t)(next_marker - payload);
+		if (!frame->size) return -1;
+		++count;
+		part = next_marker + 2;
+	}
+}
+
+bool dicomweb_parse_multipart_frame(const u8* body, size_t body_size,
+                                    const char* response_content_type,
+                                    dicomweb_frame_t* out) {
+	return dicomweb_parse_multipart_frames_internal(body, body_size, response_content_type,
+	                                                out, 1, true) == 1;
+}
+
+i32 dicomweb_parse_multipart_frames(const u8* body, size_t body_size,
+                                    const char* response_content_type,
+                                    dicomweb_frame_t* out, i32 capacity) {
+	return dicomweb_parse_multipart_frames_internal(body, body_size, response_content_type,
+	                                                out, capacity, false);
 }
 
 static bool build_path(char* dest, size_t dest_size, const char* root,
@@ -500,19 +594,30 @@ bool dicomweb_build_frame_path(char* dest, size_t dest_size,
                                const char* root, const char* study_uid,
                                const char* series_uid, const char* instance_uid,
                                u32 one_based_frame_number) {
-	if (!one_based_frame_number) return false;
-	char suffix[64];
-	snprintf(suffix, sizeof(suffix), "frames/%u", one_based_frame_number);
+	return dicomweb_build_frames_path(dest, dest_size, root, study_uid, series_uid,
+	                                  instance_uid, &one_based_frame_number, 1);
+}
+
+bool dicomweb_build_frames_path(char* dest, size_t dest_size,
+                                const char* root, const char* study_uid,
+                                const char* series_uid, const char* instance_uid,
+                                const u32* one_based_frame_numbers, i32 frame_count) {
+	if (!one_based_frame_numbers || frame_count <= 0 || frame_count > 64) return false;
+	char suffix[768];
+	size_t used = strlen("frames/");
+	memcpy(suffix, "frames/", used);
+	for (i32 i = 0; i < frame_count; ++i) {
+		if (!one_based_frame_numbers[i] || used >= sizeof(suffix)) return false;
+		i32 length = snprintf(suffix + used, sizeof(suffix) - used, "%s%u",
+		                      i ? "," : "", one_based_frame_numbers[i]);
+		if (length <= 0 || (size_t)length >= sizeof(suffix) - used) return false;
+		used += (size_t)length;
+	}
 	return build_path(dest, dest_size, root, study_uid, series_uid, instance_uid, suffix);
 }
 
 bool dicomweb_is_valid_uid(const char* value, size_t length) {
-	if (!value || !length || length > 64 || value[0] == '.' || value[length - 1] == '.') return false;
-	for (size_t i = 0; i < length; ++i) {
-		if ((value[i] < '0' || value[i] > '9') && value[i] != '.') return false;
-		if (value[i] == '.' && i > 0 && value[i - 1] == '.') return false;
-	}
-	return true;
+	return dicom_uid_is_valid_string(value, length);
 }
 
 bool dicomweb_encode_query_value(char* dest, size_t dest_size, const char* value) {

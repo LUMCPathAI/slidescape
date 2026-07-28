@@ -39,6 +39,7 @@ typedef struct http_response_t {
 	size_t content_length;
 	i32 status_code;
 	char content_type[256];
+	bool connection_reusable;
 } http_response_t;
 
 typedef struct http_response_parser_t {

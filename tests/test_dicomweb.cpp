@@ -1,8 +1,11 @@
 #include "doctest.h"
 
+#include "dicomweb_client.h"
 #include "dicomweb.h"
 #include "jpeg_decoder.h"
 #include "stringutils.h"
+#include "tile_cache.h"
+#include "tile_loader.h"
 
 #ifndef SLIDESCAPE_TEST_DICOMWEB_FIXTURE_DIR
 #define SLIDESCAPE_TEST_DICOMWEB_FIXTURE_DIR "tests/fixtures/dicomweb"
@@ -26,6 +29,19 @@ static std::string read_dicomweb_fixture(const char* filename) {
 	}
 	fclose(file);
 	return contents;
+}
+
+TEST_CASE("DICOMweb tile-cache policy enables bounded multi-frame batches") {
+	image_t image = {};
+	image.backend = IMAGE_BACKEND_DICOMWEB;
+	image.tile_cache = tile_cache_create(&image);
+	REQUIRE(image.tile_cache != nullptr);
+	CHECK(image.tile_cache->policy.batch_size == DICOMWEB_FRAME_BATCH_MAX);
+	CHECK(image.tile_cache->policy.batch_size <= TILE_LOAD_BATCH_MAX);
+	CHECK(image.tile_cache->policy.max_submit_per_tick >=
+	      image.tile_cache->policy.batch_size);
+	tile_cache_destroy(image.tile_cache);
+	image.tile_cache = nullptr;
 }
 
 TEST_CASE("DICOMweb parses WSI DICOM JSON metadata") {
@@ -88,6 +104,62 @@ TEST_CASE("DICOMweb extracts a native frame from multipart related") {
 	CHECK(strcmp(frame.transfer_syntax_uid, "1.2.840.10008.1.2.4.50") == 0);
 }
 
+TEST_CASE("DICOMweb accepts case-insensitive multipart header and parameter names") {
+	const char* content_type =
+		"Multipart/Related; type=\"image/jpeg\"; BOUNDARY=frame-boundary";
+	const char body[] =
+		"--frame-boundary\r\n"
+		"cOnTeNt-TyPe: image/jpeg; TRANSFER-SYNTAX=1.2.840.10008.1.2.4.50\r\n"
+		"\r\n"
+		"jpeg-bytes\r\n"
+		"--frame-boundary--\r\n";
+	dicomweb_frame_t frame = {};
+	REQUIRE(dicomweb_parse_multipart_frame((const u8*)body, sizeof(body) - 1,
+	                                       content_type, &frame));
+	CHECK(strcmp(frame.media_type, "image/jpeg") == 0);
+	CHECK(strcmp(frame.transfer_syntax_uid, "1.2.840.10008.1.2.4.50") == 0);
+}
+
+TEST_CASE("DICOMweb parses ordered multi-frame parts and Content-Location") {
+	const char* content_type =
+		"multipart/related; transfer-syntax=1.2.840.10008.1.2.4.50;"
+		"type=\"image/jpeg\"; boundary=frame-boundary";
+	const char body[] =
+		"--frame-boundary\r\n"
+		"Content-Location: http://archive/dicom-web/instances/1/frames/3\r\n"
+		"Content-Type: image/jpeg; transfer-syntax=1.2.840.10008.1.2.4.50\r\n\r\n"
+		"frame-three\r\n"
+		"--frame-boundary\r\n"
+		"Content-Type: image/jpeg; transfer-syntax=1.2.840.10008.1.2.4.50\r\n"
+		"Content-Location: /dicom-web/instances/1/frames/1\r\n\r\n"
+		"frame-one\r\n"
+		"--frame-boundary\r\n"
+		"Content-Location: /dicom-web/instances/1/frames/2\r\n"
+		"Content-Type: image/jpeg;transfer-syntax=1.2.840.10008.1.2.4.50\r\n\r\n"
+		"frame-two\r\n"
+		"--frame-boundary--\r\n";
+	dicomweb_frame_t frames[3] = {};
+	REQUIRE(dicomweb_parse_multipart_frames((const u8*)body, sizeof(body) - 1,
+	                                        content_type, frames, COUNT(frames)) == 3);
+	CHECK(frames[0].frame_number == 3);
+	CHECK(frames[1].frame_number == 1);
+	CHECK(frames[2].frame_number == 2);
+	CHECK(frames[0].size == strlen("frame-three"));
+	CHECK(frames[1].size == strlen("frame-one"));
+	CHECK(frames[2].size == strlen("frame-two"));
+	CHECK(memcmp(frames[0].data, "frame-three", frames[0].size) == 0);
+	CHECK(memcmp(frames[1].data, "frame-one", frames[1].size) == 0);
+	CHECK(memcmp(frames[2].data, "frame-two", frames[2].size) == 0);
+	dicomweb_frame_t insufficient[2] = {};
+	CHECK(dicomweb_parse_multipart_frames((const u8*)body, sizeof(body) - 1,
+	                                      content_type, insufficient,
+	                                      COUNT(insufficient)) == -1);
+	dicomweb_frame_t first = {};
+	REQUIRE(dicomweb_parse_multipart_frame((const u8*)body, sizeof(body) - 1,
+	                                       content_type, &first));
+	CHECK(first.frame_number == 3);
+}
+
 TEST_CASE("DICOMweb decodes transcoded JPEG using its embedded color space") {
 	const i32 width = 16;
 	const i32 height = 16;
@@ -144,6 +216,12 @@ TEST_CASE("DICOMweb builds portable WADO-RS paths") {
 	REQUIRE(dicomweb_build_frame_path(path, sizeof(path), "/dicom-web/",
 	                                  "study", "series", "instance", 17));
 	CHECK(strcmp(path, "/dicom-web/studies/study/series/series/instances/instance/frames/17") == 0);
+	u32 frames[] = {3, 1, 2};
+	REQUIRE(dicomweb_build_frames_path(path, sizeof(path), "/dicom-web/",
+	                                   "study", "series", "instance",
+	                                   frames, COUNT(frames)));
+	CHECK(strcmp(path,
+	             "/dicom-web/studies/study/series/series/instances/instance/frames/3,1,2") == 0);
 	CHECK_FALSE(dicomweb_build_frame_path(path, sizeof(path), "/dicom-web/",
 	                                      "study", "series", "instance", 0));
 }
@@ -176,6 +254,7 @@ TEST_CASE("DICOMweb validates UID syntax") {
 	CHECK_FALSE(dicomweb_is_valid_uid("", 0));
 	CHECK_FALSE(dicomweb_is_valid_uid(".1.2", 4));
 	CHECK_FALSE(dicomweb_is_valid_uid("1..2", 4));
+	CHECK_FALSE(dicomweb_is_valid_uid("1.02.3", 6));
 	CHECK_FALSE(dicomweb_is_valid_uid("1.2\r\nX-Test:1", strlen("1.2\r\nX-Test:1")));
 }
 

@@ -1504,10 +1504,19 @@ void mrxs_destroy(mrxs_t* mrxs) {
 		free(mrxs->dat_filenames);
 	}
 	if (mrxs->hier) {
+		for (i32 i = 0; i < mrxs->hier_count; ++i) {
+			free(mrxs->hier[i].val);
+		}
 		free(mrxs->hier);
 	}
 	if (mrxs->nonhier) {
+		for (i32 i = 0; i < mrxs->nonhier_count; ++i) {
+			free(mrxs->nonhier[i].val);
+		}
 		free(mrxs->nonhier);
+	}
+	for (i32 i = 0; i < COUNT(mrxs->levels); ++i) {
+		free(mrxs->levels[i].tiles);
 	}
     if (mrxs->camera_positions) {
         libc_free(mrxs->camera_positions);

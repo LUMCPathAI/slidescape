@@ -33,6 +33,25 @@ typedef struct dicomweb_worker_connection_t {
 
 static THREAD_LOCAL dicomweb_worker_connection_t dicomweb_worker_connection;
 
+typedef struct dicomweb_tile_stats_t {
+	volatile i32 request_count;
+	volatile i32 single_request_count;
+	volatile i32 multi_request_count;
+	volatile i32 batch_size_2_count;
+	volatile i32 batch_size_3_count;
+	volatile i32 batch_size_4_count;
+	volatile i32 requested_frame_count;
+	volatile i32 decoded_frame_count;
+	volatile i32 failed_request_count;
+	volatile i32 fallback_request_count;
+	volatile i32 fallback_multipart_count;
+	volatile i32 fallback_mapping_count;
+	volatile i32 fallback_decode_count;
+	volatile i32 request_latency_ms;
+} dicomweb_tile_stats_t;
+
+static dicomweb_tile_stats_t dicomweb_tile_stats;
+
 #define DICOMWEB_ASYNC_COMPLETION_RESULT 0x4449434fu
 #define DICOMWEB_MAX_JSON_RESPONSE_SIZE MEGABYTES(256)
 #define DICOMWEB_MAX_FRAME_RESPONSE_SIZE MEGABYTES(64)
@@ -43,6 +62,69 @@ static THREAD_LOCAL dicomweb_worker_connection_t dicomweb_worker_connection;
 	"?includefield=00080016&includefield=00080008&includefield=00200013" \
 	"&includefield=00280008&includefield=00209161&includefield=00209162" \
 	"&includefield=00209163&includefield=00480006&includefield=00480007"
+
+static i32 dicomweb_elapsed_milliseconds(i64 start_clock) {
+	float milliseconds = get_seconds_elapsed(start_clock, get_clock()) * 1000.0f;
+	return milliseconds > 0.0f ? (i32)(milliseconds + 0.5f) : 0;
+}
+
+void dicomweb_print_tile_stats(void) {
+	i32 request_count = dicomweb_tile_stats.request_count;
+	i32 fallback_count = dicomweb_tile_stats.fallback_request_count +
+	                     dicomweb_tile_stats.fallback_multipart_count +
+	                     dicomweb_tile_stats.fallback_mapping_count +
+	                     dicomweb_tile_stats.fallback_decode_count;
+	float average_latency = request_count > 0
+		? (float)dicomweb_tile_stats.request_latency_ms / (float)request_count : 0.0f;
+	console_print_verbose(
+		"DICOMweb tile stats: requests=%d (single=%d, multi=%d; batch 2/3/4=%d/%d/%d), "
+		"frame requests=%d, decoded=%d, failed requests=%d, "
+		"fallbacks=%d (request=%d, multipart=%d, mapping=%d, decode=%d), "
+		"average request=%.1f ms\n",
+		request_count, dicomweb_tile_stats.single_request_count,
+		dicomweb_tile_stats.multi_request_count,
+		dicomweb_tile_stats.batch_size_2_count,
+		dicomweb_tile_stats.batch_size_3_count,
+		dicomweb_tile_stats.batch_size_4_count,
+		dicomweb_tile_stats.requested_frame_count,
+		dicomweb_tile_stats.decoded_frame_count,
+		dicomweb_tile_stats.failed_request_count, fallback_count,
+		dicomweb_tile_stats.fallback_request_count,
+		dicomweb_tile_stats.fallback_multipart_count,
+		dicomweb_tile_stats.fallback_mapping_count,
+		dicomweb_tile_stats.fallback_decode_count, average_latency);
+}
+
+static void dicomweb_record_tile_request(i32 frame_count, i32 decoded_count,
+		bool request_failed, i32 latency_ms, i32 fallback_request_count,
+		i32 fallback_multipart_count, i32 fallback_mapping_count,
+		i32 fallback_decode_count) {
+	bool first_multi_request = false;
+	if (frame_count > 1) {
+		first_multi_request = atomic_increment(&dicomweb_tile_stats.multi_request_count) == 1;
+		switch (frame_count) {
+			case 2: atomic_increment(&dicomweb_tile_stats.batch_size_2_count); break;
+			case 3: atomic_increment(&dicomweb_tile_stats.batch_size_3_count); break;
+			case 4: atomic_increment(&dicomweb_tile_stats.batch_size_4_count); break;
+		}
+	} else {
+		atomic_increment(&dicomweb_tile_stats.single_request_count);
+	}
+	atomic_add(&dicomweb_tile_stats.requested_frame_count, frame_count);
+	atomic_add(&dicomweb_tile_stats.decoded_frame_count, decoded_count);
+	if (request_failed) atomic_increment(&dicomweb_tile_stats.failed_request_count);
+	atomic_add(&dicomweb_tile_stats.fallback_request_count, fallback_request_count);
+	atomic_add(&dicomweb_tile_stats.fallback_multipart_count, fallback_multipart_count);
+	atomic_add(&dicomweb_tile_stats.fallback_mapping_count, fallback_mapping_count);
+	atomic_add(&dicomweb_tile_stats.fallback_decode_count, fallback_decode_count);
+	atomic_add(&dicomweb_tile_stats.request_latency_ms, latency_ms);
+	i32 request_count = atomic_increment(&dicomweb_tile_stats.request_count);
+	if (request_count == 1 || first_multi_request || request_count % 16 == 0 ||
+	    fallback_request_count || fallback_multipart_count ||
+	    fallback_mapping_count || fallback_decode_count) {
+		dicomweb_print_tile_stats();
+	}
+}
 
 typedef struct dicomweb_async_task_t {
 	dicomweb_async_context_t* context;
@@ -327,7 +409,16 @@ static http_response_t* dicomweb_get_with_options(
 				connection, remote->hostname, path, accept,
 				remote->authorization_header, false, &effective_options);
 			if (response) {
-				dicomweb_worker_connection.last_used_clock = get_clock();
+				if (response->connection_reusable) {
+					dicomweb_worker_connection.last_used_clock = get_clock();
+				} else {
+					/*
+					 * The peer may legally close an HTTP/1.1 connection even though
+					 * this request asked for keep-alive. Do not leave that socket in
+					 * the worker cache for the next tile request.
+					 */
+					drop_worker_connection();
+				}
 				if (caller_error) *caller_error = dicomweb_last_transport_error;
 				return response;
 			}
@@ -584,6 +675,11 @@ static void dicomweb_async_task_func(i32 logical_thread_index, void* userdata) {
 	}
 
 complete:
+	if (result->succeeded) {
+		console_print("%s\n", result->message);
+	} else {
+		console_print_error("%s\n", result->message);
+	}
 	memset(task->password, 0, sizeof(task->password));
 	if (!completion_queue_post(&task->context->completions,
 	                           DICOMWEB_ASYNC_COMPLETION_RESULT,
@@ -1119,6 +1215,7 @@ static bool dicomweb_open_configured_series(app_state_t* app_state,
 		remote, NULL, message, sizeof(message));
 	if (!image) {
 		set_status("%s", message);
+		console_print_error("%s\n", message);
 		return false;
 	}
 	image->resource_id = global_next_resource_id++;
@@ -1126,6 +1223,7 @@ static bool dicomweb_open_configured_series(app_state_t* app_state,
 	add_image(app_state, image, true, false);
 	if (image->dicomweb.available_series_count > 1) show_dicom_slides_window = true;
 	set_status("%s", message);
+	console_print("%s\n", message);
 	return true;
 }
 
@@ -1167,28 +1265,144 @@ bool dicomweb_open_related_series(app_state_t* app_state, const image_t* current
 static u8* retrieve_frame_pixels(const dicomweb_remote_image_t* remote,
                                  i32 instance_index, u32 frame_number) {
 	if (instance_index < 0 || instance_index >= remote->instance_count) return NULL;
+	i64 request_start = get_clock();
 	const dicomweb_instance_metadata_t* instance = remote->instances + instance_index;
 	char path[1400];
 	if (!dicomweb_build_frame_path(path, sizeof(path), remote->root,
 	                               instance->study_instance_uid,
 	                               instance->series_instance_uid,
-	                               instance->sop_instance_uid, frame_number)) return NULL;
+	                               instance->sop_instance_uid, frame_number)) {
+		dicomweb_record_tile_request(1, 0, true,
+		                             dicomweb_elapsed_milliseconds(request_start),
+		                             0, 0, 0, 0);
+		return NULL;
+	}
+	/* Advertise only compressed transfer syntaxes the viewer can decode locally. The
+	 * Slidescape archive selects the published/stored syntax and never transcodes. */
 	http_response_t* response = dicomweb_get(
 		remote, path,
-		"multipart/related; type=\"image/jpeg\"; transfer-syntax=1.2.840.10008.1.2.4.50",
+		"multipart/related; type=\"image/jpeg\"; transfer-syntax=1.2.840.10008.1.2.4.50, "
+		"multipart/related; type=\"image/jp2\"; transfer-syntax=1.2.840.10008.1.2.4.90, "
+		"multipart/related; type=\"image/jp2\"; transfer-syntax=1.2.840.10008.1.2.4.91",
 		true);
 	if (!response || response->status_code != 200) {
 		if (response) http_response_destroy(response);
+		dicomweb_record_tile_request(1, 0, true,
+		                             dicomweb_elapsed_milliseconds(request_start),
+		                             0, 0, 0, 0);
 		return NULL;
 	}
 	dicomweb_frame_t frame = {0};
 	u8* pixels = NULL;
 	if (dicomweb_parse_multipart_frame(response->buffer.data, response->content_length,
 	                                   response->content_type, &frame)) {
-		pixels = dicomweb_decode_jpeg_frame_to_bgra(instance, &frame);
+		pixels = dicomweb_decode_frame_to_bgra(instance, &frame);
 	}
 	http_response_destroy(response);
+	dicomweb_record_tile_request(1, pixels ? 1 : 0, false,
+	                             dicomweb_elapsed_milliseconds(request_start),
+	                             0, 0, 0, 0);
 	return pixels;
+}
+
+static i32 retrieve_frame_pixels_batch(const dicomweb_remote_image_t* remote,
+		i32 instance_index, const u32* frame_numbers, i32 frame_count, u8** pixels) {
+	if (!remote || !frame_numbers || !pixels || frame_count <= 1 ||
+	    frame_count > DICOMWEB_FRAME_BATCH_MAX ||
+	    instance_index < 0 || instance_index >= remote->instance_count) return 0;
+	i64 request_start = get_clock();
+	const dicomweb_instance_metadata_t* instance = remote->instances + instance_index;
+	char path[1600];
+	if (!dicomweb_build_frames_path(path, sizeof(path), remote->root,
+	                                instance->study_instance_uid,
+	                                instance->series_instance_uid,
+	                                instance->sop_instance_uid,
+	                                frame_numbers, frame_count)) {
+		dicomweb_record_tile_request(frame_count, 0, true,
+		                             dicomweb_elapsed_milliseconds(request_start),
+		                             frame_count, 0, 0, 0);
+		return 0;
+	}
+	http_response_t* response = dicomweb_get(
+		remote, path,
+		"multipart/related; type=\"image/jpeg\"; transfer-syntax=1.2.840.10008.1.2.4.50, "
+		"multipart/related; type=\"image/jp2\"; transfer-syntax=1.2.840.10008.1.2.4.90, "
+		"multipart/related; type=\"image/jp2\"; transfer-syntax=1.2.840.10008.1.2.4.91",
+		true);
+	if (!response || response->status_code != 200) {
+		if (response) http_response_destroy(response);
+		dicomweb_record_tile_request(frame_count, 0, true,
+		                             dicomweb_elapsed_milliseconds(request_start),
+		                             frame_count, 0, 0, 0);
+		return 0;
+	}
+	dicomweb_frame_t frames[DICOMWEB_FRAME_BATCH_MAX] = {0};
+	i32 parsed_count = dicomweb_parse_multipart_frames(
+		response->buffer.data, response->content_length, response->content_type,
+		frames, frame_count);
+	i32 decoded_count = 0;
+	i32 fallback_multipart_count = 0;
+	i32 fallback_mapping_count = 0;
+	i32 fallback_decode_count = 0;
+	if (parsed_count == frame_count) {
+		bool consumed[DICOMWEB_FRAME_BATCH_MAX] = {0};
+		bool has_frame_locations = false;
+		for (i32 part_index = 0; part_index < parsed_count; ++part_index) {
+			if (frames[part_index].frame_number) {
+				has_frame_locations = true;
+				break;
+			}
+		}
+		for (i32 requested_index = 0; requested_index < frame_count; ++requested_index) {
+			i32 match = -1;
+			for (i32 part_index = 0; part_index < parsed_count; ++part_index) {
+				if (!consumed[part_index] &&
+				    frames[part_index].frame_number == frame_numbers[requested_index]) {
+					match = part_index;
+					break;
+				}
+			}
+			/* Content-Location is mandatory for these parts, but preserve response-order
+			 * compatibility with older servers that omit it. */
+			if (match < 0 && !has_frame_locations &&
+			    !consumed[requested_index]) match = requested_index;
+			if (match >= 0) {
+				consumed[match] = true;
+				pixels[requested_index] = dicomweb_decode_frame_to_bgra(instance, frames + match);
+				if (pixels[requested_index]) {
+					++decoded_count;
+				} else {
+					++fallback_decode_count;
+				}
+			} else {
+				++fallback_mapping_count;
+			}
+		}
+	} else {
+		fallback_multipart_count = frame_count;
+	}
+	http_response_destroy(response);
+	dicomweb_record_tile_request(frame_count, decoded_count, false,
+	                             dicomweb_elapsed_milliseconds(request_start),
+	                             0, fallback_multipart_count,
+	                             fallback_mapping_count, fallback_decode_count);
+	return decoded_count;
+}
+
+static void post_dicomweb_tile_result(image_t* image, const load_tile_task_t* task,
+		const level_image_t* level, u32 frame_number, u8* pixels) {
+	tile_cache_result_t result = {0};
+	result.resource_id = task->resource_id;
+	result.pixel_memory = pixels;
+	result.tile_width = level->tile_width;
+	result.tile_height = level->tile_height;
+	result.level = task->level;
+	result.tile_index = task->tile_index;
+	result.want_gpu_residency = task->need_gpu_residency;
+	result.want_cpu_residency = task->need_cpu_residency;
+	result.failed = frame_number != 0 && pixels == NULL;
+	result.is_empty = frame_number == 0;
+	if (!tile_cache_post_load_result(image, &result) && pixels) free(pixels);
 }
 
 void dicomweb_load_tile_batch_func(i32 logical_thread_index, void* userdata) {
@@ -1217,20 +1431,52 @@ void dicomweb_load_tile_batch_func(i32 logical_thread_index, void* userdata) {
 			image->dicomweb.instances + level->pyramid_image_index;
 		u32 frame_number = task->tile_index < instance->frame_map_count
 		                   ? instance->frame_numbers[task->tile_index] : 0;
-		u8* pixels = frame_number ? retrieve_frame_pixels(
-			&image->dicomweb, level->pyramid_image_index, frame_number) : NULL;
-		tile_cache_result_t result = {0};
-		result.resource_id = task->resource_id;
-		result.pixel_memory = pixels;
-		result.tile_width = level->tile_width;
-		result.tile_height = level->tile_height;
-		result.level = task->level;
-		result.tile_index = task->tile_index;
-		result.want_gpu_residency = task->need_gpu_residency;
-		result.want_cpu_residency = task->need_cpu_residency;
-		result.failed = frame_number != 0 && pixels == NULL;
-		result.is_empty = frame_number == 0;
-		if (!tile_cache_post_load_result(image, &result) && pixels) free(pixels);
+		if (!frame_number) {
+			post_dicomweb_tile_result(image, task, level, 0, NULL);
+			continue;
+		}
+
+		load_tile_task_t* grouped_tasks[DICOMWEB_FRAME_BATCH_MAX] = {task};
+		level_image_t* grouped_levels[DICOMWEB_FRAME_BATCH_MAX] = {level};
+		u32 grouped_frames[DICOMWEB_FRAME_BATCH_MAX] = {frame_number};
+		u8* grouped_pixels[DICOMWEB_FRAME_BATCH_MAX] = {0};
+		i32 group_count = 1;
+		for (i32 candidate_index = i + 1;
+		     candidate_index < batch->task_count && group_count < DICOMWEB_FRAME_BATCH_MAX;
+		     ++candidate_index) {
+			load_tile_task_t* candidate = batch->tile_tasks + candidate_index;
+			if (candidate->may_discard_if_stale &&
+			    tile_cache_task_is_stale(image, candidate->level, candidate->tile_index,
+			                             candidate->generation)) break;
+			level_image_t* candidate_level = image->level_images + candidate->level;
+			if (candidate_level->pyramid_image_index != level->pyramid_image_index) break;
+			const dicomweb_instance_metadata_t* candidate_instance =
+				image->dicomweb.instances + candidate_level->pyramid_image_index;
+			u32 candidate_frame =
+				candidate->tile_index < candidate_instance->frame_map_count
+				? candidate_instance->frame_numbers[candidate->tile_index] : 0;
+			if (!candidate_frame) break;
+			grouped_tasks[group_count] = candidate;
+			grouped_levels[group_count] = candidate_level;
+			grouped_frames[group_count++] = candidate_frame;
+		}
+
+		if (group_count > 1) {
+			retrieve_frame_pixels_batch(&image->dicomweb, level->pyramid_image_index,
+			                            grouped_frames, group_count, grouped_pixels);
+		}
+		for (i32 group_index = 0; group_index < group_count; ++group_index) {
+			if (!grouped_pixels[group_index]) {
+				grouped_pixels[group_index] = retrieve_frame_pixels(
+					&image->dicomweb, level->pyramid_image_index,
+					grouped_frames[group_index]);
+			}
+			post_dicomweb_tile_result(image, grouped_tasks[group_index],
+			                          grouped_levels[group_index],
+			                          grouped_frames[group_index],
+			                          grouped_pixels[group_index]);
+		}
+		i += group_count - 1;
 	}
 	atomic_subtract(&image->refcount, refcount_decrement);
 }

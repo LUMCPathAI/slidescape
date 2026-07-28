@@ -9,7 +9,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 message(STATUS "CMAKE_BUILD_TYPE = ${CMAKE_BUILD_TYPE}")
 
-option(BUILD_SLIDESERVER "Build the experimental slideserver executable" OFF)
+option(BUILD_SLIDESCAPE_ARCHIVE "Build the pathology-first archive service" OFF)
 option(USE_JPEG_SIMD "Use SIMD code for libjpeg-turbo" ON)
 option(USE_ADDRESS_SANITIZER "Use address sanitizer" OFF)
 
@@ -336,6 +336,7 @@ set(SLIDESCAPE_NONGUI_BASE_FILES
         src/tiff/tif_lzw.c
         src/dicom/dicom.c
         src/dicom/dicom_dict.c
+        src/dicom/dicom_uid.c
         src/dicom/dicomweb.c
         src/dicom/dicom_wsi.c
         src/isyntax/isyntax.c
@@ -528,7 +529,7 @@ target_compile_definitions(slidescape PRIVATE IS_SERVER=0)
 
 
 # Separately compiled tools:
-# slideserver    - server application for streaming WSIs, currently only TIFF format [WIP]
+# slidescape_archive - standalone pathology-first archive service [early development]
 # dicom_dict_gen - tool for generating a DICOM dictionary (dicom_dict.h and dicom_dict.c) by parsing the DICOM standard.
 
 # Some files are always required for the separately compiled tools
@@ -541,24 +542,47 @@ else()
     list(APPEND BASE_FILES src/platform/linux_utils.c)
 endif()
 
-if (BUILD_SLIDESERVER)
-    set(SERVER_SOURCE_FILES
-            ${BASE_FILES}
-            src/server.c
-            src/tiff/tiff.c
-            src/utils/jpeg_decoder.c
-            src/utils/stringutils.c
-            src/utils/memrw.c
-            src/third_party/lz4.c
-            src/third_party/ltalloc.cc
-            )
-    add_executable(slideserver ${SERVER_SOURCE_FILES} ${JPEG_SOURCE_FILES} ${MBEDTLS_SOURCE_FILES})
-    target_compile_definitions(slideserver PRIVATE IS_SERVER=1)
+add_library(slidescape_sqlite STATIC src/third_party/sqlite3.c)
+target_include_directories(slidescape_sqlite PUBLIC src/third_party)
+target_compile_definitions(slidescape_sqlite PRIVATE
+        SQLITE_DEFAULT_FOREIGN_KEYS=1
+        SQLITE_DQS=0
+        SQLITE_OMIT_LOAD_EXTENSION=1
+        SQLITE_THREADSAFE=1
+)
 
+set(SLIDESCAPE_ARCHIVE_CORE_FILES
+        src/archive/archive_database.c
+        src/archive/archive_frame_map.c
+        src/archive/archive_object.c
+        src/archive/archive_repository.c
+        src/archive/archive_routes.c
+        src/archive/archive_sha256.c
+        src/archive/archive_shell.c
+        src/archive/archive_shell_recipe.c
+        src/archive/archive_index.c
+        src/archive/archive_ingest.c
+        src/archive/archive_manifest.c
+        src/archive/archive_mrxs_adapter.c
+        src/archive/archive_representation.c
+        src/archive/archive_instance_provider.c
+        src/dicom/dicom_uid.c
+)
+add_library(slidescape_archive_core STATIC ${SLIDESCAPE_ARCHIVE_CORE_FILES})
+target_include_directories(slidescape_archive_core PUBLIC src/archive)
+target_compile_definitions(slidescape_archive_core PRIVATE IS_SERVER=1)
+target_link_libraries(slidescape_archive_core PRIVATE slidescape_sqlite)
+
+if (BUILD_SLIDESCAPE_ARCHIVE)
+    add_executable(slidescape_archive
+            src/archive/archive_main.c
+            src/archive/archive_http.c
+            src/archive/archive_support.c
+            )
+    target_compile_definitions(slidescape_archive PRIVATE IS_SERVER=1)
+    target_link_libraries(slidescape_archive PRIVATE slidescape_archive_core slidescape_nongui slidescape_jpeg)
     if (WIN32)
-        target_link_libraries(slideserver ws2_32 pthread)
-    else()
-        target_link_libraries(slideserver pthread m)
+        target_link_libraries(slidescape_archive PRIVATE ws2_32)
     endif()
 endif()
 

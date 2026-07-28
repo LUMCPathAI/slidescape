@@ -17,6 +17,7 @@
 */
 
 #include "common.h"
+#include "dicomweb_client.h"
 #include "platform.h"
 #include "stringutils.h"
 #include "gui.h"
@@ -146,6 +147,8 @@ void console_execute_command(app_state_t* app_state, const char* command) {
 			}
 		} else if (strcmp(cmd, "clear") == 0) {
 			console_clear_log();
+		} else if (strcmp(cmd, "dicomweb-stats") == 0) {
+			dicomweb_print_tile_stats();
 		} else if (strcmp(cmd, "wsi") == 0) {
 			app_state->scene.draw_wsi_image = !app_state->scene.draw_wsi_image;
 			if (app_state->scene.draw_wsi_image) {

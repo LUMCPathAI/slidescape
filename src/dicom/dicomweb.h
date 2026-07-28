@@ -41,6 +41,7 @@ typedef struct dicomweb_frame_t {
 	size_t size;
 	char media_type[64];
 	char transfer_syntax_uid[65];
+	u32 frame_number;
 } dicomweb_frame_t;
 
 typedef struct dicomweb_instance_ref_t {
@@ -112,7 +113,14 @@ i32 dicomweb_count_series_refs(const char* json, size_t json_size);
 bool dicomweb_parse_multipart_frame(const u8* body, size_t body_size,
                                     const char* response_content_type,
                                     dicomweb_frame_t* out);
+i32 dicomweb_parse_multipart_frames(const u8* body, size_t body_size,
+                                    const char* response_content_type,
+                                    dicomweb_frame_t* out, i32 capacity);
 u8* dicomweb_decode_jpeg_frame_to_bgra(const dicomweb_instance_metadata_t* instance,
+		const dicomweb_frame_t* frame);
+/* Decode a native DICOMweb frame response. JPEG Baseline and JPEG 2000 transfer
+ * syntaxes are currently supported; the returned BGRA buffer is caller-owned. */
+u8* dicomweb_decode_frame_to_bgra(const dicomweb_instance_metadata_t* instance,
 		const dicomweb_frame_t* frame);
 bool dicomweb_build_instance_metadata_path(char* dest, size_t dest_size,
                                            const char* root,
@@ -125,6 +133,13 @@ bool dicomweb_build_frame_path(char* dest, size_t dest_size,
                                const char* series_uid,
                                const char* instance_uid,
                                u32 one_based_frame_number);
+bool dicomweb_build_frames_path(char* dest, size_t dest_size,
+                                const char* root,
+                                const char* study_uid,
+                                const char* series_uid,
+                                const char* instance_uid,
+                                const u32* one_based_frame_numbers,
+                                i32 frame_count);
 bool dicomweb_resolve_series_url(char* dest, size_t dest_size, const char* url);
 bool dicomweb_is_valid_uid(const char* value, size_t length);
 bool dicomweb_encode_query_value(char* dest, size_t dest_size,
