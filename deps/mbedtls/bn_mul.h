@@ -44,7 +44,12 @@
 
 #include "mbedtls/bignum.h"
 
-#if defined(MBEDTLS_HAVE_ASM)
+/*
+ * The AArch64 multiply-accumulate assembly in this vendored Mbed TLS release
+ * produces incorrect RSA verification results on Apple Silicon. Use the
+ * portable C implementation there; retain assembly on the other platforms.
+ */
+#if defined(MBEDTLS_HAVE_ASM) && !(defined(__APPLE__) && defined(__aarch64__))
 
 #ifndef asm
 #define asm __asm
