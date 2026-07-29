@@ -87,6 +87,25 @@ $env:PATH="$clion\bin\mingw\bin;" + $env:PATH
 
 Even when invoking the full `cmake.exe` path from `CMakeCache.txt`, prepend CLion's `bin\mingw\bin` directory to `PATH` first. The compiler may otherwise start but fail to launch helper programs such as `cc1.exe`, causing Ninja to report `FAILED: [code=1]` with no useful compiler diagnostic.
 
+### Temporary Codex-on-Windows build workaround
+
+Pending a proper fix in the Codex Windows sandbox/process runner, sandboxed Ninja builds may hang after a compiler child has exited. Ninja 1.13.2 captures each command's output through an inheritable named pipe and waits for pipe completion using `GetQueuedCompletionStatus()`. In affected Codex sessions, the compiler produces its object file and exits, but the pipe completion never arrives. Ninja remains alive and idle, and does not update `.ninja_deps` or `.ninja_log` or proceed to linking. Running the same Ninja command outside the agent sandbox completes normally. This is not a Slidescape CMake issue, and invoking Ninja directly inside the sandbox is not sufficient.
+
+- Run builds outside the agent sandbox using the shell tool's escalation mechanism (`sandbox_permissions: "require_escalated"`), with the exact cached Ninja executable as a narrowly scoped approval prefix. Prepend the directory containing the cached MinGW compiler to `PATH` first.
+- Use one build invocation with a generous timeout. The build is expected to finish in well under a minute, often only a couple of seconds (depending on caches). If it appears stuck, do not start an overlapping CMake or Ninja retry.
+- Before retrying, inspect the object file, `.ninja_deps`, `.ninja_log`, target executable timestamps, and `ninja -n <target>`. A new object with unchanged Ninja metadata and executable indicates the known post-compile pipe hang; an updated executable plus `ninja -n` reporting no work indicates the build completed.
+- A stuck Ninja process typically remains at near-zero CPU with no compiler child. If deeper diagnosis is necessary, its main thread will be waiting in `GetQueuedCompletionStatus()`, and a named pipe such as `\\.\pipe\ninja_pid<PID>_sp...` will remain open.
+- Clean up only exact Ninja PIDs known to have been launched by the current agent attempt. Do not kill all `ninja.exe` or `cmake.exe` processes: the user may be building from CLion at the same time. If ownership cannot be established, ask the user before terminating anything.
+- Report IDE confirmation as the verification source rather than attributing an updated executable to the agent when builds overlapped.
+
+Typical direct-Ninja command, to be executed with outside-sandbox approval:
+
+```powershell
+$clion = '<path-to-CLion-install>'
+$env:PATH="$clion\bin\mingw\bin;" + $env:PATH
+& "$clion\bin\ninja\win\x64\ninja.exe" -C cmake-build-debug slidescape
+```
+
 If a build directory does not exist, configure one first:
 
 ```sh

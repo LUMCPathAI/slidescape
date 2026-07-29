@@ -242,6 +242,12 @@ ImDrawData* gui_get_merged_extra_drawlists_data(ImGuiViewport* viewport, ImVec2 
 				merged_drawlist->CmdBuffer.push_back(cmd);
 			}
 		}
+		// The buffers were populated directly rather than through PrimReserve().
+		// Restore the write cursors expected by ImDrawData::AddDrawList().
+		merged_drawlist->_VtxWritePtr = merged_drawlist->VtxBuffer.Size > 0
+		                                ? merged_drawlist->VtxBuffer.Data + merged_drawlist->VtxBuffer.Size : NULL;
+		merged_drawlist->_IdxWritePtr = merged_drawlist->IdxBuffer.Size > 0
+		                                ? merged_drawlist->IdxBuffer.Data + merged_drawlist->IdxBuffer.Size : NULL;
 		merged_generation = global_extra_drawlists_generation;
 	}
 
