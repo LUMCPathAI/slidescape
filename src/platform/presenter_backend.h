@@ -29,6 +29,7 @@ typedef struct presenter_backend_t {
 	void (*init_imgui)(app_state_t* app_state, window_handle_t window);
 	void (*imgui_new_frame)();
 	void (*render_imgui_draw_data)(ImDrawData* draw_data);
+	bool (*render_cached_imgui_draw_data)(ImDrawData* draw_data, u32 generation);
 	void (*set_swap_interval)(int interval);
 	int (*get_refresh_rate)(window_handle_t window, void* present_handle);
 	void (*get_drawable_size)(window_handle_t window, i32* out_width, i32* out_height);

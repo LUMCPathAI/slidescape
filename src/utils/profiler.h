@@ -38,6 +38,9 @@ extern "C" {
 	X(SCENE_RENDER, "Scene Render") \
 	X(GUI_DRAW, "GUI Draw") \
 	X(IMGUI_RENDER, "ImGui Render") \
+	X(IMGUI_BUILD, "ImGui Build") \
+	X(IMGUI_EXTRA_RENDER, "ImGui Extra Render") \
+	X(IMGUI_MAIN_RENDER, "ImGui Main Render") \
 	X(PRESENT, "Present")
 
 typedef enum profiler_section_enum {

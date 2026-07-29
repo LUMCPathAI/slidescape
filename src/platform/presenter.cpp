@@ -73,6 +73,15 @@ void presenter_render_imgui_draw_data(struct ImDrawData *draw_data) {
 	presenter.backend.render_imgui_draw_data(draw_data);
 }
 
+void presenter_render_cached_imgui_draw_data(struct ImDrawData *draw_data, u32 generation) {
+	if (presenter.backend.render_cached_imgui_draw_data) {
+		if (presenter.backend.render_cached_imgui_draw_data(draw_data, generation)) {
+			return;
+		}
+	}
+	presenter.backend.render_imgui_draw_data(draw_data);
+}
+
 void presenter_set_swap_interval(int interval) {
 	presenter.backend.set_swap_interval(interval);
 }

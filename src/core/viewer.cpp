@@ -1315,10 +1315,12 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 
 			// Zoom out using Z or / or controller button B
 			bool zoom_out_button_held = input->controllers[0].button_b.down ||
-			                            (!gui_want_capture_keyboard && (is_key_down(input, KEY_Z) || is_key_down(input, KEY_Slash)));
+			                            (!gui_want_capture_keyboard && !input->keyboard.key_ctrl.down &&
+			                             (is_key_down(input, KEY_Z) || is_key_down(input, KEY_Slash)));
 			// Zoom in using X or . or controller button A
 			bool zoom_in_button_held = input->controllers[0].button_a.down ||
-			                           (!gui_want_capture_keyboard && (is_key_down(input, KEY_X) || is_key_down(input, KEY_Period)));
+			                           (!gui_want_capture_keyboard && !input->keyboard.key_ctrl.down &&
+			                           	(is_key_down(input, KEY_X) || is_key_down(input, KEY_Period)));
 
 			if (prefer_integer_zoom) {
 				if (zoom_out_button_held) {
@@ -1500,6 +1502,13 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 
 			if (!gui_want_capture_keyboard) {
 				u32 key_modifiers_without_shift = input->keyboard.modifiers & ~KMOD_SHIFT;
+				bool redo_shortcut = (was_key_pressed(input, KEY_Y) && input->keyboard.modifiers == KMOD_CTRL) ||
+				                     (was_key_pressed(input, KEY_Z) && input->keyboard.modifiers == (KMOD_CTRL | KMOD_SHIFT));
+				if (redo_shortcut) {
+					annotation_history_redo(&scene->annotation_set);
+				} else if (was_key_pressed(input, KEY_Z) && input->keyboard.modifiers == KMOD_CTRL) {
+					annotation_history_undo(&scene->annotation_set);
+				}
 
 				// Toggle the grid
 				if (was_key_pressed(input, KEY_G) && key_modifiers_without_shift == KMOD_CTRL) {
@@ -1645,6 +1654,7 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 				if (scene->is_dragging) {
 					do_drag_annotation_node(scene);
 				} else if (scene->drag_ended) {
+					annotation_history_end_action(&scene->annotation_set);
 					app_state->mouse_mode = MODE_VIEW;
 //					scene->annotation_set.is_edit_mode = false;
 

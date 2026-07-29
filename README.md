@@ -40,6 +40,7 @@ Annotations can be manipulated in a variety of ways:
 * Individual coordinates can be moved, inserted or deleted (to toggle editing of coordinates, press `E`).
 * Annotations can be assigned a (color-coded) group.
 * Annotations can be split into parts.
+* Annotation edits can be undone with `Ctrl+Z` and redone with `Ctrl+Y` or `Ctrl+Shift+Z`.
 
 Changes to annotations are autosaved by default. If annotations were loaded from an existing file, the output format follows that file (`.xml`, `.geojson` or `.json`) and a backup of the original unchanged annotation file will be preserved with file extension `.orig`.
 

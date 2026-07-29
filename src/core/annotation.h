@@ -140,6 +140,8 @@ typedef struct annotation_hit_result_t {
 	bool is_valid;
 } annotation_hit_result_t;
 
+typedef struct annotation_history_t annotation_history_t;
+
 typedef struct annotation_set_t {
 	annotation_t* stored_annotations; // array
 	i32 stored_annotation_count;
@@ -162,6 +164,7 @@ typedef struct annotation_set_t {
 	bool modified;
 	i64 last_modification_time;
 	volatile i32 save_generation;
+	u32 render_generation;
 	i32 hovered_annotation;
 	i32 hovered_coordinate;
 	float hovered_coordinate_pixel_distance;
@@ -182,6 +185,7 @@ typedef struct annotation_set_t {
 	v2f mpp; // microns per pixel
 	volatile i32 is_saving_in_progress;
 	bool annotations_were_loaded_from_file;
+	annotation_history_t* history;
 } annotation_set_t;
 
 typedef struct annotation_set_template_t {
@@ -239,6 +243,31 @@ annotation_hit_result_t get_annotation_hit_result(app_state_t* app_state, annota
 i32 project_point_onto_annotation(annotation_set_t* annotation_set, annotation_t* annotation, v2f point, float* t_ptr, v2f* projected_point_ptr, float* distance_ptr);
 void deselect_annotation_coordinates(annotation_set_t* annotation_set);
 void notify_annotation_set_modified(annotation_set_t* annotation_set);
+
+// An action is one user-visible undo step. Actions may span multiple frames
+// (for example, a coordinate drag) and may be nested by lower-level helpers.
+void annotation_history_reset(annotation_set_t* annotation_set);
+void annotation_history_begin_action(annotation_set_t* annotation_set);
+void annotation_history_end_action(annotation_set_t* annotation_set);
+
+// Track functions capture the object's pre-edit state the first time it is
+// touched by the current action. Call them before changing the object. Use the
+// metadata variant for name/group/feature/type edits so coordinates are not
+// copied; the regular annotation variant includes geometry.
+void annotation_history_track_annotation(annotation_set_t* annotation_set, annotation_t* annotation);
+void annotation_history_track_annotation_metadata(annotation_set_t* annotation_set, annotation_t* annotation);
+void annotation_history_track_group(annotation_set_t* annotation_set, i32 stored_index);
+void annotation_history_track_feature(annotation_set_t* annotation_set, i32 stored_index);
+
+// Membership tracking is needed when an action adds/removes active objects.
+// It stores only the relevant active-index array, not the complete dataset.
+void annotation_history_track_annotation_membership(annotation_set_t* annotation_set);
+void annotation_history_track_group_membership(annotation_set_t* annotation_set);
+void annotation_history_track_feature_membership(annotation_set_t* annotation_set);
+bool annotation_history_can_undo(annotation_set_t* annotation_set);
+bool annotation_history_can_redo(annotation_set_t* annotation_set);
+bool annotation_history_undo(annotation_set_t* annotation_set);
+bool annotation_history_redo(annotation_set_t* annotation_set);
 void annotation_invalidate_derived_calculations_from_coordinates(annotation_t* annotation);
 void insert_coordinate(app_state_t* app_state, annotation_set_t* annotation_set, annotation_t* annotation, i32 insert_at_index, v2f new_coordinate);
 void delete_coordinate(annotation_set_t* annotation_set, i32 annotation_index, i32 coordinate_index);

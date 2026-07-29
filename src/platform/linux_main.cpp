@@ -976,7 +976,6 @@ int main(int argc, const char** argv)
 		presenter_imgui_new_frame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
-	    gui_reset_all_extra_drawlists();
 	    profiler_end(PROFILER_SECTION_GUI_NEW_FRAME);
 
         // Update and render our application
@@ -984,44 +983,28 @@ int main(int argc, const char** argv)
         viewer_update_and_render(app_state, curr_input, display_w, display_h, delta_t);
 	    profiler_end(PROFILER_SECTION_VIEWER);
 
-        // Finish up by rendering the UI
+	    // Finish up by rendering the UI
 	    profiler_begin(PROFILER_SECTION_IMGUI_RENDER);
+	    profiler_begin(PROFILER_SECTION_IMGUI_BUILD);
         ImGui::Render();
+	    profiler_end(PROFILER_SECTION_IMGUI_BUILD);
 		presenter_set_viewport((int) io.DisplaySize.x, (int) io.DisplaySize.y);
 
 	    // Render any ImGui content submitted to the extra draw lists on worker threads
-	    if (global_active_extra_drawlists > 0) {
-		    static ImDrawData draw_data = ImDrawData();
-		    draw_data.DisplayPos = ImGui::GetMainViewport()->Pos;
-		    draw_data.DisplaySize = ImGui::GetMainViewport()->Size;
-		    draw_data.FramebufferScale = io.DisplayFramebufferScale;
-			draw_data.OwnerViewport = ImGui::GetMainViewport();
-		    draw_data.TotalIdxCount = 0;
-		    draw_data.TotalVtxCount = 0;
-		    draw_data.CmdListsCount = 0;
-			draw_data.Textures = &ImGui::GetPlatformIO().Textures;
-			ImVector<ImDrawList*> drawlists;
-		    for (i32 i = 0; i < global_active_extra_drawlists; ++i) {
-			    ImDrawList* drawlist = global_extra_drawlists[i];
-			    if (drawlist) {
-				    i32 vertex_buffer_size = drawlist->VtxBuffer.size();
-				    if (vertex_buffer_size > 0) {
-					    drawlists.push_back(drawlist);
-					    draw_data.CmdListsCount += 1;
-					    draw_data.TotalIdxCount += drawlist->IdxBuffer.size();
-					    draw_data.TotalVtxCount += vertex_buffer_size;
-				    }
-			    }
-		    }
-		    draw_data.CmdLists = drawlists;
-		    draw_data.Valid = true;
-		    if (draw_data.CmdListsCount > 0 && draw_data.TotalVtxCount > 0) {
-				presenter_render_imgui_draw_data(&draw_data);
+	    profiler_begin(PROFILER_SECTION_IMGUI_EXTRA_RENDER);
+	    if (ImDrawData* draw_data = gui_get_merged_extra_drawlists_data(ImGui::GetMainViewport(), io.DisplayFramebufferScale)) {
+		    if (enable_persistent_extra_drawlist_buffers && enable_merged_extra_drawlists) {
+			    presenter_render_cached_imgui_draw_data(draw_data, global_extra_drawlists_generation);
+		    } else {
+			    presenter_render_imgui_draw_data(draw_data);
 		    }
 	    }
+	    profiler_end(PROFILER_SECTION_IMGUI_EXTRA_RENDER);
 
 		// Render the rest of the ImGui draw data (submitted on the main thread)
+		profiler_begin(PROFILER_SECTION_IMGUI_MAIN_RENDER);
 		presenter_render_imgui_draw_data(ImGui::GetDrawData());
+	    profiler_end(PROFILER_SECTION_IMGUI_MAIN_RENDER);
 	    profiler_end(PROFILER_SECTION_IMGUI_RENDER);
 
 	    profiler_begin(PROFILER_SECTION_PRESENT);

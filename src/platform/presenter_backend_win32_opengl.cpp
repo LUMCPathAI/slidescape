@@ -18,6 +18,7 @@
 
 #include "common.h"
 #include "presenter_backend.h"
+#include "presenter_imgui_opengl_cached.h"
 #include "win32_graphical_app.h"
 #include "viewer.h"
 #include "renderer.h"
@@ -493,6 +494,10 @@ static void presenter_win32_opengl_render_imgui_draw_data(ImDrawData* draw_data)
 	ImGui_ImplOpenGL3_RenderDrawData(draw_data);
 }
 
+static bool presenter_win32_opengl_render_cached_imgui_draw_data(ImDrawData* draw_data, u32 generation) {
+	return presenter_imgui_opengl_render_cached_draw_data(draw_data, generation);
+}
+
 static void presenter_win32_opengl_set_swap_interval(int interval) {
 	if (wglSwapIntervalEXT) {
 		wglSwapIntervalEXT(interval);
@@ -527,6 +532,7 @@ static void presenter_win32_opengl_present(window_handle_t window, void* present
 static void presenter_win32_opengl_shutdown(window_handle_t window, void* present_handle) {
 	(void)window;
 	(void)present_handle;
+	presenter_imgui_opengl_destroy_cached_draw_data();
 }
 
 presenter_backend_t presenter_opengl_get_backend() {
@@ -535,6 +541,7 @@ presenter_backend_t presenter_opengl_get_backend() {
 		presenter_win32_opengl_init_imgui,
 		presenter_win32_opengl_imgui_new_frame,
 		presenter_win32_opengl_render_imgui_draw_data,
+		presenter_win32_opengl_render_cached_imgui_draw_data,
 		presenter_win32_opengl_set_swap_interval,
 		presenter_win32_opengl_get_refresh_rate,
 		presenter_win32_opengl_get_drawable_size,

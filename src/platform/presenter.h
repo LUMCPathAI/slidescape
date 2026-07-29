@@ -48,6 +48,7 @@ void presenter_init_viewer(app_state_t* app_state);
 void presenter_init_imgui(app_state_t* app_state);
 void presenter_imgui_new_frame();
 void presenter_render_imgui_draw_data(struct ImDrawData *draw_data);
+void presenter_render_cached_imgui_draw_data(struct ImDrawData *draw_data, u32 generation);
 void presenter_set_swap_interval(int interval);
 int presenter_get_refresh_rate();
 void presenter_set_viewport(i32 width, i32 height);

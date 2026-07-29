@@ -57,7 +57,9 @@ void imgui_create_context();
 void gui_drawlist_reset_for_new_frame(ImDrawList* drawlist);
 void gui_reset_all_extra_drawlists();
 void gui_destroy_all_extra_drawlists();
+void gui_mark_extra_drawlists_modified();
 ImDrawList* gui_get_extra_drawlist(i32 drawlist_index);
+ImDrawData* gui_get_merged_extra_drawlists_data(ImGuiViewport* viewport, ImVec2 framebuffer_scale);
 void gui_make_next_window_appear_in_center_of_screen();
 void gui_draw_open_file_dialog(app_state_t* app_state);
 void menu_close_file(app_state_t* app_state);
@@ -120,9 +122,13 @@ extern ImFont* global_fixed_width_font;
 extern ImFont* global_icon_font;
 #endif
 extern bool enable_multithreaded_annotation_drawing INIT(= true);
+extern bool enable_annotation_drawlist_cache INIT(= true);
+extern bool enable_merged_extra_drawlists INIT(= true);
+extern bool enable_persistent_extra_drawlist_buffers INIT(= true);
 extern ImDrawList* global_extra_drawlists[MAX_EXTRA_DRAWLISTS];
 extern ImDrawListSharedData global_extra_drawlist_shared_datas[MAX_EXTRA_DRAWLISTS];
 extern i32 global_active_extra_drawlists INIT(= 0);
+extern u32 global_extra_drawlists_generation INIT(= 1);
 
 extern i32 viewer_min_level INIT(= -2);
 extern i32 viewer_max_level INIT(= 10);
