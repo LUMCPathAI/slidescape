@@ -695,6 +695,8 @@ void do_mouse_tool_create_freeform(app_state_t* app_state, input_t* input, scene
 				if (freeform->coordinate_count > 1) {
 					arrpop(freeform->coordinates);
 					--freeform->coordinate_count;
+					annotation_invalidate_derived_calculations_from_coordinates(freeform);
+					notify_annotation_set_modified(annotation_set);
 				} else {
 					// trying to delete the last coordinate -> abort instead
 					delete_annotation(annotation_set, annotation_set->editing_annotation_index);
@@ -739,6 +741,8 @@ void do_mouse_tool_create_freeform(app_state_t* app_state, input_t* input, scene
 					// add a point
 					arrput(freeform->coordinates, scene->mouse);
 					++freeform->coordinate_count;
+					annotation_invalidate_derived_calculations_from_coordinates(freeform);
+					notify_annotation_set_modified(annotation_set);
 					last_click_time = get_clock();
 					last_click_pos = scene->mouse;
 					last_click_annotation = freeform;
@@ -748,6 +752,8 @@ void do_mouse_tool_create_freeform(app_state_t* app_state, input_t* input, scene
 				if (distance_since_last_point > annotation_freeform_insert_interval_distance && distance_to_start_point > annotation_hover_distance) {
 					arrput(freeform->coordinates, scene->mouse);
 					++freeform->coordinate_count;
+					annotation_invalidate_derived_calculations_from_coordinates(freeform);
+					notify_annotation_set_modified(annotation_set);
 				}
 			} else if (scene->drag_ended) {
 
