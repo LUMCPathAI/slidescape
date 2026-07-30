@@ -1380,6 +1380,8 @@ TEST_CASE("P480 MRXS adapter builds a regular virtual DICOM pyramid") {
 			adapter.sop_instance_uids[lowest_level]);
 	REQUIRE(record != nullptr);
 	CHECK(strcmp(record->provider, "mrxs-native") == 0);
+	archive_instance_provider_cache_stats_t cache_before =
+		archive_instance_provider_get_cache_stats();
 	char* metadata = nullptr;
 	size_t metadata_size = 0;
 	CAPTURE(error);
@@ -1388,6 +1390,28 @@ TEST_CASE("P480 MRXS adapter builds a regular virtual DICOM pyramid") {
 		error, sizeof(error)));
 	CHECK(strstr(metadata, adapter.sop_instance_uids[lowest_level]) != nullptr);
 	free(metadata);
+	archive_instance_provider_cache_stats_t cache_after_first =
+		archive_instance_provider_get_cache_stats();
+	const archive_instance_record_t* other_record =
+		archive_index_find_instance(
+			&index, adapter.study_instance_uid, adapter.series_instance_uid,
+			adapter.sop_instance_uids[0]);
+	REQUIRE(other_record != nullptr);
+	char* other_metadata = nullptr;
+	size_t other_metadata_size = 0;
+	REQUIRE(archive_instance_provider_get_metadata(
+		&repository, other_record, &other_metadata, &other_metadata_size,
+		error, sizeof(error)));
+	CHECK(strstr(other_metadata, adapter.sop_instance_uids[0]) != nullptr);
+	free(other_metadata);
+	archive_instance_provider_cache_stats_t cache_after_second =
+		archive_instance_provider_get_cache_stats();
+	CHECK(cache_after_first.shell_misses == cache_before.shell_misses + 1);
+	CHECK(cache_after_first.shell_resident_count ==
+	      cache_before.shell_resident_count + 1);
+	CHECK(cache_after_second.shell_hits >= cache_after_first.shell_hits + 1);
+	CHECK(cache_after_second.shell_resident_count ==
+	      cache_after_first.shell_resident_count);
 	archive_frame_representation_t representation = {};
 	REQUIRE(archive_instance_provider_get_frame_representations(
 		&repository, record, &representation, 1,

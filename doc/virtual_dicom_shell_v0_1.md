@@ -2,8 +2,9 @@
 
 Status: binary format v1, single-instance and aggregate Part 10 writers/loaders, and
 transactional multi-instance logical-slide publication are implemented. Aggregate
-policy v6 promotes canonically equal governed attributes and
-container/specimen/preparation metadata into explicit shared sections.
+policy v7 promotes canonically equal governed attributes and
+container/specimen/preparation metadata into explicit shared sections, and uses
+delta-encoded encapsulated-frame payload maps.
 
 This document fixes the boundary between immutable source bundles, governed metadata,
 virtual DICOM representations, frame providers, and publication. Field names in the
@@ -208,10 +209,13 @@ For each DICOM frame, a map resolves:
 - provider-specific lookup coordinates, directly or through a provider-owned index.
 
 DICOM-facing frame order is immutable. Provider byte lookup is encoded independently:
-the initial forms are fixed base/stride and a flat array of source index, 64-bit
-offset, and 32-bit read size. Future forms may use cumulative offsets or other
-summaries. Provider lookup data may be reorganized for performance only if the bytes
-or deterministic generation rule promised for each frame remain unchanged.
+the current Part 10 forms are fixed base/stride for native uncompressed pixels and,
+for encapsulated pixels, one 64-bit base plus a structure-of-arrays map of 32-bit
+deltas between frame starts. Each non-final frame size is the following start delta
+minus an optional sparse gap correction; the final frame size is explicit. Deltas
+are accumulated in 64 bits, so the representation does not impose a 4 GiB instance
+limit. Provider lookup data may be reorganized for performance only if the bytes or
+deterministic generation rule promised for each frame remain unchanged.
 
 ## Optical Paths and Color
 
@@ -236,8 +240,9 @@ A separate compact specimen section retains Container Identifier and each Specim
 Identifier, Specimen UID, and Specimen Short Description.
 
 Aggregate publication retains that optical record layout under adapter recipe/policy
-`part10-preserve-v6`, adding the ordered multi-source recipe, logical-slide grouping
-contract, and a typed specimen-preparation section. Preparation items are stored in
+`part10-delta-payload-v7`, adding the ordered multi-source recipe, logical-slide
+grouping contract, compact delta payload maps, and a typed specimen-preparation
+section. Preparation items are stored in
 preorder with explicit specimen, step, and parent-item indices. Concept-name code
 components and CODE values retain their coding scheme and optional scheme version;
 content relationships are retained alongside explicit parent indices. TEXT, NUM
@@ -428,7 +433,7 @@ Required configuration or stakeholder policy:
 
 The single-instance writer materializes one parsed Part 10 instance, including core
 typed DICOM attributes, optical paths and ICC bytes, regular or explicit frame
-semantics, and fixed-stride, offset/size, or provider-native frame-index payload
+semantics, and fixed-stride, delta-offset, or provider-native frame-index payload
 lookup. The aggregate writer
 combines those validated sections into one shared source/string/instance directory
 and preserves an independent provider and payload map for every SOP Instance. The
@@ -445,9 +450,11 @@ provider, stored-frame representation, audit publication, and outbox event in on
 visibility transaction.
 
 QIDO reconstruction, metadata WADO, and frame-provider lookup now use the published
-representation rows and digest-validated shell buffers. A cache miss performs one
-bounded shell read and opens the source object for offset-based frame reads; it does
-not reparse Part 10 metadata.
+representation rows and digest-validated shell buffers. All instances that reference
+one aggregate share a single resident shell entry; MRXS levels also share one parsed
+native adapter. A per-instance cache retains projected metadata and any Part 10 source
+handle. A shell-cache miss performs one bounded shell read; it does not reparse Part
+10 metadata.
 
 Missing or corrupt Part 10 shells can be regenerated from the retained source and
 canonical recipe. Recovery validates both retained objects and the recipe
@@ -461,8 +468,11 @@ primary reconstruction orchestrator.
 SQLite schema v4 publishes one representation and shell per initial Part 10
 Study/Series group. Each instance retains its individual DICOMweb identity and source
 provider while referencing its persisted directory index in the aggregate shell.
-The aggregate v6 recipe records the SOP-ordered source set and grouping policy, and
+The aggregate v7 recipe records the SOP-ordered source set, grouping policy, and
+delta-payload policy, and
 local repair can deterministically rebuild and digest-check the complete shell.
+Recipe v6 shells used the removed explicit offset/size layout and must be reingested
+in development repositories.
 
 A source bundle is not automatically one slide. The current Study/Series grouping is
 an explicit first Part 10 policy; governed container/specimen/acquisition identity and

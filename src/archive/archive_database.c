@@ -1152,12 +1152,12 @@ archive_database_status_t archive_database_publish_shells(
 		const char* provider_kind = publication->provider_kind[0] ?
 			publication->provider_kind : "part10";
 		const char* adapter_version = publication->adapter_version[0] ?
-			publication->adapter_version : "6";
+			publication->adapter_version : "7";
 		const char* frame_source = publication->frame_source[0] ?
 			publication->frame_source : "STORED";
 		const char* frame_policy_version =
 			publication->frame_policy_version[0] ?
-			publication->frame_policy_version : "part10-preserve-v6";
+			publication->frame_policy_version : "part10-delta-payload-v7";
 		if ((strcmp(provider_kind, "part10") != 0 &&
 		     strcmp(provider_kind, "mrxs-native") != 0) ||
 		    !adapter_version[0] ||
@@ -1475,7 +1475,7 @@ archive_database_status_t archive_database_publish_shells(
 			const char* provider_kind = publication->provider_kind[0] ?
 				publication->provider_kind : "part10";
 			const char* adapter_version = publication->adapter_version[0] ?
-				publication->adapter_version : "6";
+				publication->adapter_version : "7";
 			const char* frame_media_type = publication->frame_media_type[0] ?
 				publication->frame_media_type :
 				archive_database_frame_media_type(instance->transfer_syntax_uid);
@@ -1483,7 +1483,7 @@ archive_database_status_t archive_database_publish_shells(
 				publication->frame_source : "STORED";
 			const char* frame_policy_version =
 				publication->frame_policy_version[0] ?
-				publication->frame_policy_version : "part10-preserve-v6";
+				publication->frame_policy_version : "part10-delta-payload-v7";
 			const char* provider_sql =
 				"INSERT INTO instance_provider(instance_id, provider_kind, "
 				"source_object_id, parameters_object_id, adapter_version) "
@@ -1595,7 +1595,7 @@ archive_database_status_t archive_database_publish_shells(
 				    statement, 2,
 				    publication->frame_policy_version[0] ?
 				    publication->frame_policy_version :
-				    "part10-preserve-v6",
+				    "part10-delta-payload-v7",
 				    -1, SQLITE_STATIC) != SQLITE_OK ||
 			    sqlite3_step(statement) != SQLITE_DONE) {
 				status = ARCHIVE_DATABASE_IO_ERROR;

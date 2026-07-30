@@ -1081,7 +1081,7 @@ TEST_CASE("virtual DICOM shell loads one aligned Part 10 serving object") {
 	REQUIRE(archive_shell_build_part10_recipe(
 		&recipe_input, recipe, &recipe_size, fingerprint));
 	CHECK(recipe_size == strlen(recipe));
-	CHECK(strstr(recipe, "adapter-policy\tpart10-preserve-v6\n") != nullptr);
+	CHECK(strstr(recipe, "adapter-policy\tpart10-delta-payload-v7\n") != nullptr);
 	char replay_recipe[ARCHIVE_SHELL_RECIPE_CAPACITY] = {};
 	size_t replay_recipe_size = 0;
 	char replay_fingerprint[65] = {};
@@ -1176,6 +1176,46 @@ TEST_CASE("virtual DICOM shell loads one aligned Part 10 serving object") {
 	CHECK(payload.source_index == 0);
 	CHECK(payload.size == 12);
 	CHECK(payload.offset == sizeof(dicom_header_t) + source.pixel_data.data_offset + 60);
+
+	dicom_instance_t compact_source = source;
+	u32 compact_offsets[6] = {0, 20, 45, 75, 110, 150};
+	u32 compact_sizes[6] = {16, 25, 26, 35, 40, 30};
+	compact_source.is_pixel_data_encapsulated = true;
+	compact_source.are_all_offsets_read = true;
+	compact_source.pixel_data_offset_count = COUNT(compact_offsets);
+	compact_source.pixel_data_offsets = compact_offsets;
+	compact_source.pixel_data_sizes = compact_sizes;
+	compact_source.pixel_data_start_offset = 256;
+	compact_source.file_handle = 0;
+	archive_shell_build_part10_input_t compact_input = input;
+	compact_input.instance = &compact_source;
+	compact_input.source_byte_size = 1024;
+	archive_shell_buffer_t compact_encoded = {};
+	REQUIRE(archive_shell_build_part10(
+		&compact_input, &compact_encoded, error, sizeof(error)));
+	archive_shell_view_t compact_shell = {};
+	REQUIRE(archive_shell_open(
+		&compact_shell, compact_encoded.data, compact_encoded.size,
+		error, sizeof(error)));
+	archive_shell_instance_t compact_instance = {};
+	REQUIRE(archive_shell_get_instance(
+		&compact_shell, 0, &compact_instance));
+	CHECK(compact_instance.payload_map_kind ==
+	      ARCHIVE_SHELL_PAYLOAD_DELTA_OFFSETS);
+	for (u32 frame_index = 0; frame_index < COUNT(compact_offsets);
+	     ++frame_index) {
+		archive_shell_payload_range_t compact_payload = {};
+		REQUIRE(archive_shell_get_payload_range(
+			&compact_shell, &compact_instance, frame_index,
+			&compact_payload));
+		CHECK(compact_payload.source_index == 0);
+		CHECK(compact_payload.offset ==
+		      sizeof(dicom_header_t) +
+			      compact_source.pixel_data_start_offset +
+			      compact_offsets[frame_index]);
+		CHECK(compact_payload.size == compact_sizes[frame_index]);
+	}
+	archive_shell_buffer_destroy(&compact_encoded);
 
 	archive_shell_optical_path_t stored_path = {};
 	REQUIRE(archive_shell_get_optical_path(&shell, &instance, 0, &stored_path));
@@ -1284,7 +1324,7 @@ TEST_CASE("virtual DICOM shell loads one aligned Part 10 serving object") {
 	CHECK(strstr(aggregate_recipe,
 	             "grouping-policy\tpart10-study-series-v1\n") != nullptr);
 	CHECK(strstr(aggregate_recipe,
-	             "adapter-policy\tpart10-preserve-v6\n") != nullptr);
+	             "adapter-policy\tpart10-delta-payload-v7\n") != nullptr);
 	archive_shell_build_part10_input_t aggregate_instances[2] = {
 		input,
 		{

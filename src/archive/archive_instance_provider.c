@@ -26,6 +26,11 @@
 #define ARCHIVE_PROVIDER_MAX_FRAME_SIZE MEGABYTES(64)
 #define ARCHIVE_PROVIDER_WORK_QUEUE_CAPACITY 1024
 #define ARCHIVE_PROVIDER_CACHE_CAPACITY 16
+/*
+ * Leave room to acquire a new shell before evicting the per-instance entry that
+ * may hold the final reference to an older shell.
+ */
+#define ARCHIVE_PROVIDER_SHELL_CACHE_CAPACITY 32
 
 typedef struct archive_provider_writer_t {
 	char* data;
@@ -44,6 +49,19 @@ static void archive_provider_set_error(char* error, size_t capacity, const char*
 
 static bool archive_provider_owns_global_thread_pool;
 
+typedef struct archive_provider_shell_cache_entry_t {
+	bool occupied;
+	i32 refcount;
+	u64 last_used;
+	char repository_root[ARCHIVE_PATH_CAPACITY];
+	char shell_key[sizeof(((archive_instance_record_t*)0)->shell_key)];
+	char shell_sha256[65];
+	u8* data;
+	size_t size;
+	archive_shell_view_t shell;
+	archive_mrxs_adapter_t* mrxs;
+} archive_provider_shell_cache_entry_t;
+
 typedef struct archive_provider_cache_entry_t {
 	bool occupied;
 	i32 refcount;
@@ -51,12 +69,9 @@ typedef struct archive_provider_cache_entry_t {
 	char repository_root[ARCHIVE_PATH_CAPACITY];
 	char shell_key[sizeof(((archive_instance_record_t*)0)->shell_key)];
 	u32 shell_instance_index;
-	u8* shell_data;
-	size_t shell_size;
-	archive_shell_view_t shell;
+	archive_provider_shell_cache_entry_t* shared_shell;
 	archive_shell_instance_t instance;
 	file_handle_t source_file;
-	archive_mrxs_adapter_t* mrxs;
 	char* metadata_json;
 	size_t metadata_size;
 } archive_provider_cache_entry_t;
@@ -64,17 +79,31 @@ typedef struct archive_provider_cache_entry_t {
 static platform_mutex_t archive_provider_cache_mutex = PLATFORM_MUTEX_INITIALIZER;
 static platform_mutex_t archive_provider_regeneration_mutex = PLATFORM_MUTEX_INITIALIZER;
 static archive_provider_cache_entry_t archive_provider_cache[ARCHIVE_PROVIDER_CACHE_CAPACITY];
+static archive_provider_shell_cache_entry_t
+	archive_provider_shell_cache[ARCHIVE_PROVIDER_SHELL_CACHE_CAPACITY];
 static u64 archive_provider_cache_clock;
 static archive_instance_provider_cache_stats_t archive_provider_cache_stats;
+
+static void archive_provider_shell_cache_entry_destroy(
+		archive_provider_shell_cache_entry_t* entry) {
+	if (!entry || !entry->occupied) return;
+	ASSERT(entry->refcount == 0);
+	free(entry->data);
+	if (entry->mrxs) {
+		archive_mrxs_adapter_close(entry->mrxs);
+		free(entry->mrxs);
+	}
+	memset(entry, 0, sizeof(*entry));
+}
 
 static void archive_provider_cache_entry_destroy(archive_provider_cache_entry_t* entry) {
 	if (!entry || !entry->occupied) return;
 	free(entry->metadata_json);
-	free(entry->shell_data);
 	file_handle_close(entry->source_file);
-	if (entry->mrxs) {
-		archive_mrxs_adapter_close(entry->mrxs);
-		free(entry->mrxs);
+	if (entry->shared_shell) {
+		ASSERT(entry->shared_shell->occupied &&
+		       entry->shared_shell->refcount > 0);
+		--entry->shared_shell->refcount;
 	}
 	memset(entry, 0, sizeof(*entry));
 }
@@ -84,6 +113,10 @@ static void archive_provider_cache_destroy(void) {
 	for (i32 i = 0; i < COUNT(archive_provider_cache); ++i) {
 		ASSERT(archive_provider_cache[i].refcount == 0);
 		archive_provider_cache_entry_destroy(archive_provider_cache + i);
+	}
+	for (i32 i = 0; i < COUNT(archive_provider_shell_cache); ++i) {
+		archive_provider_shell_cache_entry_destroy(
+			archive_provider_shell_cache + i);
 	}
 	archive_provider_cache_clock = 0;
 	memset(&archive_provider_cache_stats, 0, sizeof(archive_provider_cache_stats));
@@ -96,6 +129,11 @@ archive_instance_provider_cache_stats_t archive_instance_provider_get_cache_stat
 	result.capacity = ARCHIVE_PROVIDER_CACHE_CAPACITY;
 	for (i32 i = 0; i < COUNT(archive_provider_cache); ++i) {
 		if (archive_provider_cache[i].occupied) ++result.resident_count;
+	}
+	result.shell_capacity = ARCHIVE_PROVIDER_SHELL_CACHE_CAPACITY;
+	for (i32 i = 0; i < COUNT(archive_provider_shell_cache); ++i) {
+		if (archive_provider_shell_cache[i].occupied)
+			++result.shell_resident_count;
 	}
 	platform_mutex_unlock(&archive_provider_cache_mutex);
 	return result;
@@ -862,7 +900,7 @@ static bool archive_provider_regenerate_aggregate_shell(
 	char* cursor = text;
 	char* line = archive_provider_recipe_next_line(&cursor);
 	bool success = line &&
-		strcmp(line, "slidescape-virtual-dicom-recipe-v6") == 0;
+		strcmp(line, "slidescape-virtual-dicom-recipe-v7") == 0;
 	const char* bundle_sha256 = NULL;
 	const char* study_uid = NULL;
 	const char* series_uid = NULL;
@@ -1090,9 +1128,21 @@ static bool archive_provider_regenerate_shell(
 		                     retained_recipe_sha256) &&
 		strcmp(retained_recipe_sha256, record->recipe_sha256) == 0;
 	if (success && retained_recipe_size >=
-	    strlen("slidescape-virtual-dicom-recipe-v6\n") &&
-	    memcmp(retained_recipe, "slidescape-virtual-dicom-recipe-v6\n",
-	           strlen("slidescape-virtual-dicom-recipe-v6\n")) == 0) {
+	    strlen("slidescape-virtual-dicom-recipe-v6") &&
+	    memcmp(retained_recipe, "slidescape-virtual-dicom-recipe-v6",
+	           strlen("slidescape-virtual-dicom-recipe-v6")) == 0) {
+		archive_provider_set_error(
+			error, error_capacity,
+			"Part 10 shell recipe v6 uses the removed explicit payload layout; "
+			"reingest the source to publish a v7 shell");
+		dicom_destroy(&dicom);
+		free(retained_recipe);
+		return false;
+	}
+	if (success && retained_recipe_size >=
+	    strlen("slidescape-virtual-dicom-recipe-v7\n") &&
+	    memcmp(retained_recipe, "slidescape-virtual-dicom-recipe-v7\n",
+	           strlen("slidescape-virtual-dicom-recipe-v7\n")) == 0) {
 		success = archive_provider_regenerate_aggregate_shell(
 			repository, record, retained_recipe, retained_recipe_size,
 			error, error_capacity);
@@ -1210,7 +1260,165 @@ static archive_mrxs_adapter_t* archive_provider_open_mrxs(
 	return adapter;
 }
 
-static archive_provider_cache_entry_t* archive_provider_shell_cache_acquire(
+static void archive_provider_shell_cache_release(
+		archive_provider_shell_cache_entry_t* entry) {
+	if (!entry) return;
+	platform_mutex_lock(&archive_provider_cache_mutex);
+	ASSERT(entry->occupied && entry->refcount > 0);
+	--entry->refcount;
+	entry->last_used = ++archive_provider_cache_clock;
+	platform_mutex_unlock(&archive_provider_cache_mutex);
+}
+
+static archive_provider_shell_cache_entry_t*
+archive_provider_shared_shell_acquire(
+		const archive_repository_t* repository,
+		const archive_instance_record_t* record,
+		char* error, size_t error_capacity) {
+	bool is_part10 = record && strcmp(record->provider, "part10") == 0;
+	bool is_mrxs = record && strcmp(record->provider, "mrxs-native") == 0;
+	if (!repository || !record || (!is_part10 && !is_mrxs) ||
+	    !record->shell_key[0] || !record->shell_sha256[0] ||
+	    record->shell_byte_size == 0 ||
+	    record->shell_byte_size > SIZE_MAX) return NULL;
+
+	platform_mutex_lock(&archive_provider_cache_mutex);
+	for (i32 i = 0; i < COUNT(archive_provider_shell_cache); ++i) {
+		archive_provider_shell_cache_entry_t* entry =
+			archive_provider_shell_cache + i;
+		if (!entry->occupied ||
+		    strcmp(entry->repository_root, repository->root) != 0 ||
+		    strcmp(entry->shell_key, record->shell_key) != 0) continue;
+		if (entry->size != record->shell_byte_size ||
+		    strcmp(entry->shell_sha256, record->shell_sha256) != 0) {
+			platform_mutex_unlock(&archive_provider_cache_mutex);
+			archive_provider_set_error(
+				error, error_capacity,
+				"published records disagree about aggregate shell identity");
+			return NULL;
+		}
+		++archive_provider_cache_stats.shell_hits;
+		++entry->refcount;
+		entry->last_used = ++archive_provider_cache_clock;
+		platform_mutex_unlock(&archive_provider_cache_mutex);
+		return entry;
+	}
+	++archive_provider_cache_stats.shell_misses;
+	platform_mutex_unlock(&archive_provider_cache_mutex);
+
+	u8* shell_data = NULL;
+	archive_shell_view_t shell = {0};
+	archive_shell_instance_t instance = {0};
+	bool success = archive_provider_load_published_shell(
+		repository, record, &shell_data, &shell, &instance,
+		error, error_capacity);
+	if (!success && is_part10) {
+		/*
+		 * A single process-wide repair lock keeps regeneration rare and
+		 * bounded. Recheck after acquiring it because another request may
+		 * already have restored the same immutable shell.
+		 */
+		platform_mutex_lock(&archive_provider_regeneration_mutex);
+		if (error && error_capacity) error[0] = '\0';
+		success = archive_provider_load_published_shell(
+			repository, record, &shell_data, &shell, &instance,
+			error, error_capacity);
+		if (!success) {
+			if (error && error_capacity) error[0] = '\0';
+			success = archive_provider_regenerate_shell(
+				repository, record, error, error_capacity);
+			if (success) {
+				if (error && error_capacity) error[0] = '\0';
+				success = archive_provider_load_published_shell(
+					repository, record, &shell_data, &shell, &instance,
+					error, error_capacity);
+			}
+		}
+		platform_mutex_unlock(&archive_provider_regeneration_mutex);
+	}
+	archive_mrxs_adapter_t* mrxs = success && is_mrxs ?
+		archive_provider_open_mrxs(
+			repository, record, error, error_capacity) : NULL;
+	if (success && is_mrxs) success = mrxs != NULL;
+	if (!success) {
+		if (mrxs) {
+			archive_mrxs_adapter_close(mrxs);
+			free(mrxs);
+		}
+		free(shell_data);
+		if (!error || !error[0])
+			archive_provider_set_error(
+				error, error_capacity,
+				"could not load or validate aggregate virtual DICOM shell '%s'",
+				record->shell_key);
+		return NULL;
+	}
+
+	platform_mutex_lock(&archive_provider_cache_mutex);
+	archive_provider_shell_cache_entry_t* available = NULL;
+	for (i32 i = 0; i < COUNT(archive_provider_shell_cache); ++i) {
+		archive_provider_shell_cache_entry_t* entry =
+			archive_provider_shell_cache + i;
+		if (entry->occupied &&
+		    strcmp(entry->repository_root, repository->root) == 0 &&
+		    strcmp(entry->shell_key, record->shell_key) == 0) {
+			bool matches =
+				entry->size == record->shell_byte_size &&
+				strcmp(entry->shell_sha256, record->shell_sha256) == 0;
+			if (matches) {
+				++entry->refcount;
+				entry->last_used = ++archive_provider_cache_clock;
+			}
+			platform_mutex_unlock(&archive_provider_cache_mutex);
+			if (mrxs) {
+				archive_mrxs_adapter_close(mrxs);
+				free(mrxs);
+			}
+			free(shell_data);
+			if (!matches)
+				archive_provider_set_error(
+					error, error_capacity,
+					"published records disagree about aggregate shell identity");
+			return matches ? entry : NULL;
+		}
+		if (!entry->occupied ||
+		    (entry->refcount == 0 &&
+		     (!available || entry->last_used < available->last_used)))
+			available = entry;
+	}
+	if (!available) {
+		platform_mutex_unlock(&archive_provider_cache_mutex);
+		if (mrxs) {
+			archive_mrxs_adapter_close(mrxs);
+			free(mrxs);
+		}
+		free(shell_data);
+		archive_provider_set_error(
+			error, error_capacity,
+			"all aggregate virtual DICOM shell cache entries are busy");
+		return NULL;
+	}
+	if (available->occupied)
+		++archive_provider_cache_stats.shell_evictions;
+	archive_provider_shell_cache_entry_destroy(available);
+	available->occupied = true;
+	available->refcount = 1;
+	available->last_used = ++archive_provider_cache_clock;
+	snprintf(available->repository_root, sizeof(available->repository_root),
+	         "%s", repository->root);
+	snprintf(available->shell_key, sizeof(available->shell_key),
+	         "%s", record->shell_key);
+	snprintf(available->shell_sha256, sizeof(available->shell_sha256),
+	         "%s", record->shell_sha256);
+	available->data = shell_data;
+	available->size = (size_t)record->shell_byte_size;
+	available->shell = shell;
+	available->mrxs = mrxs;
+	platform_mutex_unlock(&archive_provider_cache_mutex);
+	return available;
+}
+
+static archive_provider_cache_entry_t* archive_provider_instance_cache_acquire(
 		const archive_repository_t* repository, const archive_instance_record_t* record,
 		char* error, size_t error_capacity) {
 	bool is_part10 = record && strcmp(record->provider, "part10") == 0;
@@ -1240,19 +1448,23 @@ static archive_provider_cache_entry_t* archive_provider_shell_cache_acquire(
 	platform_mutex_unlock(&archive_provider_cache_mutex);
 
 	char source_path[ARCHIVE_PATH_CAPACITY];
-	u8* shell_data = NULL;
 	char* metadata = NULL;
 	file_handle_t source_file = 0;
-	archive_mrxs_adapter_t* mrxs = NULL;
-	archive_shell_view_t shell = {0};
 	archive_shell_instance_t instance = {0};
 	size_t metadata_size = 0;
-	bool success = (!is_part10 ||
-		archive_repository_make_path(repository, record->object_key,
-		                             source_path, sizeof(source_path))) &&
-	               archive_provider_load_published_shell(
-		               repository, record, &shell_data, &shell, &instance,
-		               error, error_capacity);
+	archive_provider_shell_cache_entry_t* shared_shell =
+		archive_provider_shared_shell_acquire(
+			repository, record, error, error_capacity);
+	bool success = shared_shell &&
+		archive_shell_get_instance(
+			&shared_shell->shell, record->shell_instance_index, &instance) &&
+		archive_provider_record_matches_shell(
+			record, &shared_shell->shell, &instance,
+			error, error_capacity) &&
+		(!is_part10 ||
+		 archive_repository_make_path(
+			 repository, record->object_key,
+			 source_path, sizeof(source_path)));
 	if (success && is_part10 &&
 	    archive_provider_path_is_external_reference(source_path)) {
 		char actual_sha256[65];
@@ -1266,58 +1478,25 @@ static archive_provider_cache_entry_t* archive_provider_shell_cache_acquire(
 				error, error_capacity,
 				"externally referenced Part 10 source changed or is unavailable");
 	}
-	if (!success && is_part10) {
-		/*
-		 * A single process-wide repair lock keeps regeneration rare and bounded.
-		 * Recheck after acquiring it: another request may already have restored
-		 * the same immutable content-addressed object.
-		 */
-		platform_mutex_lock(&archive_provider_regeneration_mutex);
-		if (error && error_capacity) error[0] = '\0';
-		success = archive_repository_make_path(repository, record->object_key,
-		                                       source_path, sizeof(source_path)) &&
-		          archive_provider_load_published_shell(
-			          repository, record, &shell_data, &shell, &instance,
-			          error, error_capacity);
-		if (!success) {
-			if (error && error_capacity) error[0] = '\0';
-			success = archive_provider_regenerate_shell(repository, record,
-			                                           error, error_capacity);
-			if (success) {
-				if (error && error_capacity) error[0] = '\0';
-				success = archive_provider_load_published_shell(
-					repository, record, &shell_data, &shell, &instance,
-					error, error_capacity);
-			}
-		}
-		platform_mutex_unlock(&archive_provider_regeneration_mutex);
-	}
 	u64 metadata_capacity = 0;
 	success = success && archive_provider_get_metadata_capacity(
-		&shell, &instance, &metadata_capacity);
+		&shared_shell->shell, &instance, &metadata_capacity);
 	if (success) {
 		metadata = malloc((size_t)metadata_capacity);
 		success = metadata &&
 		          archive_provider_write_shell_metadata(
-			          &shell, &instance, metadata, (size_t)metadata_capacity,
+			          &shared_shell->shell, &instance,
+			          metadata, (size_t)metadata_capacity,
 			          &metadata_size, true);
 	}
 	if (success && is_part10) {
 		source_file = open_file_handle_for_simultaneous_access(source_path);
 		success = source_file != 0;
-	} else if (success && is_mrxs) {
-		mrxs = archive_provider_open_mrxs(
-			repository, record, error, error_capacity);
-		success = mrxs != NULL;
 	}
 	if (!success) {
 		file_handle_close(source_file);
-		if (mrxs) {
-			archive_mrxs_adapter_close(mrxs);
-			free(mrxs);
-		}
 		free(metadata);
-		free(shell_data);
+		archive_provider_shell_cache_release(shared_shell);
 		if (!error || !error[0])
 			archive_provider_set_error(error, error_capacity,
 			                           "could not load or validate virtual DICOM shell '%s'",
@@ -1337,12 +1516,8 @@ static archive_provider_cache_entry_t* archive_provider_shell_cache_acquire(
 			entry->last_used = ++archive_provider_cache_clock;
 			platform_mutex_unlock(&archive_provider_cache_mutex);
 			file_handle_close(source_file);
-			if (mrxs) {
-				archive_mrxs_adapter_close(mrxs);
-				free(mrxs);
-			}
 			free(metadata);
-			free(shell_data);
+			archive_provider_shell_cache_release(shared_shell);
 			return entry;
 		}
 		if (!entry->occupied ||
@@ -1353,7 +1528,7 @@ static archive_provider_cache_entry_t* archive_provider_shell_cache_acquire(
 		platform_mutex_unlock(&archive_provider_cache_mutex);
 		file_handle_close(source_file);
 		free(metadata);
-		free(shell_data);
+		archive_provider_shell_cache_release(shared_shell);
 		archive_provider_set_error(error, error_capacity,
 		                           "all virtual DICOM shell cache entries are busy");
 		return NULL;
@@ -1367,12 +1542,9 @@ static archive_provider_cache_entry_t* archive_provider_shell_cache_acquire(
 	         repository->root);
 	snprintf(available->shell_key, sizeof(available->shell_key), "%s", record->shell_key);
 	available->shell_instance_index = record->shell_instance_index;
-	available->shell_data = shell_data;
-	available->shell_size = (size_t)record->shell_byte_size;
-	available->shell = shell;
+	available->shared_shell = shared_shell;
 	available->instance = instance;
 	available->source_file = source_file;
-	available->mrxs = mrxs;
 	available->metadata_json = metadata;
 	available->metadata_size = metadata_size;
 	platform_mutex_unlock(&archive_provider_cache_mutex);
@@ -1395,7 +1567,8 @@ bool archive_instance_provider_get_metadata(const archive_repository_t* reposito
 	*json = NULL;
 	*json_size = 0;
 	archive_provider_cache_entry_t* entry =
-		archive_provider_shell_cache_acquire(repository, record, error, error_capacity);
+		archive_provider_instance_cache_acquire(
+			repository, record, error, error_capacity);
 	if (!entry) return false;
 	char* result = malloc(entry->metadata_size + 1);
 	bool success = result != NULL;
@@ -1424,11 +1597,12 @@ bool archive_instance_provider_get_series_metadata(
 		return false;
 	}
 	archive_provider_cache_entry_t* entry =
-		archive_provider_shell_cache_acquire(
+		archive_provider_instance_cache_acquire(
 			repository, records, error, error_capacity);
 	if (!entry) return false;
 
-	bool success = entry->shell.instance_count == (u32)record_count;
+	const archive_shell_view_t* shell = &entry->shared_shell->shell;
+	bool success = shell->instance_count == (u32)record_count;
 	u64 result_capacity = 4;
 	for (i32 i = 0; i < record_count && success; ++i) {
 		const archive_instance_record_t* record = records + i;
@@ -1450,13 +1624,13 @@ bool archive_instance_provider_get_series_metadata(
 			strcmp(record->recipe_sha256, records->recipe_sha256) == 0 &&
 			record->recipe_byte_size == records->recipe_byte_size &&
 			archive_shell_get_instance(
-				&entry->shell, (u32)i, &instance) &&
+				shell, (u32)i, &instance) &&
 			archive_provider_record_matches_shell(
-				record, &entry->shell, &instance,
+				record, shell, &instance,
 				error, error_capacity);
 		u64 instance_capacity = 0;
 		success = success && archive_provider_get_metadata_capacity(
-			&entry->shell, &instance, &instance_capacity);
+			shell, &instance, &instance_capacity);
 		if (!success ||
 		    result_capacity > ARCHIVE_PROVIDER_MAX_METADATA_SIZE -
 		                      instance_capacity) {
@@ -1483,9 +1657,9 @@ bool archive_instance_provider_get_series_metadata(
 		size_t object_size = 0;
 		if (i) result[used++] = ',';
 		success =
-			archive_shell_get_instance(&entry->shell, (u32)i, &instance) &&
+			archive_shell_get_instance(shell, (u32)i, &instance) &&
 			archive_provider_write_shell_metadata(
-				&entry->shell, &instance, result + used,
+				shell, &instance, result + used,
 				(size_t)result_capacity - used, &object_size, false);
 		if (success) used += object_size;
 	}
@@ -1527,7 +1701,7 @@ i32 archive_instance_provider_get_frame_representations(
 	     strcmp(record->provider, "mrxs-native") != 0)) return 0;
 	if (strcmp(record->provider, "mrxs-native") == 0) {
 		archive_provider_cache_entry_t* entry =
-			archive_provider_shell_cache_acquire(
+			archive_provider_instance_cache_acquire(
 				repository, record, error, error_capacity);
 		if (!entry) return 0;
 		bool valid =
@@ -1562,7 +1736,8 @@ i32 archive_instance_provider_get_frame_representations(
 	i32 count = 1;
 
 	archive_provider_cache_entry_t* entry =
-		archive_provider_shell_cache_acquire(repository, record, error, error_capacity);
+		archive_provider_instance_cache_acquire(
+			repository, record, error, error_capacity);
 	if (!entry) return 0;
 	const archive_shell_instance_t* instance = &entry->instance;
 	bool can_generate_rgb8 =
@@ -1592,7 +1767,8 @@ static bool archive_provider_read_shell_frame(
 	*data = NULL;
 	*size = 0;
 	archive_shell_payload_range_t range = {0};
-	if (!archive_shell_get_payload_range(&entry->shell, &entry->instance,
+	if (!archive_shell_get_payload_range(
+			&entry->shared_shell->shell, &entry->instance,
 	                                     frame_index, &range) ||
 	    range.source_index != entry->instance.source_index ||
 	    range.size > ARCHIVE_PROVIDER_MAX_FRAME_SIZE) return false;
@@ -1630,17 +1806,19 @@ bool archive_instance_provider_get_frame(const archive_repository_t* repository,
 		return false;
 	}
 	archive_provider_cache_entry_t* entry =
-		archive_provider_shell_cache_acquire(repository, record, error, error_capacity);
+		archive_provider_instance_cache_acquire(
+			repository, record, error, error_capacity);
 	if (!entry) return false;
 	const archive_shell_instance_t* instance = &entry->instance;
-	if (entry->mrxs &&
+	if (entry->shared_shell->mrxs &&
 	    instance->provider_kind == ARCHIVE_SHELL_PROVIDER_MRXS_NATIVE &&
 	    representation->source == ARCHIVE_FRAME_REPRESENTATION_GENERATED &&
 	    strcmp(representation->media_type, "image/jpeg") == 0 &&
 	    strcmp(representation->transfer_syntax_uid,
 	           "1.2.840.10008.1.2.4.50") == 0 &&
 	    archive_mrxs_adapter_get_jpeg_frame(
-		    entry->mrxs, record->shell_instance_index, one_based_frame,
+		    entry->shared_shell->mrxs, record->shell_instance_index,
+		    one_based_frame,
 		    &frame->data, &frame->size, error, error_capacity)) {
 		snprintf(frame->media_type, sizeof(frame->media_type),
 		         "image/jpeg");

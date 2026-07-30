@@ -45,6 +45,11 @@ typedef struct archive_instance_provider_cache_stats_t {
 	u64 evictions;
 	i32 resident_count;
 	i32 capacity;
+	u64 shell_hits;
+	u64 shell_misses;
+	u64 shell_evictions;
+	i32 shell_resident_count;
+	i32 shell_capacity;
 } archive_instance_provider_cache_stats_t;
 
 /* Main-thread lifecycle. Initialization also starts Slidescape's shared worker/TLS

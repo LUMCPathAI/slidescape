@@ -45,17 +45,17 @@ bool archive_shell_build_part10_recipe(
 	    !archive_shell_recipe_uid_is_valid(input->sop_instance_uid)) return false;
 
 	int length = snprintf(recipe, ARCHIVE_SHELL_RECIPE_CAPACITY,
-		"slidescape-virtual-dicom-recipe-v6-single\n"
+		"slidescape-virtual-dicom-recipe-v7-single\n"
 		"bundle-sha256\t%s\n"
 		"source-sha256\t%s\n"
 		"source-byte-size\t%llu\n"
 		"logical-role\tpart10-instance\n"
 		"sop-instance-uid\t%s\n"
 		"adapter\tslidescape-dicom-shell\n"
-		"adapter-version\t6\n"
-		"adapter-policy\tpart10-preserve-v6\n"
+		"adapter-version\t7\n"
+		"adapter-policy\tpart10-delta-payload-v7\n"
 		"configuration\tbuiltin-default-v1\n"
-		"shell-schema-version\t1\n",
+		"shell-schema-version\t2\n",
 		input->bundle_sha256, input->source_sha256,
 		(unsigned long long)input->source_byte_size, input->sop_instance_uid);
 	if (length < 0 || length >= ARCHIVE_SHELL_RECIPE_CAPACITY) return false;
@@ -81,7 +81,7 @@ bool archive_shell_build_part10_aggregate_recipe(
 	if (!data) return false;
 	i32 length = snprintf(
 		data, capacity,
-		"slidescape-virtual-dicom-recipe-v6\n"
+		"slidescape-virtual-dicom-recipe-v7\n"
 		"bundle-sha256\t%s\n"
 		"logical-slide-study-uid\t%s\n"
 		"logical-slide-series-uid\t%s\n"
@@ -116,10 +116,10 @@ bool archive_shell_build_part10_aggregate_recipe(
 			"logical-role\tpart10-logical-slide\n"
 			"grouping-policy\tpart10-study-series-v1\n"
 			"adapter\tslidescape-dicom-shell\n"
-			"adapter-version\t6\n"
-			"adapter-policy\tpart10-preserve-v6\n"
+			"adapter-version\t7\n"
+			"adapter-policy\tpart10-delta-payload-v7\n"
 			"configuration\tbuiltin-default-v1\n"
-			"shell-schema-version\t1\n");
+			"shell-schema-version\t2\n");
 		if (length < 0 || (size_t)length >= capacity - used)
 			success = false;
 		else

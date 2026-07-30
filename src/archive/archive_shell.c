@@ -25,7 +25,8 @@
 #define ARCHIVE_SHELL_PREPARATION_HEADER_SIZE 16
 #define ARCHIVE_SHELL_PREPARATION_RECORD_SIZE 72
 #define ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE 32
-#define ARCHIVE_SHELL_PAYLOAD_RECORD_SIZE 16
+#define ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE 4
+#define ARCHIVE_SHELL_PAYLOAD_GAP_RECORD_SIZE 8
 #define ARCHIVE_SHELL_SECTION_CRITICAL 1
 #define ARCHIVE_SHELL_SOURCE_ROLE_PART10 1
 #define ARCHIVE_SHELL_SOURCE_ROLE_NATIVE_BUNDLE 2
@@ -604,16 +605,14 @@ static bool archive_shell_build_payload_map(dicom_instance_t* instance, u64 sour
 		archive_shell_set_error(error, error_capacity, "encapsulated Part 10 frame index is incomplete");
 		return false;
 	}
-	u64 required = ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE +
-		(u64)frame_count * ARCHIVE_SHELL_PAYLOAD_RECORD_SIZE;
-	if (required > SIZE_MAX) return false;
-	section->size = (size_t)required;
-	section->data = calloc(1, section->size);
-	if (!section->data) return false;
-	*kind = ARCHIVE_SHELL_PAYLOAD_OFFSET_SIZE;
-	archive_shell_write_u32(section->data, *kind);
-	archive_shell_write_u32(section->data + 4, frame_count);
-	archive_shell_write_u32(section->data + 8, ARCHIVE_SHELL_PAYLOAD_ENCAPSULATED);
+	u64* offsets = calloc(frame_count, sizeof(*offsets));
+	u32* sizes = calloc(frame_count, sizeof(*sizes));
+	if (!offsets || !sizes) {
+		free(sizes);
+		free(offsets);
+		return false;
+	}
+	bool valid = true;
 	for (u32 frame = 0; frame < frame_count; ++frame) {
 		u64 offset = sizeof(dicom_header_t) + (u64)instance->pixel_data_start_offset +
 		             instance->pixel_data_offsets[frame];
@@ -627,13 +626,15 @@ static bool archive_shell_build_payload_map(dicom_instance_t* instance, u64 sour
 				archive_shell_set_error(error, error_capacity,
 				                        "encapsulated Part 10 frame %u has no bounded byte range",
 				                        frame + 1);
-				return false;
+				valid = false;
+				break;
 			}
 		} else if (size == DICOM_UNDEFINED_LENGTH) {
 			archive_shell_set_error(error, error_capacity,
 			                        "encapsulated Part 10 frame %u has no bounded byte range",
 			                        frame + 1);
-			return false;
+			valid = false;
+			break;
 		}
 		if (offset > source_size ||
 		    size > source_size - offset) {
@@ -642,14 +643,110 @@ static bool archive_shell_build_payload_map(dicom_instance_t* instance, u64 sour
 			                        "(offset=%llu, size=%u, source=%llu)",
 			                        frame + 1, (unsigned long long)offset, size,
 			                        (unsigned long long)source_size);
+			valid = false;
+			break;
+		}
+		offsets[frame] = offset;
+		sizes[frame] = size;
+	}
+	if (!valid) {
+		free(sizes);
+		free(offsets);
+		return false;
+	}
+
+	/*
+	 * Encapsulated Part 10 frames are normally consecutive item ranges. Store
+	 * one 64-bit base followed by 32-bit deltas between frame starts, and
+	 * derive each size from the following delta. A sparse correction table
+	 * records bytes between frames that are not part of either frame. The
+	 * cumulative offset remains 64-bit, so the instance may exceed 4 GiB.
+	 */
+	u32 gap_count = 0;
+	for (u32 frame = 0; frame < frame_count; ++frame) {
+		if (!sizes[frame]) {
+			archive_shell_set_error(
+				error, error_capacity,
+				"encapsulated Part 10 frame %u has an empty byte range",
+				frame + 1);
+			free(sizes);
+			free(offsets);
 			return false;
 		}
-		u8* record = section->data + ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE +
-		             (size_t)frame * ARCHIVE_SHELL_PAYLOAD_RECORD_SIZE;
-		archive_shell_write_u64(record, offset);
-		archive_shell_write_u32(record + 8, size);
-		archive_shell_write_u32(record + 12, 0);
+		if (frame + 1 == frame_count) continue;
+		if (offsets[frame + 1] < offsets[frame] ||
+		    sizes[frame] > offsets[frame + 1] - offsets[frame]) {
+			archive_shell_set_error(
+				error, error_capacity,
+				"encapsulated Part 10 frame ranges overlap or are unordered");
+			free(sizes);
+			free(offsets);
+			return false;
+		}
+		u64 delta = offsets[frame + 1] - offsets[frame];
+		u64 gap = offsets[frame + 1] - offsets[frame] - sizes[frame];
+		if (delta > UINT32_MAX || gap > UINT32_MAX) {
+			archive_shell_set_error(
+				error, error_capacity,
+				"encapsulated Part 10 frame-start delta exceeds 32 bits");
+			free(sizes);
+			free(offsets);
+			return false;
+		}
+		if (gap) ++gap_count;
 	}
+	u64 required = ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE +
+		(u64)frame_count * ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE +
+		(u64)gap_count * ARCHIVE_SHELL_PAYLOAD_GAP_RECORD_SIZE;
+	if (required > SIZE_MAX) {
+		free(sizes);
+		free(offsets);
+		return false;
+	}
+	section->size = (size_t)required;
+	section->data = calloc(1, section->size);
+	if (!section->data) {
+		free(sizes);
+		free(offsets);
+		return false;
+	}
+	*kind = ARCHIVE_SHELL_PAYLOAD_DELTA_OFFSETS;
+	archive_shell_write_u32(section->data, *kind);
+	archive_shell_write_u32(section->data + 4, frame_count);
+	archive_shell_write_u32(
+		section->data + 8, ARCHIVE_SHELL_PAYLOAD_ENCAPSULATED);
+	archive_shell_write_u32(section->data + 12, gap_count);
+	archive_shell_write_u64(section->data + 16, offsets[0]);
+	archive_shell_write_u32(
+		section->data + 24, sizes[frame_count - 1]);
+	archive_shell_write_u32(
+		section->data + 28, ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE);
+	u8* deltas = section->data + ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE;
+	u8* gaps = deltas +
+		(size_t)frame_count * ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE;
+	u32 gap_index = 0;
+	for (u32 frame = 0; frame < frame_count; ++frame) {
+		u32 delta = frame ?
+			(u32)(offsets[frame] - offsets[frame - 1]) : 0;
+		archive_shell_write_u32(
+			deltas + (size_t)frame * ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE,
+			delta);
+		if (frame + 1 < frame_count) {
+			u32 gap = (u32)(
+				offsets[frame + 1] - offsets[frame] - sizes[frame]);
+			if (gap) {
+				u8* gap_record =
+					gaps + (size_t)gap_index *
+						ARCHIVE_SHELL_PAYLOAD_GAP_RECORD_SIZE;
+				archive_shell_write_u32(gap_record, frame);
+				archive_shell_write_u32(gap_record + 4, gap);
+				++gap_index;
+			}
+		}
+	}
+	ASSERT(gap_index == gap_count);
+	free(sizes);
+	free(offsets);
 	return true;
 }
 
@@ -1111,18 +1208,11 @@ static bool archive_shell_set_payload_source(
 	if (!section || section->kind != ARCHIVE_SHELL_SECTION_PAYLOAD_MAP ||
 	    section->size < ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE) return false;
 	u32 kind = archive_shell_read_u32(section->data);
-	u32 count = archive_shell_read_u32(section->data + 4);
 	if (kind == ARCHIVE_SHELL_PAYLOAD_FIXED_STRIDE ||
-	    kind == ARCHIVE_SHELL_PAYLOAD_FRAME_INDEX) return true;
-	if (kind != ARCHIVE_SHELL_PAYLOAD_OFFSET_SIZE ||
-	    section->size != ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE +
-	    (u64)count * ARCHIVE_SHELL_PAYLOAD_RECORD_SIZE) return false;
-	for (u32 i = 0; i < count; ++i) {
-		u8* record = section->data + ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE +
-		             (size_t)i * ARCHIVE_SHELL_PAYLOAD_RECORD_SIZE;
-		archive_shell_write_u32(record + 12, source_index);
-	}
-	return true;
+	    kind == ARCHIVE_SHELL_PAYLOAD_FRAME_INDEX ||
+	    kind == ARCHIVE_SHELL_PAYLOAD_DELTA_OFFSETS) return true;
+	(void)source_index;
+	return false;
 }
 
 static const u32 archive_shell_governed_attribute_tags[] = {
@@ -1769,6 +1859,56 @@ bool archive_shell_get_source(const archive_shell_view_t* shell, u32 source_inde
 	return source->byte_size > 0;
 }
 
+static bool archive_shell_delta_payload_is_valid(
+		const u8* payload, u64 payload_size, u32 frame_count) {
+	if (!payload || payload_size < ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE ||
+	    !frame_count ||
+	    archive_shell_read_u32(payload + 28) !=
+		    ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE)
+		return false;
+	u32 gap_count = archive_shell_read_u32(payload + 12);
+	u64 delta_size =
+		(u64)frame_count * ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE;
+	u64 gap_size = (u64)gap_count * ARCHIVE_SHELL_PAYLOAD_GAP_RECORD_SIZE;
+	if (delta_size > UINT64_MAX - ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE ||
+	    gap_size > UINT64_MAX - ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE -
+		               delta_size ||
+	    payload_size != ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE +
+		                    delta_size + gap_size ||
+	    archive_shell_read_u32(payload + 24) == 0)
+		return false;
+	const u8* deltas = payload + ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE;
+	if (archive_shell_read_u32(deltas) != 0) return false;
+	u64 cumulative = 0;
+	for (u32 frame = 1; frame < frame_count; ++frame) {
+		u32 delta = archive_shell_read_u32(
+			deltas + (size_t)frame *
+				ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE);
+		if (!delta || cumulative > UINT64_MAX - delta) return false;
+		cumulative += delta;
+	}
+	const u8* gaps = deltas + delta_size;
+	u32 previous_frame = UINT32_MAX;
+	for (u32 i = 0; i < gap_count; ++i) {
+		const u8* record =
+			gaps + (size_t)i * ARCHIVE_SHELL_PAYLOAD_GAP_RECORD_SIZE;
+		u32 frame = archive_shell_read_u32(record);
+		u32 gap = archive_shell_read_u32(record + 4);
+		if (!gap || frame + 1 >= frame_count ||
+		    (previous_frame != UINT32_MAX && frame <= previous_frame))
+			return false;
+		u32 next_delta = archive_shell_read_u32(
+			deltas + (size_t)(frame + 1) *
+				ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE);
+		if (gap >= next_delta) return false;
+		previous_frame = frame;
+	}
+	u64 base = archive_shell_read_u64(payload + 16);
+	return base <= UINT64_MAX - cumulative &&
+	       base + cumulative <=
+		       UINT64_MAX - archive_shell_read_u32(payload + 24);
+}
+
 bool archive_shell_get_instance(const archive_shell_view_t* shell, u32 instance_index,
 		archive_shell_instance_t* instance) {
 	if (!shell || !instance || instance_index >= shell->instance_count || !shell->instances) return false;
@@ -1838,8 +1978,9 @@ bool archive_shell_get_instance(const archive_shell_view_t* shell, u32 instance_
 	    (instance->frame_map_kind != ARCHIVE_SHELL_FRAME_MAP_REGULAR_GRID &&
 	     instance->frame_map_kind != ARCHIVE_SHELL_FRAME_MAP_EXPLICIT) ||
 	    (instance->payload_map_kind != ARCHIVE_SHELL_PAYLOAD_FIXED_STRIDE &&
-	     instance->payload_map_kind != ARCHIVE_SHELL_PAYLOAD_OFFSET_SIZE &&
-	     instance->payload_map_kind != ARCHIVE_SHELL_PAYLOAD_FRAME_INDEX)) return false;
+	     instance->payload_map_kind != ARCHIVE_SHELL_PAYLOAD_FRAME_INDEX &&
+	     instance->payload_map_kind !=
+		     ARCHIVE_SHELL_PAYLOAD_DELTA_OFFSETS)) return false;
 	u64 attribute_size = 0;
 	const u8* attributes = archive_shell_section_data(shell, instance->attribute_section_index,
 		ARCHIVE_SHELL_SECTION_ATTRIBUTE_TABLE, instance_index, &attribute_size);
@@ -1868,9 +2009,11 @@ bool archive_shell_get_instance(const archive_shell_view_t* shell, u32 instance_
 	    payload_size != ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE) return false;
 	if (instance->payload_map_kind == ARCHIVE_SHELL_PAYLOAD_FRAME_INDEX &&
 	    payload_size != ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE) return false;
-	if (instance->payload_map_kind == ARCHIVE_SHELL_PAYLOAD_OFFSET_SIZE &&
-	    payload_size != ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE +
-	    (u64)instance->frame_count * ARCHIVE_SHELL_PAYLOAD_RECORD_SIZE) return false;
+	if (instance->payload_map_kind ==
+		    ARCHIVE_SHELL_PAYLOAD_DELTA_OFFSETS &&
+	    !archive_shell_delta_payload_is_valid(
+		    payload, payload_size, instance->frame_count))
+		return false;
 	if (instance->frame_map_kind == ARCHIVE_SHELL_FRAME_MAP_REGULAR_GRID) {
 		if (instance->frame_map_section_index != ARCHIVE_SHELL_NO_SECTION ||
 		    !instance->tiles_per_row || !instance->tiles_per_column ||
@@ -1958,19 +2101,79 @@ bool archive_shell_get_payload_range(const archive_shell_view_t* shell,
 		       range->offset <= source.byte_size &&
 		       range->size <= source.byte_size - range->offset;
 	}
-	if (instance->payload_map_kind != ARCHIVE_SHELL_PAYLOAD_OFFSET_SIZE ||
-	    size != ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE +
-	    (u64)instance->frame_count * ARCHIVE_SHELL_PAYLOAD_RECORD_SIZE) return false;
-	const u8* record = section + ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE +
-		(size_t)frame_index * ARCHIVE_SHELL_PAYLOAD_RECORD_SIZE;
-	range->offset = archive_shell_read_u64(record);
-	range->size = archive_shell_read_u32(record + 8);
-	range->source_index = archive_shell_read_u32(record + 12);
-	archive_shell_source_t source;
-	return range->source_index < shell->source_count && range->size > 0 &&
-	       archive_shell_get_source(shell, range->source_index, &source) &&
-	       range->offset <= source.byte_size &&
-	       range->size <= source.byte_size - range->offset;
+	if (instance->payload_map_kind ==
+	    ARCHIVE_SHELL_PAYLOAD_DELTA_OFFSETS) {
+		u32 gap_count = archive_shell_read_u32(section + 12);
+		u64 delta_size =
+			(u64)instance->frame_count *
+			ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE;
+		u64 gap_size =
+			(u64)gap_count * ARCHIVE_SHELL_PAYLOAD_GAP_RECORD_SIZE;
+		if (archive_shell_read_u32(section + 28) !=
+			    ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE ||
+		    delta_size >
+			    UINT64_MAX - ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE ||
+		    gap_size >
+			    UINT64_MAX - ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE -
+				    delta_size ||
+		    size != ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE +
+			    delta_size + gap_size)
+			return false;
+		const u8* deltas =
+			section + ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE;
+		u64 start = 0;
+		for (u32 frame = 1; frame <= frame_index; ++frame) {
+			u32 delta = archive_shell_read_u32(
+				deltas + (size_t)frame *
+					ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE);
+			if (start > UINT64_MAX - delta) return false;
+			start += delta;
+		}
+		u32 frame_size = archive_shell_read_u32(section + 24);
+		if (frame_index + 1 < instance->frame_count) {
+			u32 next_delta = archive_shell_read_u32(
+				deltas + (size_t)(frame_index + 1) *
+					ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE);
+			u32 gap = 0;
+			const u8* gaps =
+				deltas +
+				(size_t)instance->frame_count *
+					ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE;
+			u32 low = 0;
+			u32 high = gap_count;
+			while (low < high) {
+				u32 middle = low + (high - low) / 2;
+				const u8* gap_record =
+					gaps + (size_t)middle *
+						ARCHIVE_SHELL_PAYLOAD_GAP_RECORD_SIZE;
+				u32 corrected_frame =
+					archive_shell_read_u32(gap_record);
+				if (corrected_frame < frame_index) low = middle + 1;
+				else high = middle;
+			}
+			if (low < gap_count) {
+				const u8* gap_record =
+					gaps + (size_t)low *
+						ARCHIVE_SHELL_PAYLOAD_GAP_RECORD_SIZE;
+				if (archive_shell_read_u32(gap_record) ==
+				    frame_index)
+					gap = archive_shell_read_u32(gap_record + 4);
+			}
+			if (gap >= next_delta) return false;
+			frame_size = next_delta - gap;
+		}
+		u64 base = archive_shell_read_u64(section + 16);
+		if (base > UINT64_MAX - start) return false;
+		range->source_index = instance->source_index;
+		range->offset = base + start;
+		range->size = frame_size;
+		archive_shell_source_t source;
+		return frame_size > 0 &&
+		       archive_shell_get_source(shell, range->source_index, &source) &&
+		       range->offset <= source.byte_size &&
+		       range->size <= source.byte_size - range->offset;
+	}
+	return false;
 }
 
 bool archive_shell_get_frame(const archive_shell_view_t* shell,

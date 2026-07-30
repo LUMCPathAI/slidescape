@@ -45,8 +45,8 @@ typedef enum archive_shell_frame_map_kind_t {
 
 typedef enum archive_shell_payload_map_kind_t {
 	ARCHIVE_SHELL_PAYLOAD_FIXED_STRIDE = 1,
-	ARCHIVE_SHELL_PAYLOAD_OFFSET_SIZE = 2,
 	ARCHIVE_SHELL_PAYLOAD_FRAME_INDEX = 3,
+	ARCHIVE_SHELL_PAYLOAD_DELTA_OFFSETS = 4,
 } archive_shell_payload_map_kind_t;
 
 typedef enum archive_shell_provider_kind_t {

@@ -374,9 +374,15 @@ static void archive_handle_request(archive_socket_t client, const archive_reposi
 			"{\"status\":\"ok\",\"service\":\"slidescape-pathology-archive\","
 			"\"repositorySchemaVersion\":1,\"part10Cache\":{"
 			"\"resident\":%d,\"capacity\":%d,\"hits\":%llu,\"misses\":%llu,"
+			"\"evictions\":%llu},\"shellCache\":{"
+			"\"resident\":%d,\"capacity\":%d,\"hits\":%llu,\"misses\":%llu,"
 			"\"evictions\":%llu}}\n",
 			stats.resident_count, stats.capacity, (unsigned long long)stats.hits,
-			(unsigned long long)stats.misses, (unsigned long long)stats.evictions);
+			(unsigned long long)stats.misses, (unsigned long long)stats.evictions,
+			stats.shell_resident_count, stats.shell_capacity,
+			(unsigned long long)stats.shell_hits,
+			(unsigned long long)stats.shell_misses,
+			(unsigned long long)stats.shell_evictions);
 		archive_send_json(client, 200, "OK", body);
 		return;
 	}

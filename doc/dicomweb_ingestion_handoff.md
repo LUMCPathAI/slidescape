@@ -104,7 +104,7 @@ work.
   the in-memory QIDO/provider index;
 - virtual-shell binary format v1 with an aligned section directory, stable
   source-digest references, inline optical-path/ICC data, compact regular or explicit
-  frame semantics, fixed-stride or offset/size payload lookup, and validated
+  frame semantics, fixed-stride or delta-offset payload lookup, and validated
   single-instance and aggregate Part 10 writers/loaders;
 - SQLite schema v4 publication of one aggregate shell per initial Study/Series
   logical-slide group, with a durable shell-directory index and individual DICOMweb
@@ -125,9 +125,11 @@ work.
   using content-addressed filesystem links instead of copying source bytes. Linked
   objects are checksummed during ingestion and again on first provider-cache use;
   moving, changing, or deleting the external source invalidates retrieval;
-- SQLite index reconstruction from published shell representations and a bounded
-  shell-provider cache that validates shell/source digests, projects metadata, and
-  performs frame byte lookup without request-time Part 10 reparsing;
+- SQLite index reconstruction from published shell representations, a bounded
+  aggregate-shell cache shared by every instance in the logical slide, and a bounded
+  per-instance provider cache. The shared entry owns the validated shell bytes and,
+  for MRXS, the parsed native adapter; the instance entries project metadata and
+  retain only instance-specific source state;
 - a versioned repository layout separating immutable objects, bundle manifests,
   representations, durable published state, disposable derived data, and staging;
 - shared DICOM UID validation and bounded source/virtual-instance C contracts;
@@ -157,7 +159,7 @@ limitations are:
 - the current manifest describes provider ownership, regular versus explicit frame
   geometry, slide coordinates, dimension counts/defaults, pixel spacing, and an
   optional ICC digest; compact explicit spatial/dimension maps can now be generated
-  and validated. Aggregate recipe v6 retains the ordered source-object set and
+  and validated. Aggregate recipe v7 retains the ordered source-object set and
   grouping policy. The regenerated shell retains patient/study scalar identifiers
   and full patient names; optical-path identity, description, illumination codes,
   filter bands, objectives, DICOM Color Space, validated inline ICC bytes, and
@@ -165,8 +167,12 @@ limitations are:
   nested specimen-preparation tree preserving concept names, CODE, TEXT, NUM with
   units, UIDREF, DATETIME, DATE, TIME, and PNAME values. Metadata WADO reconstructs
   the corresponding DICOM content-item sequences;
-- pre-v6 development publications are no longer accepted. Development repositories
-  must be recreated and ingested again; automated representation upgrades remain;
+- pre-v7 Part 10 development publications are no longer accepted. Policy v7 removes
+  the flat 16-byte-per-frame explicit payload records. Encapsulated frames use one
+  64-bit base, 32-bit deltas between frame starts, one explicit final-frame size,
+  and sparse non-frame gap corrections; all other frame sizes are derived from the
+  next delta. Development repositories must be recreated and ingested again;
+  automated representation upgrades remain future work;
 - staging is not crash-durable and is not safe as a multi-process transaction;
 - virtual-shell representation publication is atomic after its immutable inputs are
   stored. Missing or corrupt Part 10 shells are lazily regenerated after validating
@@ -252,9 +258,9 @@ batching are complete. Continue with:
 The aggregate and series-metadata slices are implemented with deterministic
 Study/Series grouping and persisted shell-directory ordering. Typed
 specimen-preparation content is retained without flattening its step or parent-child
-structure. Policy v6 promotes ten canonically equal patient/study/series attributes
+structure. Policy v7 promotes ten canonically equal patient/study/series attributes
 plus equal container/specimen/preparation sections, while retaining per-instance
-overrides for the remaining attributes. Series metadata loads that aggregate once,
+overrides for the remaining attributes. Series metadata reuses the aggregate cache,
 rejects incomplete or inconsistent index spans, and projects every instance as a
 complete independent DICOM dataset. Governed acquisition grouping remains future
 schema work. Continue Part 10 response-parity tests throughout.
