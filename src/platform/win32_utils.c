@@ -209,7 +209,7 @@ file_stream_t file_stream_open_for_writing(const char* filename) {
 
 	size_t filename_len = strlen(filename) + 1;
 	wchar_t* wide_filename = win32_string_widen(filename, filename_len, (wchar_t*) alloca(2 * filename_len));
-	HANDLE handle = CreateFileW(wide_filename, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+	HANDLE handle = CreateFileW(wide_filename, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
 	                            FILE_ATTRIBUTE_NORMAL /* | FILE_FLAG_SEQUENTIAL_SCAN */
 		/*| FILE_FLAG_NO_BUFFERING |*/ /* | FILE_FLAG_OVERLAPPED*/,
 		                        NULL);
