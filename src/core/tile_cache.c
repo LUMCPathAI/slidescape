@@ -568,8 +568,17 @@ bool tile_cache_try_begin_decode(image_t* image, i32 level, i32 tile_index, u32 
 	platform_mutex_lock(&cache->lock);
 	tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, level, tile_index);
 	if (!tile_cache_accepts_work_locked(cache) || !tile ||
-	    tile->decode_in_flight || tile->upload_pending ||
-	    tile->cpu_resident || tile->gpu_resident) {
+	    tile->decode_in_flight || tile->upload_pending) {
+		platform_mutex_unlock(&cache->lock);
+		return false;
+	}
+	u32 residency_demand = demand_flags &
+	                       (TILE_CACHE_DEMAND_CPU_RESIDENCY | TILE_CACHE_DEMAND_GPU_RESIDENCY);
+	bool requested_residency_satisfied = residency_demand ?
+			(!(residency_demand & TILE_CACHE_DEMAND_CPU_RESIDENCY) || tile->cpu_resident) &&
+			(!(residency_demand & TILE_CACHE_DEMAND_GPU_RESIDENCY) || tile->gpu_resident) :
+			(tile->cpu_resident || tile->gpu_resident);
+	if (requested_residency_satisfied) {
 		platform_mutex_unlock(&cache->lock);
 		return false;
 	}

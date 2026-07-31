@@ -145,6 +145,21 @@ TEST_CASE("tile cache suppresses duplicate decode requests") {
 	tile_cache_test_image_destroy(&fixture);
 }
 
+TEST_CASE("GPU-resident tile can be decoded for a later CPU request") {
+	tile_cache_test_image_t fixture = {};
+	tile_cache_test_image_init(&fixture);
+	REQUIRE(fixture.image.tile_cache != nullptr);
+
+	tile_cache_store_gpu_texture(&fixture.image, 0, 0, 42);
+	CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	                                        TILE_CACHE_DEMAND_GPU_RESIDENCY, 10, 1));
+	CHECK(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	                                  TILE_CACHE_DEMAND_CPU_RESIDENCY, 10, 1));
+	tile_cache_cancel_decode(&fixture.image, 0, 0);
+
+	tile_cache_test_image_destroy(&fixture);
+}
+
 TEST_CASE("tile cache grants one decode reservation to competing callers") {
 	tile_cache_test_ensure_thread_memory();
 	tile_cache_test_image_t fixture = {};
