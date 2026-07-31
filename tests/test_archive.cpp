@@ -6,6 +6,7 @@
 #include "archive_routes.h"
 #include "archive_shell.h"
 #include "archive_shell_recipe.h"
+#include "archive_sha256.h"
 #include "archive_index.h"
 #include "archive_ingest.h"
 #include "archive_frame_map.h"
@@ -37,6 +38,66 @@ static void archive_test_remove_database(const char* root) {
 		snprintf(path, sizeof(path), "%s/%s%s", root, ARCHIVE_DATABASE_FILENAME, suffix);
 		remove(path);
 	}
+}
+
+TEST_CASE("pathology archive SHA-256 supports incremental input boundaries") {
+	struct sha256_vector_t {
+		const char* input;
+		const char* digest;
+	};
+	const sha256_vector_t vectors[] = {
+		{"", "e3b0c44298fc1c149afbf4c8996fb924"
+		     "27ae41e4649b934ca495991b7852b855"},
+		{"abc", "ba7816bf8f01cfea414140de5dae2223"
+		        "b00361a396177a9cb410ff61f20015ad"},
+		{"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+		 "248d6a61d20638b8e5c026930c3e6039"
+		 "a33ce45964ff2167f6ecedd419db06c1"},
+	};
+	for (const sha256_vector_t& vector : vectors) {
+		size_t size = strlen(vector.input);
+		char one_shot[65];
+		REQUIRE(archive_sha256_bytes(vector.input, size, one_shot));
+		CHECK(strcmp(one_shot, vector.digest) == 0);
+
+		archive_sha256_t streaming = {};
+		archive_sha256_initialize(&streaming);
+		for (size_t offset = 0; offset < size;) {
+			size_t chunk = offset % 17 + 1;
+			if (chunk > size - offset) chunk = size - offset;
+			REQUIRE(archive_sha256_update(
+				&streaming, vector.input + offset, chunk));
+			offset += chunk;
+		}
+		CHECK(streaming.byte_count == size);
+		u8 digest[32];
+		char incremental[65];
+		archive_sha256_finish(&streaming, digest);
+		archive_sha256_hex(digest, incremental);
+		CHECK(strcmp(incremental, vector.digest) == 0);
+	}
+
+	archive_sha256_t empty_updates = {};
+	archive_sha256_initialize(&empty_updates);
+	CHECK(archive_sha256_update(&empty_updates, nullptr, 0));
+	CHECK_FALSE(archive_sha256_update(&empty_updates, nullptr, 1));
+
+	char repeated[1000];
+	memset(repeated, 'a', sizeof(repeated));
+	archive_sha256_t million_a = {};
+	archive_sha256_initialize(&million_a);
+	bool updated = true;
+	for (i32 i = 0; i < 1000; ++i)
+		updated = updated &&
+		          archive_sha256_update(&million_a, repeated, sizeof(repeated));
+	REQUIRE(updated);
+	u8 million_digest[32];
+	char million_hex[65];
+	archive_sha256_finish(&million_a, million_digest);
+	archive_sha256_hex(million_digest, million_hex);
+	CHECK(strcmp(million_hex,
+	             "cdc76e5c9914fb9281a1c7e284d73e67"
+	             "f1809a48a497200e046d39ccc7112cd0") == 0);
 }
 
 TEST_CASE("pathology archive selects a frame representation from Accept") {

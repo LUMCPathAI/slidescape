@@ -23,6 +23,9 @@ if (APPLE)
     # NOTE: the script will by default look in `~/Downloads` for an OpenSlide binary distribution named `openslide-bin-*-macos-arm64-x86_64`
     set(MACOS_OPENSLIDE_DYLIB "" CACHE FILEPATH "Optional path to libopenslide.dylib for the macOS app bundle")
     set(MACOS_OPENSLIDE_ROOT "" CACHE PATH "Optional path to an official OpenSlide macOS binary distribution")
+    option(SLIDESCAPE_ARCHIVE_USE_COMMONCRYPTO
+            "Use the macOS CommonCrypto SHA-256 backend for the pathology archive"
+            ON)
 endif()
 
 # Detect CPU type and whether we're building 64-bit or 32-bit code
@@ -568,10 +571,25 @@ set(SLIDESCAPE_ARCHIVE_CORE_FILES
         src/archive/archive_instance_provider.c
         src/dicom/dicom_uid.c
 )
+if (NOT(APPLE AND SLIDESCAPE_ARCHIVE_USE_COMMONCRYPTO))
+    list(APPEND SLIDESCAPE_ARCHIVE_CORE_FILES src/third_party/sha256.c)
+endif()
 add_library(slidescape_archive_core STATIC ${SLIDESCAPE_ARCHIVE_CORE_FILES})
 target_include_directories(slidescape_archive_core PUBLIC src/archive)
 target_compile_definitions(slidescape_archive_core PRIVATE IS_SERVER=1)
 target_link_libraries(slidescape_archive_core PRIVATE slidescape_sqlite)
+if (APPLE AND SLIDESCAPE_ARCHIVE_USE_COMMONCRYPTO)
+    find_library(SECURITY_FRAMEWORK Security)
+    if (NOT SECURITY_FRAMEWORK)
+        message(FATAL_ERROR "Security.framework is required for the CommonCrypto archive SHA-256 backend")
+    endif()
+    target_compile_definitions(slidescape_archive_core PUBLIC
+            ARCHIVE_SHA256_USE_COMMON_CRYPTO=1)
+    target_link_libraries(slidescape_archive_core PRIVATE ${SECURITY_FRAMEWORK})
+else()
+    target_compile_definitions(slidescape_archive_core PUBLIC
+            ARCHIVE_SHA256_USE_COMMON_CRYPTO=0)
+endif()
 
 if (BUILD_SLIDESCAPE_ARCHIVE)
     add_executable(slidescape_archive

@@ -121,6 +121,11 @@ work.
   one `TILED_SPARSE` VOLUME instance per native pyramid level in one aggregate shell;
   compact row runs enumerate only occupied native positions, and frame WADO passes
   their standalone JPEG tiles through without decoding;
+- archive SHA-256 keeps one streaming API but uses CommonCrypto by default on macOS
+  and a vendored Apache-2.0 backend elsewhere. The vendored backend dispatches to
+  x86 SHA-NI at runtime, uses ARM SHA2 when the compiler target provides it, and
+  otherwise retains a portable C fallback. macOS builds can exercise that path with
+  `-DSLIDESCAPE_ARCHIVE_USE_COMMONCRYPTO=OFF`;
 - development-only external Part 10 ingestion from an arbitrary file or directory.
   Canonical absolute paths are stored in SQLite instead of copying bytes or creating
   filesystem links under `objects/`. Sources are checksummed during ingestion;

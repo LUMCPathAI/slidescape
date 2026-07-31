@@ -12,15 +12,29 @@
 
 #include "common.h"
 
+#ifndef ARCHIVE_SHA256_USE_COMMON_CRYPTO
+#if defined(__APPLE__)
+#define ARCHIVE_SHA256_USE_COMMON_CRYPTO 1
+#else
+#define ARCHIVE_SHA256_USE_COMMON_CRYPTO 0
+#endif
+#endif
+
+#if ARCHIVE_SHA256_USE_COMMON_CRYPTO
+#include <CommonCrypto/CommonDigest.h>
+typedef CC_SHA256_CTX archive_sha256_backend_t;
+#else
+#include "sha256.h"
+typedef slidescape_sha256_context_t archive_sha256_backend_t;
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct archive_sha256_t {
-	u32 state[8];
 	u64 byte_count;
-	u8 buffer[64];
-	size_t buffer_size;
+	archive_sha256_backend_t backend;
 } archive_sha256_t;
 
 void archive_sha256_initialize(archive_sha256_t* sha);
