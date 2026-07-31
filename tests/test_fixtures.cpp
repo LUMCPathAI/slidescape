@@ -460,7 +460,8 @@ static void check_archive_part10_provider(dicom_instance_t* instance, u32 one_ba
 	         instance->sop_instance_uid.value);
 	snprintf(record.sop_class_uid, sizeof(record.sop_class_uid), "%s", instance->sop_class_uid.value);
 	snprintf(record.provider, sizeof(record.provider), "part10");
-	snprintf(record.object_key, sizeof(record.object_key), "%s", source_object.storage_key);
+	snprintf(record.external_path, sizeof(record.external_path), "%s",
+	         source_object.external_path);
 	snprintf(record.object_sha256, sizeof(record.object_sha256), "%s", source_object.sha256);
 	record.object_byte_size = source_object.byte_size;
 	snprintf(record.shell_key, sizeof(record.shell_key), "%s", stored_shell.storage_key);
@@ -714,10 +715,6 @@ static void check_archive_part10_provider(dicom_instance_t* instance, u32 one_ba
 		&repository, synthetic_shell_object.storage_key,
 		synthetic_shell_path, sizeof(synthetic_shell_path)));
 	CHECK(remove(synthetic_shell_path) == 0);
-	char source_object_path[ARCHIVE_PATH_CAPACITY];
-	REQUIRE(archive_repository_make_path(&repository, source_object.storage_key,
-	                                     source_object_path, sizeof(source_object_path)));
-	CHECK(remove(source_object_path) == 0);
 	char shell_prefix_path[ARCHIVE_PATH_CAPACITY];
 	snprintf(shell_prefix_path, sizeof(shell_prefix_path), "%s/shells/sha256/%.2s",
 	         temp_path, stored_shell.sha256);
@@ -728,12 +725,6 @@ static void check_archive_part10_provider(dicom_instance_t* instance, u32 one_ba
 		         synthetic_shell_object.sha256);
 		CHECK(rmdir(shell_prefix_path) == 0);
 	}
-	char object_prefix_path[ARCHIVE_PATH_CAPACITY];
-	snprintf(object_prefix_path, sizeof(object_prefix_path), "%s/objects/sha256/%.2s",
-	         temp_path, source_object.sha256);
-	CHECK(rmdir(object_prefix_path) == 0);
-	snprintf(object_prefix_path, sizeof(object_prefix_path), "%s/objects/sha256", temp_path);
-	CHECK(rmdir(object_prefix_path) == 0);
 	snprintf(shell_prefix_path, sizeof(shell_prefix_path), "%s/shells/sha256", temp_path);
 	CHECK(rmdir(shell_prefix_path) == 0);
 	const char* children[] = {
@@ -1207,7 +1198,8 @@ TEST_CASE("P480 MRXS adapter builds a sparse virtual DICOM pyramid") {
 		CHECK(instance.provider_kind == ARCHIVE_SHELL_PROVIDER_MRXS_NATIVE);
 		CHECK(instance.provider_parameter_version == ARCHIVE_MRXS_ADAPTER_VERSION);
 		CHECK(instance.frame_map_kind == ARCHIVE_SHELL_FRAME_MAP_SPARSE_RUNS);
-		CHECK(instance.payload_map_kind == ARCHIVE_SHELL_PAYLOAD_FRAME_INDEX);
+		CHECK(instance.payload_map_kind ==
+		      ARCHIVE_SHELL_PAYLOAD_NATIVE_OFFSET_SIZE_SOA);
 		CHECK(instance.frame_count == occupied_count);
 		CHECK(strcmp(instance.study_instance_uid,
 		             adapter.study_instance_uid) == 0);
@@ -1217,6 +1209,23 @@ TEST_CASE("P480 MRXS adapter builds a sparse virtual DICOM pyramid") {
 		             adapter.sop_instance_uids[i]) == 0);
 		CHECK(strcmp(instance.transfer_syntax_uid,
 		             "1.2.840.10008.1.2.4.50") == 0);
+		u32 first_occupied = 0;
+		while (first_occupied <
+		       (u32)(level->width_in_tiles *
+		             level->height_in_tiles) &&
+		       !level->tiles[first_occupied].hier_entry.length)
+			++first_occupied;
+		REQUIRE(first_occupied <
+		        (u32)(level->width_in_tiles *
+		              level->height_in_tiles));
+		archive_shell_native_payload_t payload = {};
+		REQUIRE(archive_shell_get_native_payload(
+			&shell, &instance, 0, &payload));
+		const mrxs_hier_entry_t expected =
+			level->tiles[first_occupied].hier_entry;
+		CHECK(payload.file_index == expected.file);
+		CHECK(payload.offset == expected.offset);
+		CHECK(payload.size == expected.length);
 	}
 
 	u32 lowest_level = (u32)adapter.slide.level_count - 1;
@@ -1283,10 +1292,52 @@ TEST_CASE("P480 MRXS adapter builds a sparse virtual DICOM pyramid") {
 	archive_repository_t repository = {};
 	REQUIRE(archive_repository_initialize(
 		&repository, temp_path, error, sizeof(error)) == ARCHIVE_REPOSITORY_OK);
-	const char descriptor[] = "slidescape-mrxs-test-bundle-v1\n";
+	char descriptor[KILOBYTES(64)] =
+		"slidescape-mrxs-bundle-v1\n";
+	size_t descriptor_size = strlen(descriptor);
+	const char* zero_digest =
+		"0000000000000000000000000000000000000000000000000000000000000000";
+	for (i32 object_index = 0;
+	     object_index < adapter.slide.dat_count + 3; ++object_index) {
+		const char* logical_name =
+			object_index == 0 ? "source.mrxs" :
+			object_index == 1 ? "companion/Slidedat.ini" :
+			object_index == 2 ? "companion/Index.dat" : nullptr;
+		char generated_name[ARCHIVE_PATH_CAPACITY] = {};
+		u64 byte_size = 1;
+		if (object_index >= 3) {
+			const char* dat_name =
+				adapter.slide.dat_filenames[object_index - 3];
+			snprintf(generated_name, sizeof(generated_name),
+			         "companion/%s", dat_name);
+			logical_name = generated_name;
+			char dat_path[ARCHIVE_PATH_CAPACITY];
+			snprintf(dat_path, sizeof(dat_path), "%s", fixture->path);
+			char* extension = strrchr(dat_path, '.');
+			REQUIRE(extension != nullptr);
+			*extension = '\0';
+			REQUIRE(strlen(dat_path) + strlen(dat_name) + 2 <
+			        sizeof(dat_path));
+			strcat(dat_path, PATH_SEP);
+			strcat(dat_path, dat_name);
+			struct stat info = {};
+			REQUIRE(platform_stat(dat_path, &info) == 0);
+			byte_size = (u64)info.st_size;
+		}
+		i32 written = snprintf(
+			descriptor + descriptor_size,
+			sizeof(descriptor) - descriptor_size,
+			"object\t%d\t%s\t%s\t%llu\n",
+			object_index, logical_name, zero_digest,
+			(unsigned long long)byte_size);
+		REQUIRE(written > 0);
+		REQUIRE((size_t)written <
+		        sizeof(descriptor) - descriptor_size);
+		descriptor_size += (size_t)written;
+	}
 	archive_object_t descriptor_object = {};
 	REQUIRE(archive_object_store_control_bytes(
-		&repository, descriptor, sizeof(descriptor) - 1,
+		&repository, descriptor, descriptor_size,
 		"application/vnd.slidescape.mrxs-bundle",
 		&descriptor_object, error, sizeof(error)) == ARCHIVE_OBJECT_OK);
 	archive_database_bundle_t bundle = {};
@@ -1361,12 +1412,13 @@ TEST_CASE("P480 MRXS adapter builds a sparse virtual DICOM pyramid") {
 	publication.instance_count = adapter.slide.level_count;
 	snprintf(publication.provider_kind, sizeof(publication.provider_kind),
 	         "mrxs-native");
-	snprintf(publication.adapter_version, sizeof(publication.adapter_version), "3");
+	snprintf(publication.adapter_version, sizeof(publication.adapter_version), "4");
 	snprintf(publication.frame_media_type, sizeof(publication.frame_media_type),
 	         "image/jpeg");
 	snprintf(publication.frame_source, sizeof(publication.frame_source), "GENERATED");
 	snprintf(publication.frame_policy_version,
-	         sizeof(publication.frame_policy_version), "mrxs-jpeg-sparse-v3");
+	         sizeof(publication.frame_policy_version),
+	         "mrxs-jpeg-shell-payload-v5");
 	REQUIRE(archive_database_publish_shells(
 		&repository, bundle.id, &publication, 1,
 		error, sizeof(error)) == ARCHIVE_DATABASE_OK);

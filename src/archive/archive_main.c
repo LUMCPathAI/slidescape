@@ -119,7 +119,9 @@ int main(int argc, char** argv) {
 		}
 		if (reference_source)
 			printf("Development reference mode: source bytes remain externally owned "
-			       "and must not be moved, changed, or deleted.\n");
+			       "and must not be moved, changed, or deleted; their absolute paths "
+			       "are stored in SQLite and objects/ contains no reference payloads "
+			       "or symbolic links.\n");
 		printf("Published %d DICOM instance%s in %d series and %d stud%s\n",
 		       result.instance_count, result.instance_count == 1 ? "" : "s",
 		       result.series_count, result.study_count, result.study_count == 1 ? "y" : "ies");

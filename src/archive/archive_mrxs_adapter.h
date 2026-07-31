@@ -19,7 +19,7 @@
 extern "C" {
 #endif
 
-#define ARCHIVE_MRXS_ADAPTER_VERSION 3
+#define ARCHIVE_MRXS_ADAPTER_VERSION 5
 #define ARCHIVE_MRXS_MAX_LEVELS 16
 #define ARCHIVE_MRXS_RECIPE_MEDIA_TYPE \
 	"application/vnd.slidescape.mrxs-native-recipe"

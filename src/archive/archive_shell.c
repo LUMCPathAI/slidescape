@@ -29,6 +29,7 @@
 #define ARCHIVE_SHELL_PAYLOAD_CORRECTION_RECORD_SIZE 4
 #define ARCHIVE_SHELL_PAYLOAD_OFFSET_RECORD_SIZE 8
 #define ARCHIVE_SHELL_PAYLOAD_SIZE_RECORD_SIZE 4
+#define ARCHIVE_SHELL_PAYLOAD_FILE_RECORD_SIZE 4
 #define ARCHIVE_SHELL_SPARSE_RUN_HEADER_SIZE 32
 #define ARCHIVE_SHELL_SPARSE_RUN_RECORD_SIZE 16
 #define ARCHIVE_SHELL_SPARSE_RUN_VERSION 1
@@ -726,6 +727,77 @@ static bool archive_shell_find_last_encapsulated_frame_size(
 	return false;
 }
 
+static bool archive_shell_build_native_payload_map(
+		const archive_shell_native_payload_t* payloads,
+		u32 payload_count, archive_shell_section_t* section,
+		archive_shell_payload_map_kind_t* kind) {
+	if (!payloads || !payload_count || !section || !kind)
+		return false;
+	bool common_file = true;
+	for (u32 frame = 1; frame < payload_count; ++frame)
+		if (payloads[frame].file_index !=
+		    payloads[0].file_index) {
+			common_file = false;
+			break;
+		}
+	u64 per_frame_size =
+		ARCHIVE_SHELL_PAYLOAD_OFFSET_RECORD_SIZE +
+		ARCHIVE_SHELL_PAYLOAD_SIZE_RECORD_SIZE +
+		(common_file ? 0 :
+		 ARCHIVE_SHELL_PAYLOAD_FILE_RECORD_SIZE);
+	u64 required = ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE +
+		(u64)payload_count * per_frame_size;
+	if (required > SIZE_MAX) return false;
+	section->size = (size_t)required;
+	section->data = calloc(1, section->size);
+	if (!section->data) return false;
+	*kind = ARCHIVE_SHELL_PAYLOAD_NATIVE_OFFSET_SIZE_SOA;
+	archive_shell_write_u32(section->data, *kind);
+	archive_shell_write_u32(section->data + 4, payload_count);
+	if (common_file)
+		archive_shell_write_u32(
+			section->data + 8,
+			payloads[0].file_index);
+	archive_shell_write_u32(
+		section->data + 12,
+		ARCHIVE_SHELL_PAYLOAD_SIZE_RECORD_SIZE);
+	archive_shell_write_u32(
+		section->data + 24,
+		common_file ? 0 :
+			ARCHIVE_SHELL_PAYLOAD_FILE_RECORD_SIZE);
+	archive_shell_write_u32(
+		section->data + 28,
+		ARCHIVE_SHELL_PAYLOAD_OFFSET_RECORD_SIZE);
+	u8* files = section->data + ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE;
+	u8* offsets = files + (common_file ? 0 :
+		(size_t)payload_count *
+			ARCHIVE_SHELL_PAYLOAD_FILE_RECORD_SIZE);
+	u8* sizes = offsets +
+		(size_t)payload_count *
+			ARCHIVE_SHELL_PAYLOAD_OFFSET_RECORD_SIZE;
+	for (u32 frame = 0; frame < payload_count; ++frame) {
+		if (!payloads[frame].size) {
+			free(section->data);
+			memset(section, 0, sizeof(*section));
+			return false;
+		}
+		if (!common_file)
+			archive_shell_write_u32(
+				files + (size_t)frame *
+					ARCHIVE_SHELL_PAYLOAD_FILE_RECORD_SIZE,
+				payloads[frame].file_index);
+		archive_shell_write_u64(
+			offsets + (size_t)frame *
+				ARCHIVE_SHELL_PAYLOAD_OFFSET_RECORD_SIZE,
+			payloads[frame].offset);
+		archive_shell_write_u32(
+			sizes + (size_t)frame *
+				ARCHIVE_SHELL_PAYLOAD_SIZE_RECORD_SIZE,
+			payloads[frame].size);
+	}
+	return true;
+}
+
 static bool archive_shell_build_payload_map(dicom_instance_t* instance, u64 source_size,
 		archive_shell_section_t* section, archive_shell_payload_map_kind_t* kind,
 		char* error, size_t error_capacity) {
@@ -934,6 +1006,25 @@ static const u8* archive_shell_section_data(const archive_shell_view_t* shell,
 	u64 offset = archive_shell_read_u64(entry + 16);
 	u64 encoded_size = archive_shell_read_u64(entry + 24);
 	if (offset > shell->size || encoded_size > shell->size - offset) return NULL;
+	if (size) *size = encoded_size;
+	return shell->data + offset;
+}
+
+static const u8* archive_shell_scoped_section_data(
+		const archive_shell_view_t* shell, u32 index,
+		u32 expected_kind, u32 instance_index, u64* size) {
+	const u8* entry = archive_shell_section_entry(shell, index);
+	if (!entry || archive_shell_read_u32(entry) != expected_kind)
+		return NULL;
+	u32 owner = archive_shell_read_u32(entry + 8);
+	if (owner != instance_index &&
+	    owner != ARCHIVE_SHELL_SHARED_SECTION)
+		return NULL;
+	u64 offset = archive_shell_read_u64(entry + 16);
+	u64 encoded_size = archive_shell_read_u64(entry + 24);
+	if (offset > shell->size ||
+	    encoded_size > shell->size - offset)
+		return NULL;
 	if (size) *size = encoded_size;
 	return shell->data + offset;
 }
@@ -1149,17 +1240,14 @@ bool archive_shell_build_part10(const archive_shell_build_part10_input_t* input,
 	payload_section->instance_index = 0;
 	payload_section->flags = ARCHIVE_SHELL_SECTION_CRITICAL;
 	archive_shell_payload_map_kind_t payload_kind = 0;
-	if (success && input->provider_uses_frame_index) {
-		payload_section->size = ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE;
-		payload_section->data = calloc(1, payload_section->size);
-		if (!payload_section->data) {
+	if (success && input->native_payloads) {
+		if (input->native_payload_count !=
+			    (u32)instance->number_of_frames ||
+		    !archive_shell_build_native_payload_map(
+			    input->native_payloads,
+			    input->native_payload_count,
+			    payload_section, &payload_kind))
 			success = false;
-		} else {
-			payload_kind = ARCHIVE_SHELL_PAYLOAD_FRAME_INDEX;
-			archive_shell_write_u32(payload_section->data, payload_kind);
-			archive_shell_write_u32(
-				payload_section->data + 4, (u32)instance->number_of_frames);
-		}
 	} else if (success && !archive_shell_build_payload_map(
 			instance, input->source_byte_size, payload_section,
 			&payload_kind, error, error_capacity)) {
@@ -1219,7 +1307,6 @@ bool archive_shell_build_part10(const archive_shell_build_part10_input_t* input,
 			input->provider_kind ? input->provider_kind :
 				ARCHIVE_SHELL_PROVIDER_PART10);
 		archive_shell_write_u32(record + 188,
-			!input->provider_uses_frame_index &&
 			instance->is_pixel_data_encapsulated ?
 				ARCHIVE_SHELL_PAYLOAD_ENCAPSULATED : 0);
 	}
@@ -1372,16 +1459,16 @@ static bool archive_shell_adjust_section_strings(
 	}
 }
 
-static bool archive_shell_set_payload_source(
-		archive_shell_section_t* section, u32 source_index) {
+static bool archive_shell_payload_kind_is_known(
+		const archive_shell_section_t* section) {
 	if (!section || section->kind != ARCHIVE_SHELL_SECTION_PAYLOAD_MAP ||
 	    section->size < ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE) return false;
 	u32 kind = archive_shell_read_u32(section->data);
 	if (kind == ARCHIVE_SHELL_PAYLOAD_FIXED_STRIDE ||
 	    kind == ARCHIVE_SHELL_PAYLOAD_OFFSET_SIZE_SOA ||
-	    kind == ARCHIVE_SHELL_PAYLOAD_FRAME_INDEX ||
-	    kind == ARCHIVE_SHELL_PAYLOAD_DELTA_OFFSETS) return true;
-	(void)source_index;
+	    kind == ARCHIVE_SHELL_PAYLOAD_DELTA_OFFSETS ||
+	    kind == ARCHIVE_SHELL_PAYLOAD_NATIVE_OFFSET_SIZE_SOA)
+		return true;
 	return false;
 }
 
@@ -1641,6 +1728,66 @@ static bool archive_shell_preparation_metadata_is_equal(
 	return true;
 }
 
+static bool archive_shell_optical_paths_are_equal(
+		const archive_shell_view_t* a, const archive_shell_view_t* b) {
+	archive_shell_instance_t a_instance = {0};
+	archive_shell_instance_t b_instance = {0};
+	if (!archive_shell_get_instance(a, 0, &a_instance) ||
+	    !archive_shell_get_instance(b, 0, &b_instance) ||
+	    a_instance.optical_path_count != b_instance.optical_path_count)
+		return false;
+	for (u32 i = 0; i < a_instance.optical_path_count; ++i) {
+		archive_shell_optical_path_t ap = {0};
+		archive_shell_optical_path_t bp = {0};
+		if (!archive_shell_get_optical_path(a, &a_instance, i, &ap) ||
+		    !archive_shell_get_optical_path(b, &b_instance, i, &bp))
+			return false;
+		const char* a_values[] = {
+			ap.identifier, ap.description, ap.color_space,
+			ap.illumination_type_code_value,
+			ap.illumination_type_coding_scheme,
+			ap.illumination_type_code_meaning,
+			ap.illumination_color_code_value,
+			ap.illumination_color_coding_scheme,
+			ap.illumination_color_code_meaning,
+		};
+		const char* b_values[] = {
+			bp.identifier, bp.description, bp.color_space,
+			bp.illumination_type_code_value,
+			bp.illumination_type_coding_scheme,
+			bp.illumination_type_code_meaning,
+			bp.illumination_color_code_value,
+			bp.illumination_color_coding_scheme,
+			bp.illumination_color_code_meaning,
+		};
+		for (i32 field = 0; field < COUNT(a_values); ++field)
+			if (strcmp(a_values[field], b_values[field]) != 0)
+				return false;
+		if (ap.illumination_wavelength != bp.illumination_wavelength ||
+		    ap.source_preserved_fields != bp.source_preserved_fields ||
+		    ap.inferred_fields != bp.inferred_fields ||
+		    ap.light_path_filter_pass_through_wavelength !=
+			    bp.light_path_filter_pass_through_wavelength ||
+		    memcmp(ap.light_path_filter_pass_band,
+		           bp.light_path_filter_pass_band,
+		           sizeof(ap.light_path_filter_pass_band)) != 0 ||
+		    ap.image_path_filter_pass_through_wavelength !=
+			    bp.image_path_filter_pass_through_wavelength ||
+		    memcmp(ap.image_path_filter_pass_band,
+		           bp.image_path_filter_pass_band,
+		           sizeof(ap.image_path_filter_pass_band)) != 0 ||
+		    ap.objective_lens_power != bp.objective_lens_power ||
+		    ap.objective_lens_numerical_aperture !=
+			    bp.objective_lens_numerical_aperture ||
+		    ap.icc_profile_size != bp.icc_profile_size ||
+		    (ap.icc_profile_size &&
+		     memcmp(ap.icc_profile, bp.icc_profile,
+		            (size_t)ap.icc_profile_size) != 0))
+			return false;
+	}
+	return true;
+}
+
 bool archive_shell_build_part10_aggregate(
 		const archive_shell_build_part10_aggregate_input_t* input,
 		archive_shell_buffer_t* shell, char* error, size_t error_capacity) {
@@ -1677,6 +1824,12 @@ bool archive_shell_build_part10_aggregate(
 			          strings_size64 <= SIZE_MAX;
 		}
 	}
+	bool share_optical_paths = success;
+	for (u32 i = 1;
+	     i < input->instance_count && share_optical_paths; ++i)
+		share_optical_paths =
+			archive_shell_optical_paths_are_equal(
+				views, views + i);
 	for (u32 i = 1; i < input->instance_count && success; ++i) {
 		if (!archive_shell_specimen_metadata_is_equal(
 				views, views + i)) {
@@ -1697,6 +1850,8 @@ bool archive_shell_build_part10_aggregate(
 	if (success) {
 		u64 duplicate_sections =
 			(u64)(input->instance_count - 1) * 2;
+		if (share_optical_paths)
+			duplicate_sections += input->instance_count - 1;
 		success = section_count64 >= duplicate_sections;
 		if (success) section_count64 -= duplicate_sections;
 	}
@@ -1743,6 +1898,7 @@ bool archive_shell_build_part10_aggregate(
 		}
 	}
 	u32 string_cursor = 1;
+	u32 shared_optical_section_index = ARCHIVE_SHELL_NO_SECTION;
 	for (u32 i = 0; i < input->instance_count && success; ++i) {
 		const archive_shell_view_t* view = views + i;
 		archive_shell_source_t source = {0};
@@ -1778,6 +1934,10 @@ bool archive_shell_build_part10_aggregate(
 		archive_shell_write_u32(instance_record + 172, ARCHIVE_SHELL_NO_SECTION);
 		archive_shell_write_u32(instance_record + 176, ARCHIVE_SHELL_NO_SECTION);
 		archive_shell_write_u32(instance_record + 180, ARCHIVE_SHELL_NO_SECTION);
+		if (i > 0 && share_optical_paths)
+			archive_shell_write_u32(
+				instance_record + 172,
+				shared_optical_section_index);
 
 		for (u32 source_index = 0;
 		     source_index < view->section_count && success; ++source_index) {
@@ -1787,7 +1947,9 @@ bool archive_shell_build_part10_aggregate(
 			if (owner == ARCHIVE_SHELL_SHARED_SECTION) continue;
 			if (i > 0 &&
 			    (kind == ARCHIVE_SHELL_SECTION_SPECIMEN_TABLE ||
-			     kind == ARCHIVE_SHELL_SECTION_SPECIMEN_PREPARATION))
+			     kind == ARCHIVE_SHELL_SECTION_SPECIMEN_PREPARATION ||
+			     (share_optical_paths &&
+			      kind == ARCHIVE_SHELL_SECTION_OPTICAL_PATH_TABLE)))
 				continue;
 			if (output_section >= section_count) {
 				success = false;
@@ -1797,7 +1959,9 @@ bool archive_shell_build_part10_aggregate(
 			destination->kind = kind;
 			destination->instance_index =
 				(kind == ARCHIVE_SHELL_SECTION_SPECIMEN_TABLE ||
-				 kind == ARCHIVE_SHELL_SECTION_SPECIMEN_PREPARATION) ?
+				 kind == ARCHIVE_SHELL_SECTION_SPECIMEN_PREPARATION ||
+				 (share_optical_paths &&
+				  kind == ARCHIVE_SHELL_SECTION_OPTICAL_PATH_TABLE)) ?
 				ARCHIVE_SHELL_SHARED_SECTION : i;
 			destination->flags = archive_shell_read_u16(entry + 6);
 			u64 source_size = archive_shell_read_u64(entry + 24);
@@ -1824,7 +1988,8 @@ bool archive_shell_build_part10_aggregate(
 					destination);
 			if (success &&
 			    kind == ARCHIVE_SHELL_SECTION_PAYLOAD_MAP) {
-				success = archive_shell_set_payload_source(destination, i);
+				success =
+					archive_shell_payload_kind_is_known(destination);
 			}
 			if (!success) break;
 			switch (kind) {
@@ -1833,6 +1998,9 @@ bool archive_shell_build_part10_aggregate(
 					break;
 				case ARCHIVE_SHELL_SECTION_OPTICAL_PATH_TABLE:
 					archive_shell_write_u32(instance_record + 172, output_section);
+					if (share_optical_paths)
+						shared_optical_section_index =
+							output_section;
 					break;
 				case ARCHIVE_SHELL_SECTION_FRAME_MAP:
 					archive_shell_write_u32(instance_record + 176, output_section);
@@ -2112,6 +2280,45 @@ static bool archive_shell_explicit_payload_is_valid(
 	return true;
 }
 
+static bool archive_shell_native_payload_is_valid(
+		const u8* payload, u64 payload_size, u32 frame_count) {
+	if (!payload || payload_size < ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE ||
+	    !frame_count ||
+	    archive_shell_read_u32(payload + 12) !=
+		    ARCHIVE_SHELL_PAYLOAD_SIZE_RECORD_SIZE ||
+	    archive_shell_read_u32(payload + 28) !=
+		    ARCHIVE_SHELL_PAYLOAD_OFFSET_RECORD_SIZE)
+		return false;
+	u32 kind = archive_shell_read_u32(payload);
+	if (kind != ARCHIVE_SHELL_PAYLOAD_NATIVE_OFFSET_SIZE_SOA)
+		return false;
+	u32 file_record_size = archive_shell_read_u32(payload + 24);
+	if (file_record_size != 0 &&
+	    file_record_size != ARCHIVE_SHELL_PAYLOAD_FILE_RECORD_SIZE)
+		return false;
+	u64 records_size =
+		(u64)frame_count *
+		(ARCHIVE_SHELL_PAYLOAD_OFFSET_RECORD_SIZE +
+		 ARCHIVE_SHELL_PAYLOAD_SIZE_RECORD_SIZE +
+		 file_record_size);
+	if (records_size >
+		    UINT64_MAX - ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE ||
+	    payload_size !=
+		    ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE + records_size)
+		return false;
+	const u8* sizes =
+		payload + ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE +
+		(u64)frame_count *
+			(ARCHIVE_SHELL_PAYLOAD_OFFSET_RECORD_SIZE +
+			 file_record_size);
+	for (u32 frame = 0; frame < frame_count; ++frame)
+		if (!archive_shell_read_u32(
+				sizes + (size_t)frame *
+					ARCHIVE_SHELL_PAYLOAD_SIZE_RECORD_SIZE))
+			return false;
+	return true;
+}
+
 static bool archive_shell_sparse_runs_are_valid(
 		const u8* data, u64 size,
 		const archive_shell_instance_t* instance) {
@@ -2233,15 +2440,19 @@ bool archive_shell_get_instance(const archive_shell_view_t* shell, u32 instance_
 	     instance->frame_map_kind != ARCHIVE_SHELL_FRAME_MAP_SPARSE_RUNS) ||
 	    (instance->payload_map_kind != ARCHIVE_SHELL_PAYLOAD_FIXED_STRIDE &&
 	     instance->payload_map_kind != ARCHIVE_SHELL_PAYLOAD_OFFSET_SIZE_SOA &&
-	     instance->payload_map_kind != ARCHIVE_SHELL_PAYLOAD_FRAME_INDEX &&
 	     instance->payload_map_kind !=
-		     ARCHIVE_SHELL_PAYLOAD_DELTA_OFFSETS)) return false;
+		     ARCHIVE_SHELL_PAYLOAD_DELTA_OFFSETS &&
+	     instance->payload_map_kind !=
+		     ARCHIVE_SHELL_PAYLOAD_NATIVE_OFFSET_SIZE_SOA))
+		return false;
 	u64 attribute_size = 0;
 	const u8* attributes = archive_shell_section_data(shell, instance->attribute_section_index,
 		ARCHIVE_SHELL_SECTION_ATTRIBUTE_TABLE, instance_index, &attribute_size);
 	u64 optical_size = 0;
-	const u8* optical_paths = archive_shell_section_data(shell, instance->optical_path_section_index,
-		ARCHIVE_SHELL_SECTION_OPTICAL_PATH_TABLE, instance_index, &optical_size);
+	const u8* optical_paths = archive_shell_scoped_section_data(
+		shell, instance->optical_path_section_index,
+		ARCHIVE_SHELL_SECTION_OPTICAL_PATH_TABLE,
+		instance_index, &optical_size);
 	u64 payload_size = 0;
 	const u8* payload = archive_shell_section_data(shell, instance->payload_map_section_index,
 		ARCHIVE_SHELL_SECTION_PAYLOAD_MAP, instance_index, &payload_size);
@@ -2262,8 +2473,6 @@ bool archive_shell_get_instance(const archive_shell_view_t* shell, u32 instance_
 	    archive_shell_read_u32(payload + 4) != instance->frame_count) return false;
 	if (instance->payload_map_kind == ARCHIVE_SHELL_PAYLOAD_FIXED_STRIDE &&
 	    payload_size != ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE) return false;
-	if (instance->payload_map_kind == ARCHIVE_SHELL_PAYLOAD_FRAME_INDEX &&
-	    payload_size != ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE) return false;
 	if (instance->payload_map_kind ==
 		    ARCHIVE_SHELL_PAYLOAD_OFFSET_SIZE_SOA &&
 	    !archive_shell_explicit_payload_is_valid(
@@ -2274,6 +2483,13 @@ bool archive_shell_get_instance(const archive_shell_view_t* shell, u32 instance_
 	    !archive_shell_delta_payload_is_valid(
 		    payload, payload_size, instance->frame_count))
 		return false;
+	if (instance->payload_map_kind ==
+		    ARCHIVE_SHELL_PAYLOAD_NATIVE_OFFSET_SIZE_SOA) {
+		if (!archive_shell_native_payload_is_valid(
+				payload, payload_size,
+				instance->frame_count))
+			return false;
+	}
 	if (instance->frame_map_kind == ARCHIVE_SHELL_FRAME_MAP_REGULAR_GRID) {
 		if (instance->frame_map_section_index != ARCHIVE_SHELL_NO_SECTION ||
 		    !instance->tiles_per_row || !instance->tiles_per_column ||
@@ -2357,8 +2573,6 @@ bool archive_shell_get_payload_range(const archive_shell_view_t* shell,
 	if (!section || size < ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE ||
 	    archive_shell_read_u32(section + 4) != instance->frame_count) return false;
 	memset(range, 0, sizeof(*range));
-	if (instance->payload_map_kind == ARCHIVE_SHELL_PAYLOAD_FRAME_INDEX)
-		return false;
 	if (instance->payload_map_kind == ARCHIVE_SHELL_PAYLOAD_FIXED_STRIDE) {
 		u64 base = archive_shell_read_u64(section + 16);
 		u64 stride = archive_shell_read_u64(section + 24);
@@ -2462,6 +2676,119 @@ bool archive_shell_get_payload_range(const archive_shell_view_t* shell,
 		       range->size <= source.byte_size - range->offset;
 	}
 	return false;
+}
+
+bool archive_shell_get_native_payload(const archive_shell_view_t* shell,
+		const archive_shell_instance_t* instance, u32 frame_index,
+		archive_shell_native_payload_t* payload) {
+	if (!shell || !instance || !payload ||
+	    frame_index >= instance->frame_count ||
+	    instance->payload_map_kind !=
+		    ARCHIVE_SHELL_PAYLOAD_NATIVE_OFFSET_SIZE_SOA)
+		return false;
+	u64 size = 0;
+	const u8* section = archive_shell_section_data(
+		shell, instance->payload_map_section_index,
+		ARCHIVE_SHELL_SECTION_PAYLOAD_MAP,
+		instance->instance_index, &size);
+	if (!archive_shell_native_payload_is_valid(
+			section, size, instance->frame_count))
+		return false;
+	u32 file_record_size = archive_shell_read_u32(section + 24);
+	bool multiple_sources =
+		file_record_size == ARCHIVE_SHELL_PAYLOAD_FILE_RECORD_SIZE;
+	u64 files_size = multiple_sources ?
+		(u64)instance->frame_count *
+			file_record_size : 0;
+	u64 offsets_size =
+		(u64)instance->frame_count *
+		ARCHIVE_SHELL_PAYLOAD_OFFSET_RECORD_SIZE;
+	const u8* files =
+		section + ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE;
+	const u8* offsets = files + files_size;
+	const u8* sizes = offsets + offsets_size;
+	payload->file_index = multiple_sources ?
+		archive_shell_read_u32(
+			files + (size_t)frame_index *
+				ARCHIVE_SHELL_PAYLOAD_FILE_RECORD_SIZE) :
+		archive_shell_read_u32(section + 8);
+	payload->offset = archive_shell_read_u64(
+		offsets + (size_t)frame_index *
+			ARCHIVE_SHELL_PAYLOAD_OFFSET_RECORD_SIZE);
+	payload->size = archive_shell_read_u32(
+		sizes + (size_t)frame_index *
+			ARCHIVE_SHELL_PAYLOAD_SIZE_RECORD_SIZE);
+	return payload->size > 0;
+}
+
+bool archive_shell_build_payload_ranges(const archive_shell_view_t* shell,
+		const archive_shell_instance_t* instance,
+		archive_shell_payload_range_t* ranges, u32 range_count) {
+	if (!shell || !instance || !ranges ||
+	    range_count != instance->frame_count)
+		return false;
+	if (instance->payload_map_kind !=
+	    ARCHIVE_SHELL_PAYLOAD_DELTA_OFFSETS) {
+		for (u32 frame = 0; frame < range_count; ++frame)
+			if (!archive_shell_get_payload_range(
+					shell, instance, frame, ranges + frame))
+				return false;
+		return true;
+	}
+
+	u64 size = 0;
+	const u8* section = archive_shell_section_data(
+		shell, instance->payload_map_section_index,
+		ARCHIVE_SHELL_SECTION_PAYLOAD_MAP,
+		instance->instance_index, &size);
+	u64 array_size =
+		(u64)instance->frame_count *
+		ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE;
+	if (!section ||
+	    size != ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE + array_size * 2 ||
+	    archive_shell_read_u32(section) !=
+		    ARCHIVE_SHELL_PAYLOAD_DELTA_OFFSETS ||
+	    archive_shell_read_u32(section + 4) != instance->frame_count)
+		return false;
+	const u8* deltas =
+		section + ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE;
+	const u8* corrections = deltas + array_size;
+	archive_shell_source_t source = {0};
+	if (!archive_shell_get_source(
+			shell, instance->source_index, &source))
+		return false;
+	u64 offset = archive_shell_read_u64(section + 16);
+	for (u32 frame = 0; frame < range_count; ++frame) {
+		u32 frame_size = archive_shell_read_u32(section + 24);
+		if (frame + 1 < range_count) {
+			u32 next_delta = archive_shell_read_u32(
+				deltas + (size_t)(frame + 1) *
+					ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE);
+			u32 correction = archive_shell_read_u32(
+				corrections + (size_t)frame *
+					ARCHIVE_SHELL_PAYLOAD_CORRECTION_RECORD_SIZE);
+			if (!next_delta || correction >= next_delta)
+				return false;
+			frame_size = next_delta - correction;
+		}
+		if (!frame_size || offset > source.byte_size ||
+		    frame_size > source.byte_size - offset)
+			return false;
+		ranges[frame] = (archive_shell_payload_range_t){
+			.source_index = instance->source_index,
+			.offset = offset,
+			.size = frame_size,
+		};
+		if (frame + 1 < range_count) {
+			u32 next_delta = archive_shell_read_u32(
+				deltas + (size_t)(frame + 1) *
+					ARCHIVE_SHELL_PAYLOAD_DELTA_RECORD_SIZE);
+			if (offset > UINT64_MAX - next_delta)
+				return false;
+			offset += next_delta;
+		}
+	}
+	return true;
 }
 
 bool archive_shell_get_frame(const archive_shell_view_t* shell,
@@ -2578,8 +2905,10 @@ bool archive_shell_get_optical_path(const archive_shell_view_t* shell,
 	if (!shell || !instance || !optical_path ||
 	    optical_path_index >= instance->optical_path_count) return false;
 	u64 size = 0;
-	const u8* section = archive_shell_section_data(shell, instance->optical_path_section_index,
-		ARCHIVE_SHELL_SECTION_OPTICAL_PATH_TABLE, instance->instance_index, &size);
+	const u8* section = archive_shell_scoped_section_data(
+		shell, instance->optical_path_section_index,
+		ARCHIVE_SHELL_SECTION_OPTICAL_PATH_TABLE,
+		instance->instance_index, &size);
 	if (!section || size < ARCHIVE_SHELL_OPTICAL_HEADER_SIZE ||
 	    archive_shell_read_u32(section) != instance->optical_path_count ||
 	    archive_shell_read_u32(section + 4) != ARCHIVE_SHELL_OPTICAL_RECORD_SIZE) return false;

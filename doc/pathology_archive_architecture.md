@@ -90,7 +90,7 @@ limited to a profile whose RGB semantics are unambiguous. JPEG Baseline generati
 for clients that cannot decode stored JPEG 2000 still requires an explicit lossy
 quality/color policy and is not a prerequisite for extending the schema.
 
-The former TSV compatibility index has been removed. SQLite schema v4 stores the Part
+The former TSV compatibility index has been removed. SQLite schema v5 stores the Part
 10 query projection and provider locator, and only objects belonging to a `PUBLISHED`
 bundle are loaded at startup. Protocol handlers continue to consume the in-memory
 index/provider interface, so a future live database-backed query implementation does
@@ -100,33 +100,23 @@ TLS termination, OIDC/OAuth policy, rate limiting, and externally reachable bind
 belong at a reviewed gateway boundary. The current loopback listener is development
 scaffolding, not a production HTTP implementation.
 
-## Staged Representation Contracts
+## Representation Contracts
 
-`archive_manifest.*` defines early versioned C contracts for source-bundle provenance
-and virtual DICOM WSI instances. The implementation validates and stages bounded JSON
-manifests for a single-writer development workflow. Source formats initially cover
-DICOM, MRXS, iSyntax, and TIFF. Manifest schema v2 adds provider kind and immutable
-locator, pass-through/generated provenance, regular-row-major or explicit frame-map
-contracts, tile-grid dimensions, optical-path/focal-plane counts, pixel spacing, and
-an optional ICC digest. It also records slide-coordinate origin/orientation, the
-single optical-path and focal-plane defaults, and an immutable compact-map key when
-frames span multiple optical paths or focal planes. The Part 10 adapter populates
-these deterministic fields directly from parsed WSI metadata and only classifies a
-single-dimension `TILED_FULL` image as regular row-major. The contract does not yet
-describe complete optical-path definitions, materialize explicit spatial/dimension
-maps, capture specimen/container data, or define a full governed color policy, so it
-is not yet the canonical production schema.
+The early staged JSON manifest implementation has been removed. SQLite publication,
+retained generation recipes, and the virtual shell are now the only representation
+contracts. Source formats and future adapters must enter through those boundaries
+rather than introducing a parallel manifest authority.
 
 `virtual_dicom_shell_v0_1.md` defines the durable representation contract, including
 aggregate ownership, identity/versioning, optical-path and color policy, provider
 behavior, publication state, and worked Part 10 and MRXS-native examples. Binary
-format v1 now has an aligned section directory plus single-instance and aggregate
+format v2 has an aligned section directory plus single-instance and aggregate
 Part 10 writers/loaders. The aggregate writer combines validated instance sections,
 remaps their source/string/section references, and retains independent payload maps
 inside one logical-slide object. Transactional representation publication records the
 shell as canonical metadata and the exact aggregate generation recipe as provenance.
 The index and byte provider select instances by their persisted shell-directory index.
-Complete governed attributes and shared-section deduplication remain.
+Broader governed attributes remain; identical optical-path/ICC sections are shared.
 
 `archive_frame_map.*` defines the explicit-map encoding embedded by shell v1. It has a
 64-byte little-endian header followed by fixed 32-byte records in DICOM frame order.
@@ -179,7 +169,7 @@ initialization. It establishes strict, foreign-keyed tables for immutable object
 bundles, metadata versions, shell representations, QIDO projections, instance
 providers, promised frame representations, publications, and outbox work. The
 database carries an application ID and explicit schema version and is opened in WAL
-mode. Repository `open` and `check` validate it read-only. Schema v4 intentionally has
+mode. Repository `open` and `check` validate it read-only. Schema v5 intentionally has
 no migration path during this development phase: delete and recreate the repository
 with `slidescape_archive init REPOSITORY`. Part 10 ingest registers immutable
 members and marks their bundle `PUBLISHED` in one writer transaction; lookup admits
@@ -312,7 +302,7 @@ DICOM shell rather than introduce a competing source of truth.
 ### Logical-Slide Aggregate
 
 One published representation and one virtual shell describe one logical slide, not
-one SOP Instance. SQLite schema v4 and the Part 10 publisher now implement this
+one SOP Instance. SQLite schema v5 and the Part 10 publisher now implement this
 aggregate with a persisted shell-directory index per DICOM instance. The initial
 grouping identity is the Series Instance UID within its Study; governed
 container/specimen/acquisition grouping must replace or extend that provisional
@@ -360,18 +350,17 @@ The first format-neutrality spike is implemented for the private P480 brightfiel
 fixture. It uses the built-in MRXS reader through the generic shell, publication,
 index, and provider contracts; HTTP routing contains no MRXS behavior. The profile is
 intentionally narrow: regular non-overlapping JPEG tiles, known spacing, one optical
-path/focal plane, native JPEG pass-through plus generated background JPEG frames,
-and one `TILED_FULL` VOLUME instance per native level. `TILED_FULL` describes the
-published virtual frame set, not whether every MRXS grid slot has stored bytes.
+path/focal plane, native JPEG pass-through, and one `TILED_SPARSE` VOLUME instance
+per native level. Only occupied native tile positions become DICOM frames.
 The development recipe currently points to the original
 absolute path even though ingestion checksums every bundle member. This locator is
 not an owned, mutation-safe cloud source.
 
 Part 10 has a parallel development convenience: `ingest --source PATH --reference`
-creates content-addressed filesystem links rather than byte copies. The ordinary
-Part 10 shell/provider path remains unchanged, and a linked source is rehashed on
-first cache admission. This is explicitly external ownership, not durable archive
-storage.
+stores canonical absolute paths in SQLite rather than copying bytes or creating
+entries under `objects/`. Provider-cache admission checks availability and size
+without rehashing the WSI. This is explicitly external ownership, not durable
+archive storage.
 
 The viewer tile-cache locking/lifetime prerequisite and bounded four-frame DICOMweb
 batching are complete. The next implementation slices are:

@@ -9,7 +9,7 @@
 #include "archive_index.h"
 #include "archive_ingest.h"
 #include "archive_frame_map.h"
-#include "archive_manifest.h"
+#include "archive_mrxs_adapter.h"
 #include "archive_representation.h"
 #include "dicom.h"
 #include "dicomweb.h"
@@ -281,7 +281,7 @@ TEST_CASE("pathology archive repository has explicit immutable and publication b
 	CHECK(archive_repository_initialize(&repository, temp_path, error, sizeof(error)) ==
 	      ARCHIVE_REPOSITORY_INCOMPATIBLE_SCHEMA);
 	REQUIRE(sqlite3_open(path, &database) == SQLITE_OK);
-	REQUIRE(sqlite3_exec(database, "PRAGMA user_version = 4;", nullptr, nullptr, nullptr) ==
+	REQUIRE(sqlite3_exec(database, "PRAGMA user_version = 5;", nullptr, nullptr, nullptr) ==
 	        SQLITE_OK);
 	REQUIRE(sqlite3_close(database) == SQLITE_OK);
 	CHECK(archive_database_validate(&repository, error, sizeof(error)) == ARCHIVE_DATABASE_OK);
@@ -506,100 +506,6 @@ TEST_CASE("pathology archive repository has explicit immutable and publication b
 	CHECK(strcmp(instance_result.total_pixel_matrix_rows, "5345") == 0);
 	archive_index_destroy(&index);
 
-	archive_source_bundle_manifest_t bundle = {};
-	snprintf(bundle.bundle_id, sizeof(bundle.bundle_id), "idc-test-bundle");
-	bundle.source_format = ARCHIVE_SOURCE_FORMAT_DICOM;
-	memset(bundle.bundle_digest_sha256, 'a', 64);
-	bundle.bundle_digest_sha256[64] = '\0';
-	snprintf(bundle.adapter_name, sizeof(bundle.adapter_name), "slidescape-dicom");
-	snprintf(bundle.adapter_version, sizeof(bundle.adapter_version), "1-0");
-	bundle.object_count = 4;
-	bundle.total_bytes = 199 * MEGABYTES(1);
-	REQUIRE(archive_manifest_stage_source_bundle(&repository, &bundle, error, sizeof(error)));
-
-	archive_virtual_instance_manifest_t instance = {};
-	snprintf(instance.representation_id, sizeof(instance.representation_id), "idc-test-volume-1");
-	snprintf(instance.bundle_id, sizeof(instance.bundle_id), "%s", bundle.bundle_id);
-	instance.representation_version = 1;
-	snprintf(instance.study_instance_uid, sizeof(instance.study_instance_uid), "1.2.3");
-	snprintf(instance.series_instance_uid, sizeof(instance.series_instance_uid), "1.2.3.1");
-	snprintf(instance.sop_instance_uid, sizeof(instance.sop_instance_uid), "1.2.3.1.1");
-	snprintf(instance.sop_class_uid, sizeof(instance.sop_class_uid),
-	         "1.2.840.10008.5.1.4.1.1.77.1.6");
-	snprintf(instance.transfer_syntax_uid, sizeof(instance.transfer_syntax_uid),
-	         "1.2.840.10008.1.2.4.90");
-	snprintf(instance.image_flavor, sizeof(instance.image_flavor), "VOLUME");
-	snprintf(instance.photometric_interpretation, sizeof(instance.photometric_interpretation), "RGB");
-	instance.instance_number = 1;
-	instance.frame_count = 437;
-	instance.rows = 240;
-	instance.columns = 240;
-	instance.total_pixel_matrix_rows = 5345;
-	instance.total_pixel_matrix_columns = 4481;
-	instance.provider_kind = ARCHIVE_MANIFEST_PROVIDER_PART10;
-	snprintf(instance.provider_locator, sizeof(instance.provider_locator),
-	         "objects/test.dcm");
-	instance.representation_source = ARCHIVE_MANIFEST_REPRESENTATION_PASSTHROUGH;
-	instance.frame_map_kind = ARCHIVE_MANIFEST_FRAME_MAP_REGULAR_ROW_MAJOR;
-	instance.tiles_per_row = 19;
-	instance.tiles_per_column = 23;
-	instance.optical_path_count = 1;
-	instance.focal_plane_count = 1;
-	snprintf(instance.default_optical_path_identifier,
-	         sizeof(instance.default_optical_path_identifier), "0");
-	instance.has_default_focal_plane_z_offset = true;
-	instance.default_focal_plane_z_offset_um = 0.0f;
-	instance.pixel_spacing_row_mm = 0.00025f;
-	instance.pixel_spacing_column_mm = 0.00025f;
-	instance.has_slide_coordinate_origin = true;
-	instance.slide_coordinate_origin_x_mm = 25.5f;
-	instance.slide_coordinate_origin_y_mm = 42.0f;
-	instance.slide_coordinate_origin_z_mm = 0.0f;
-	instance.has_image_orientation_slide = true;
-	instance.image_orientation_slide[0] = 1.0f;
-	instance.image_orientation_slide[4] = 1.0f;
-	REQUIRE(archive_manifest_stage_virtual_instance(&repository, &instance, error, sizeof(error)));
-	CHECK_FALSE(archive_manifest_stage_virtual_instance(&repository, &instance, error, sizeof(error)));
-	archive_virtual_instance_manifest_t invalid_instance = instance;
-	invalid_instance.pixel_spacing_column_mm = 0.0f;
-	CHECK_FALSE(archive_virtual_instance_manifest_is_valid(&invalid_instance));
-	invalid_instance = instance;
-	invalid_instance.tiles_per_row = 18;
-	CHECK_FALSE(archive_virtual_instance_manifest_is_valid(&invalid_instance));
-	invalid_instance = instance;
-	invalid_instance.optical_path_count = 2;
-	invalid_instance.default_optical_path_identifier[0] = '\0';
-	CHECK_FALSE(archive_virtual_instance_manifest_is_valid(&invalid_instance));
-	snprintf(invalid_instance.frame_dimension_map_object_key,
-	         sizeof(invalid_instance.frame_dimension_map_object_key),
-	         "derived/test-dimensions.bin");
-	CHECK(archive_virtual_instance_manifest_is_valid(&invalid_instance));
-
-	snprintf(path, sizeof(path), "%s/staging/%s.source.json", temp_path, bundle.bundle_id);
-	CHECK(remove(path) == 0);
-	snprintf(path, sizeof(path), "%s/staging/%s.representation.json", temp_path,
-	         instance.representation_id);
-	FILE* representation_file = fopen(path, "rb");
-	REQUIRE(representation_file != nullptr);
-	char representation_json[8192] = {};
-	size_t representation_size = fread(representation_json, 1,
-	                                   sizeof(representation_json) - 1,
-	                                   representation_file);
-	CHECK(ferror(representation_file) == 0);
-	fclose(representation_file);
-	REQUIRE(representation_size > 0);
-	CHECK(strstr(representation_json, "\"schemaVersion\": 2") != nullptr);
-	CHECK(strstr(representation_json,
-	             "\"provider\": {\"kind\": \"part10\", \"locator\": \"objects/test.dcm\"}") != nullptr);
-	CHECK(strstr(representation_json, "\"mapKind\": \"regular-row-major\"") != nullptr);
-	CHECK(strstr(representation_json, "\"tilesPerRow\": 19") != nullptr);
-	CHECK(strstr(representation_json,
-	             "\"defaultOpticalPathIdentifier\": \"0\"") != nullptr);
-	CHECK(strstr(representation_json, "\"originMm\": [25.5, 42, 0]") != nullptr);
-	CHECK(strstr(representation_json,
-	             "\"imageOrientationSlide\": [1, 0, 0, 0, 1, 0]") != nullptr);
-	CHECK(remove(path) == 0);
-
 	const char* children[] = {
 		"staging", "derived", "representations", "bundles", "shells", "objects"
 	};
@@ -680,16 +586,25 @@ TEST_CASE("pathology archive stores immutable objects by verified SHA-256") {
 	REQUIRE(archive_object_reference_file(
 		&repository, reference_source_path, "application/octet-stream",
 		&referenced, error, sizeof(error)) == ARCHIVE_OBJECT_OK);
-	char referenced_path[ARCHIVE_PATH_CAPACITY];
-	REQUIRE(archive_repository_make_path(
-		&repository, referenced.storage_key,
-		referenced_path, sizeof(referenced_path)));
-#if !defined(_WIN32)
-	struct stat referenced_info = {};
-	REQUIRE(lstat(referenced_path, &referenced_info) == 0);
-	CHECK(S_ISLNK(referenced_info.st_mode));
+	CHECK(referenced.storage_key[0] == '\0');
+	char canonical_reference_path[ARCHIVE_PATH_CAPACITY] = {};
+#if defined(_WIN32)
+	REQUIRE(GetFullPathNameA(
+		reference_source_path, sizeof(canonical_reference_path),
+		canonical_reference_path, nullptr) > 0);
+#else
+	REQUIRE(realpath(
+		reference_source_path, canonical_reference_path) != nullptr);
 #endif
-	FILE* referenced_file = fopen(referenced_path, "rb");
+	CHECK(strcmp(referenced.external_path, canonical_reference_path) == 0);
+	archive_database_object_t referenced_record = {};
+	REQUIRE(archive_database_find_object(
+		&repository, referenced.sha256, &referenced_record,
+		error, sizeof(error)) == ARCHIVE_DATABASE_OK);
+	CHECK(referenced_record.storage_key[0] == '\0');
+	CHECK(strcmp(referenced_record.external_path,
+	             canonical_reference_path) == 0);
+	FILE* referenced_file = fopen(referenced.external_path, "rb");
 	REQUIRE(referenced_file != nullptr);
 	char referenced_bytes[sizeof(reference_payload)] = {};
 	CHECK(fread(referenced_bytes, 1, sizeof(reference_payload) - 1,
@@ -806,10 +721,6 @@ TEST_CASE("pathology archive stores immutable objects by verified SHA-256") {
 	char path[ARCHIVE_PATH_CAPACITY];
 	CHECK(remove(source_path) == 0);
 	CHECK(remove(reference_source_path) == 0);
-	CHECK(remove(referenced_path) == 0);
-	snprintf(path, sizeof(path), "%s/objects/sha256/%.2s",
-	         temp_path, referenced.sha256);
-	CHECK(archive_test_rmdir(path) == 0);
 	CHECK(remove(object_path) == 0);
 	snprintf(path, sizeof(path), "%s/objects/sha256/ba", temp_path);
 	CHECK(archive_test_rmdir(path) == 0);
@@ -838,70 +749,6 @@ TEST_CASE("pathology archive stores immutable objects by verified SHA-256") {
 	CHECK(remove(path) == 0);
 	archive_test_remove_database(temp_path);
 	CHECK(archive_test_rmdir(temp_path) == 0);
-}
-
-TEST_CASE("Part 10 metadata populates deterministic virtual-instance geometry") {
-	dicom_instance_t source = {};
-	snprintf(source.general_study.StudyInstanceUID.value,
-	         sizeof(source.general_study.StudyInstanceUID.value), "1.2.3");
-	snprintf(source.general_series.SeriesInstanceUID.value,
-	         sizeof(source.general_series.SeriesInstanceUID.value), "1.2.3.1");
-	snprintf(source.sop_instance_uid.value, sizeof(source.sop_instance_uid.value),
-	         "1.2.3.1.1");
-	snprintf(source.sop_class_uid.value, sizeof(source.sop_class_uid.value),
-	         "1.2.840.10008.5.1.4.1.1.77.1.6");
-	snprintf(source.transfer_syntax_uid.value, sizeof(source.transfer_syntax_uid.value),
-	         "1.2.840.10008.1.2.4.91");
-	source.image_flavor = DICOM_IMAGE_FLAVOR_VOLUME;
-	source.photometric_interpretation = DICOM_PHOTOMETRIC_INTERPRETATION_RGB;
-	source.instance_number = 3;
-	source.number_of_frames = 6;
-	source.rows = 240;
-	source.columns = 240;
-	source.total_pixel_matrix_rows = 480;
-	source.total_pixel_matrix_columns = 720;
-	source.pixel_spacing = V2F(0.0005f, 0.0005f);
-	source.is_tiled_full = true;
-	source.number_of_optical_paths = 1;
-	source.total_pixel_matrix_focal_planes = 1;
-	source.is_total_pixel_matrix_origin_known = true;
-	source.total_pixel_matrix_origin_x_mm = 12.5f;
-	source.total_pixel_matrix_origin_y_mm = 7.25f;
-	source.total_pixel_matrix_origin_z_mm = 0.0f;
-	source.is_image_orientation_slide_known = true;
-	source.image_orientation_slide[0] = 1.0f;
-	source.image_orientation_slide[4] = 1.0f;
-	dicom_optical_path_t optical_path = {};
-	optical_path.OpticalPathIdentifier.present = true;
-	snprintf(optical_path.OpticalPathIdentifier.value,
-	         sizeof(optical_path.OpticalPathIdentifier.value), "A");
-	arrput(source.optical_paths, optical_path);
-	for (i32 frame = 0; frame < 6; ++frame) {
-		dicom_plane_position_slide_t position = {};
-		position.z_offset_in_slide_coordinate_system = 1.5f;
-		arrput(source.per_frame_plane_position_slide, position);
-	}
-
-	archive_virtual_instance_manifest_t manifest = {};
-	snprintf(manifest.representation_id, sizeof(manifest.representation_id), "representation-1");
-	snprintf(manifest.bundle_id, sizeof(manifest.bundle_id), "bundle-1");
-	manifest.representation_version = 1;
-	snprintf(manifest.provider_locator, sizeof(manifest.provider_locator), "objects/test.dcm");
-	REQUIRE(archive_manifest_populate_part10_instance(&manifest, &source));
-	CHECK(manifest.frame_map_kind == ARCHIVE_MANIFEST_FRAME_MAP_REGULAR_ROW_MAJOR);
-	CHECK(manifest.tiles_per_row == 3);
-	CHECK(manifest.tiles_per_column == 2);
-	CHECK(manifest.optical_path_count == 1);
-	CHECK(strcmp(manifest.default_optical_path_identifier, "A") == 0);
-	CHECK(manifest.focal_plane_count == 1);
-	CHECK(manifest.has_default_focal_plane_z_offset);
-	CHECK(manifest.default_focal_plane_z_offset_um == doctest::Approx(1.5f));
-	CHECK(manifest.has_slide_coordinate_origin);
-	CHECK(manifest.has_image_orientation_slide);
-	CHECK(archive_virtual_instance_manifest_is_valid(&manifest));
-
-	arrfree(source.per_frame_plane_position_slide);
-	arrfree(source.optical_paths);
 }
 
 TEST_CASE("virtual DICOM shell loads one aligned Part 10 serving object") {
@@ -1081,7 +928,9 @@ TEST_CASE("virtual DICOM shell loads one aligned Part 10 serving object") {
 	REQUIRE(archive_shell_build_part10_recipe(
 		&recipe_input, recipe, &recipe_size, fingerprint));
 	CHECK(recipe_size == strlen(recipe));
-	CHECK(strstr(recipe, "adapter-policy\tpart10-delta-payload-v7\n") != nullptr);
+	CHECK(strstr(
+		recipe,
+		"adapter-policy\tpart10-cached-delta-payload-v9\n") != nullptr);
 	char replay_recipe[ARCHIVE_SHELL_RECIPE_CAPACITY] = {};
 	size_t replay_recipe_size = 0;
 	char replay_fingerprint[65] = {};
@@ -1214,6 +1063,20 @@ TEST_CASE("virtual DICOM shell loads one aligned Part 10 serving object") {
 			      compact_source.pixel_data_start_offset +
 			      compact_offsets[frame_index]);
 		CHECK(compact_payload.size == compact_sizes[frame_index]);
+	}
+	archive_shell_payload_range_t compact_ranges[
+		COUNT(compact_offsets)] = {};
+	REQUIRE(archive_shell_build_payload_ranges(
+		&compact_shell, &compact_instance, compact_ranges,
+		COUNT(compact_ranges)));
+	for (u32 frame_index = 0; frame_index < COUNT(compact_ranges);
+	     ++frame_index) {
+		CHECK(compact_ranges[frame_index].offset ==
+		      sizeof(dicom_header_t) +
+			      compact_source.pixel_data_start_offset +
+			      compact_offsets[frame_index]);
+		CHECK(compact_ranges[frame_index].size ==
+		      compact_sizes[frame_index]);
 	}
 	archive_shell_buffer_destroy(&compact_encoded);
 
@@ -1353,8 +1216,9 @@ TEST_CASE("virtual DICOM shell loads one aligned Part 10 serving object") {
 		aggregate_fingerprint));
 	CHECK(strstr(aggregate_recipe,
 	             "grouping-policy\tpart10-study-series-v1\n") != nullptr);
-	CHECK(strstr(aggregate_recipe,
-	             "adapter-policy\tpart10-delta-payload-v7\n") != nullptr);
+	CHECK(strstr(
+		aggregate_recipe,
+		"adapter-policy\tpart10-cached-delta-payload-v9\n") != nullptr);
 	archive_shell_build_part10_input_t aggregate_instances[2] = {
 		input,
 		{
@@ -1387,6 +1251,20 @@ TEST_CASE("virtual DICOM shell loads one aligned Part 10 serving object") {
 	CHECK(strcmp(aggregate_second.sop_instance_uid, "1.2.3.1.2") == 0);
 	CHECK(aggregate_first.source_index == 0);
 	CHECK(aggregate_second.source_index == 1);
+	CHECK(aggregate_first.optical_path_section_index ==
+	      aggregate_second.optical_path_section_index);
+	archive_shell_optical_path_t aggregate_first_path = {};
+	archive_shell_optical_path_t aggregate_second_path = {};
+	REQUIRE(archive_shell_get_optical_path(
+		&aggregate_shell, &aggregate_first, 0,
+		&aggregate_first_path));
+	REQUIRE(archive_shell_get_optical_path(
+		&aggregate_shell, &aggregate_second, 0,
+		&aggregate_second_path));
+	CHECK(aggregate_first_path.icc_profile ==
+	      aggregate_second_path.icc_profile);
+	CHECK(aggregate_first_path.icc_profile_size ==
+	      sizeof(icc_profile));
 	CHECK(archive_shell_get_governed_attribute_count(
 		      &aggregate_shell) == 10);
 	CHECK(archive_shell_get_attribute_override_count(
@@ -1440,6 +1318,41 @@ TEST_CASE("virtual DICOM shell loads one aligned Part 10 serving object") {
 	archive_shell_buffer_destroy(&conflicting_aggregate);
 	archive_shell_buffer_destroy(&aggregate_encoded);
 	free(aggregate_recipe);
+
+	archive_shell_native_payload_t native_payloads[6] = {};
+	for (u32 frame_index = 0; frame_index < COUNT(native_payloads);
+	     ++frame_index) {
+		native_payloads[frame_index].file_index =
+			frame_index < 3 ? 2 : 7;
+		native_payloads[frame_index].offset =
+			1000 + (u64)frame_index * 200;
+		native_payloads[frame_index].size = 150 + frame_index;
+	}
+	archive_shell_build_part10_input_t native_input = input;
+	native_input.provider_kind = ARCHIVE_SHELL_PROVIDER_MRXS_NATIVE;
+	native_input.provider_parameter_version =
+		ARCHIVE_MRXS_ADAPTER_VERSION;
+	native_input.native_payloads = native_payloads;
+	native_input.native_payload_count = COUNT(native_payloads);
+	archive_shell_buffer_t native_encoded = {};
+	REQUIRE(archive_shell_build_part10(
+		&native_input, &native_encoded, error, sizeof(error)));
+	archive_shell_view_t native_shell = {};
+	REQUIRE(archive_shell_open(
+		&native_shell, native_encoded.data, native_encoded.size,
+		error, sizeof(error)));
+	archive_shell_instance_t native_instance = {};
+	REQUIRE(archive_shell_get_instance(
+		&native_shell, 0, &native_instance));
+	CHECK(native_instance.payload_map_kind ==
+	      ARCHIVE_SHELL_PAYLOAD_NATIVE_OFFSET_SIZE_SOA);
+	archive_shell_native_payload_t native_payload = {};
+	REQUIRE(archive_shell_get_native_payload(
+		&native_shell, &native_instance, 4, &native_payload));
+	CHECK(native_payload.file_index == 7);
+	CHECK(native_payload.offset == 1800);
+	CHECK(native_payload.size == 154);
+	archive_shell_buffer_destroy(&native_encoded);
 
 	CHECK_FALSE(archive_shell_open(&shell, encoded.data, encoded.size - 1,
 	                               error, sizeof(error)));
@@ -1660,64 +1573,6 @@ TEST_CASE("explicit Part 10 frame maps preserve DICOM tile and dimension order")
 	archive_frame_map_t invalid = {};
 	CHECK_FALSE(archive_frame_map_parse(&invalid, encoded, encoded_size,
 	                                    error, sizeof(error)));
-
-	char temp_path[ARCHIVE_PATH_CAPACITY];
-#if defined(_WIN32)
-	char temp_base[L_tmpnam] = {0};
-	REQUIRE(tmpnam_s(temp_base, sizeof(temp_base)) == 0);
-	snprintf(temp_path, sizeof(temp_path), "%s-frame-map", temp_base);
-#else
-	REQUIRE(slidescape_test_make_temp_directory(
-		temp_path, sizeof(temp_path), "slidescape-frame-map-test"));
-#endif
-	archive_repository_t repository = {};
-	REQUIRE(archive_repository_initialize(&repository, temp_path, error, sizeof(error)) ==
-	        ARCHIVE_REPOSITORY_OK);
-	archive_virtual_instance_manifest_t manifest = {};
-	snprintf(manifest.representation_id, sizeof(manifest.representation_id),
-	         "multidimensional-volume");
-	snprintf(manifest.bundle_id, sizeof(manifest.bundle_id), "bundle-1");
-	manifest.representation_version = 1;
-	snprintf(manifest.provider_locator, sizeof(manifest.provider_locator),
-	         "objects/test.dcm");
-	REQUIRE(archive_manifest_materialize_part10_frame_map(
-		&repository, &manifest, &source, error, sizeof(error)));
-	CHECK(manifest.frame_map_kind == ARCHIVE_MANIFEST_FRAME_MAP_EXPLICIT);
-	CHECK(strcmp(manifest.frame_map_object_key,
-	             manifest.frame_dimension_map_object_key) == 0);
-	CHECK(archive_virtual_instance_manifest_is_valid(&manifest));
-	REQUIRE(archive_manifest_stage_virtual_instance(
-		&repository, &manifest, error, sizeof(error)));
-	char staged_map_path[ARCHIVE_PATH_CAPACITY];
-	REQUIRE(archive_repository_make_path(&repository, manifest.frame_map_object_key,
-	                                     staged_map_path, sizeof(staged_map_path)));
-	FILE* staged_map = fopen(staged_map_path, "rb");
-	REQUIRE(staged_map != nullptr);
-	CHECK(fseek(staged_map, 0, SEEK_END) == 0);
-	CHECK(ftell(staged_map) == (long)encoded_size);
-	fclose(staged_map);
-	CHECK_FALSE(archive_manifest_materialize_part10_frame_map(
-		&repository, &manifest, &source, error, sizeof(error)));
-
-	char staged_manifest_path[ARCHIVE_PATH_CAPACITY];
-	snprintf(staged_manifest_path, sizeof(staged_manifest_path),
-	         "%s/staging/%s.representation.json", temp_path,
-	         manifest.representation_id);
-	CHECK(remove(staged_manifest_path) == 0);
-	CHECK(remove(staged_map_path) == 0);
-	const char* children[] = {
-		"staging", "derived", "representations", "bundles", "shells", "objects"
-	};
-	for (const char* child : children) {
-		char child_path[ARCHIVE_PATH_CAPACITY];
-		snprintf(child_path, sizeof(child_path), "%s/%s", temp_path, child);
-		CHECK(archive_test_rmdir(child_path) == 0);
-	}
-	char descriptor_path[ARCHIVE_PATH_CAPACITY];
-	snprintf(descriptor_path, sizeof(descriptor_path), "%s/repository.json", temp_path);
-	CHECK(remove(descriptor_path) == 0);
-	archive_test_remove_database(temp_path);
-	CHECK(archive_test_rmdir(temp_path) == 0);
 
 	source.number_of_frames = 2;
 	source.concatenation_uid.len = 5;

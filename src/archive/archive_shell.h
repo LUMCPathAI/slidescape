@@ -16,7 +16,7 @@
 extern "C" {
 #endif
 
-#define ARCHIVE_SHELL_FORMAT_VERSION 1
+#define ARCHIVE_SHELL_FORMAT_VERSION 2
 #define ARCHIVE_SHELL_HEADER_SIZE 128
 #define ARCHIVE_SHELL_SECTION_ENTRY_SIZE 40
 #define ARCHIVE_SHELL_INSTANCE_RECORD_SIZE 192
@@ -47,8 +47,8 @@ typedef enum archive_shell_frame_map_kind_t {
 typedef enum archive_shell_payload_map_kind_t {
 	ARCHIVE_SHELL_PAYLOAD_FIXED_STRIDE = 1,
 	ARCHIVE_SHELL_PAYLOAD_OFFSET_SIZE_SOA = 2,
-	ARCHIVE_SHELL_PAYLOAD_FRAME_INDEX = 3,
-	ARCHIVE_SHELL_PAYLOAD_DELTA_OFFSETS = 4,
+	ARCHIVE_SHELL_PAYLOAD_DELTA_OFFSETS = 3,
+	ARCHIVE_SHELL_PAYLOAD_NATIVE_OFFSET_SIZE_SOA = 4,
 } archive_shell_payload_map_kind_t;
 
 typedef enum archive_shell_provider_kind_t {
@@ -85,7 +85,8 @@ typedef struct archive_shell_build_part10_input_t {
 	const char* representation_fingerprint;
 	archive_shell_provider_kind_t provider_kind;
 	u32 provider_parameter_version;
-	bool provider_uses_frame_index;
+	const struct archive_shell_native_payload_t* native_payloads;
+	u32 native_payload_count;
 } archive_shell_build_part10_input_t;
 
 typedef struct archive_shell_build_part10_aggregate_input_t {
@@ -170,10 +171,16 @@ typedef struct archive_shell_source_t {
 } archive_shell_source_t;
 
 typedef struct archive_shell_payload_range_t {
-	u32 source_index;
 	u64 offset;
 	u32 size;
+	u32 source_index;
 } archive_shell_payload_range_t;
+
+typedef struct archive_shell_native_payload_t {
+	u32 file_index;
+	u64 offset;
+	u32 size;
+} archive_shell_native_payload_t;
 
 typedef struct archive_shell_frame_t {
 	u32 row_position;
@@ -270,6 +277,12 @@ bool archive_shell_get_instance(const archive_shell_view_t* shell, u32 instance_
 bool archive_shell_get_payload_range(const archive_shell_view_t* shell,
 		const archive_shell_instance_t* instance, u32 frame_index,
 		archive_shell_payload_range_t* range);
+bool archive_shell_build_payload_ranges(const archive_shell_view_t* shell,
+		const archive_shell_instance_t* instance,
+		archive_shell_payload_range_t* ranges, u32 range_count);
+bool archive_shell_get_native_payload(const archive_shell_view_t* shell,
+		const archive_shell_instance_t* instance, u32 frame_index,
+		archive_shell_native_payload_t* payload);
 bool archive_shell_get_frame(const archive_shell_view_t* shell,
 		const archive_shell_instance_t* instance, u32 frame_index,
 		archive_shell_frame_t* frame);

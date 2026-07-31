@@ -50,6 +50,24 @@ static void archive_ingest_set_error(char* error, size_t capacity, const char* f
 	va_end(args);
 }
 
+static bool archive_ingest_object_path(
+		const archive_repository_t* repository,
+		const archive_object_t* object, char* path,
+		size_t path_capacity) {
+	if (!repository || !object || !path || !path_capacity)
+		return false;
+	if (object->external_path[0]) {
+		i32 length = snprintf(
+			path, path_capacity, "%s",
+			object->external_path);
+		return length > 0 && (size_t)length < path_capacity;
+	}
+	return object->storage_key[0] &&
+		archive_repository_make_path(
+			repository, object->storage_key,
+			path, path_capacity);
+}
+
 static bool archive_ingest_has_dcm_extension(const char* name) {
 	size_t length = strlen(name);
 	if (length < 4) return false;
@@ -437,7 +455,8 @@ bool archive_ingest_part10_path(const archive_repository_t* repository,
 				&object, error, error_capacity);
 		if (object_status != ARCHIVE_OBJECT_OK) {
 			success = false;
-		} else if (!archive_repository_make_path(repository, object.storage_key,
+		} else if (!archive_ingest_object_path(
+				repository, &object,
 				full_path, sizeof(full_path)) ||
 		    !dicom_open_single_instance_from_path(&dicom, full_path) || arrlen(dicom.instances) != 1) {
 			archive_ingest_set_error(error, error_capacity, "could not parse Part 10 object '%s'", paths.values[i]);
@@ -588,8 +607,8 @@ bool archive_ingest_part10_path(const archive_repository_t* repository,
 			    strcmp(members[i].database.series_instance_uid,
 			           members[j].database.series_instance_uid) != 0) continue;
 			char source_path[ARCHIVE_PATH_CAPACITY];
-			if (!archive_repository_make_path(
-					repository, members[j].object.storage_key,
+			if (!archive_ingest_object_path(
+					repository, &members[j].object,
 					source_path, sizeof(source_path)) ||
 			    !dicom_open_single_instance_from_path(
 				    dicoms + group_index, source_path) ||
@@ -763,7 +782,7 @@ bool archive_ingest_mrxs(const archive_repository_t* repository,
 	char fingerprint[65] = {0};
 	i32 fingerprint_length = success ? snprintf(
 		fingerprint_input, sizeof(fingerprint_input),
-				"slidescape-mrxs-virtual-dicom-v3\n%s\n",
+				"slidescape-mrxs-virtual-dicom-v5\n%s\n",
 		descriptor_object.sha256) : -1;
 	if (success &&
 	    (fingerprint_length <= 0 ||
@@ -870,7 +889,7 @@ bool archive_ingest_mrxs(const archive_repository_t* repository,
 			                    sizeof(publication.provider_kind),
 			                    "mrxs-native") &&
 			archive_ingest_copy(publication.adapter_version,
-			                    sizeof(publication.adapter_version), "3") &&
+			                    sizeof(publication.adapter_version), "4") &&
 			archive_ingest_copy(publication.frame_media_type,
 			                    sizeof(publication.frame_media_type),
 			                    "image/jpeg") &&
@@ -879,7 +898,7 @@ bool archive_ingest_mrxs(const archive_repository_t* repository,
 			                    "GENERATED") &&
 			archive_ingest_copy(publication.frame_policy_version,
 			                    sizeof(publication.frame_policy_version),
-			                    "mrxs-jpeg-sparse-v3");
+			                    "mrxs-jpeg-shell-payload-v5");
 		publication.shell_object_id = shell_object.id;
 		publication.recipe_object_id = recipe_object.id;
 		publication.instances = instances;

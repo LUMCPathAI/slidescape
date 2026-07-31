@@ -18,7 +18,7 @@ extern "C" {
 #endif
 
 #define ARCHIVE_DATABASE_FILENAME "archive.sqlite3"
-#define ARCHIVE_DATABASE_SCHEMA_VERSION 4
+#define ARCHIVE_DATABASE_SCHEMA_VERSION 5
 #define ARCHIVE_DATABASE_APPLICATION_ID 0x534C5041 /* "SLPA" */
 
 typedef enum archive_database_status_t {
@@ -35,6 +35,7 @@ typedef struct archive_database_object_t {
 	u64 byte_size;
 	char media_type[129];
 	char storage_key[257];
+	char external_path[ARCHIVE_PATH_CAPACITY];
 	bool already_registered;
 } archive_database_object_t;
 
@@ -97,6 +98,15 @@ archive_database_status_t archive_database_register_object(
 		const archive_repository_t* repository, const char* sha256, u64 byte_size,
 		const char* media_type, const char* storage_key,
 		archive_database_object_t* object, char* error, size_t error_capacity);
+archive_database_status_t archive_database_register_external_object(
+		const archive_repository_t* repository, const char* sha256,
+		u64 byte_size, const char* media_type, const char* external_path,
+		archive_database_object_t* object, char* error,
+		size_t error_capacity);
+archive_database_status_t archive_database_find_object(
+		const archive_repository_t* repository, const char* sha256,
+		archive_database_object_t* object, char* error,
+		size_t error_capacity);
 archive_database_status_t archive_database_register_inline_object(
 		const archive_repository_t* repository, const char* sha256,
 		const void* data, size_t size, const char* media_type,

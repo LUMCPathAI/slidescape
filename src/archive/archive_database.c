@@ -24,7 +24,7 @@ static const char archive_database_schema[] =
 	"  schema_version INTEGER NOT NULL,\n"
 	"  information_model TEXT NOT NULL\n"
 	") STRICT;\n"
-	"INSERT OR IGNORE INTO archive_schema VALUES (1, 4, 'virtual-dicom-shell-v0.1');\n"
+	"INSERT OR IGNORE INTO archive_schema VALUES (1, 5, 'virtual-dicom-shell-v0.1');\n"
 	"CREATE TABLE IF NOT EXISTS schema_migration (\n"
 	"  version INTEGER PRIMARY KEY,\n"
 	"  name TEXT NOT NULL,\n"
@@ -33,6 +33,7 @@ static const char archive_database_schema[] =
 	"INSERT OR IGNORE INTO schema_migration(version, name) VALUES (2, 'initial durable model v2');\n"
 	"INSERT OR IGNORE INTO schema_migration(version, name) VALUES (3, 'inline control objects');\n"
 	"INSERT OR IGNORE INTO schema_migration(version, name) VALUES (4, 'logical slide aggregate shells');\n"
+	"INSERT OR IGNORE INTO schema_migration(version, name) VALUES (5, 'external object locators');\n"
 	"CREATE TABLE IF NOT EXISTS object (\n"
 	"  id INTEGER PRIMARY KEY,\n"
 	"  sha256 TEXT NOT NULL UNIQUE\n"
@@ -40,12 +41,13 @@ static const char archive_database_schema[] =
 	"  byte_size INTEGER NOT NULL CHECK (byte_size >= 0),\n"
 	"  media_type TEXT NOT NULL,\n"
 	"  storage_key TEXT UNIQUE,\n"
+	"  external_path TEXT UNIQUE,\n"
 	"  inline_data BLOB,\n"
 	"  retention_state TEXT NOT NULL DEFAULT 'ACTIVE'\n"
 	"    CHECK (retention_state IN ('ACTIVE', 'QUARANTINED', 'HELD', 'DELETABLE')),\n"
 	"  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,\n"
-	"  CHECK ((storage_key IS NOT NULL AND inline_data IS NULL) OR\n"
-	"         (storage_key IS NULL AND inline_data IS NOT NULL)),\n"
+	"  CHECK ((storage_key IS NOT NULL) + (external_path IS NOT NULL) +\n"
+	"         (inline_data IS NOT NULL) = 1),\n"
 	"  CHECK (inline_data IS NULL OR length(inline_data) = byte_size)\n"
 	") STRICT;\n"
 	"CREATE TABLE IF NOT EXISTS bundle (\n"
@@ -188,7 +190,7 @@ static const char archive_database_schema[] =
 	"CREATE INDEX IF NOT EXISTS part10_instance_study_series\n"
 	"  ON part10_instance(study_instance_uid, series_instance_uid);\n"
 	"PRAGMA application_id = 1397510209;\n"
-	"PRAGMA user_version = 4;\n"
+	"PRAGMA user_version = 5;\n"
 	"COMMIT;\n";
 
 static const char* archive_database_required_tables[] = {
@@ -396,14 +398,21 @@ archive_database_status_t archive_database_validate(const archive_repository_t* 
 	return status;
 }
 
-archive_database_status_t archive_database_register_object(
+static archive_database_status_t archive_database_register_located_object(
 		const archive_repository_t* repository, const char* sha256, u64 byte_size,
 		const char* media_type, const char* storage_key,
+		const char* external_path,
 		archive_database_object_t* object, char* error, size_t error_capacity) {
 	if (object) memset(object, 0, sizeof(*object));
+	bool has_storage_key = storage_key && storage_key[0];
+	bool has_external_path = external_path && external_path[0];
 	if (!repository || !repository->root[0] || !archive_database_sha256_is_valid(sha256) ||
 	    !media_type || !media_type[0] || strlen(media_type) >= sizeof(object->media_type) ||
-	    !storage_key || !storage_key[0] || strlen(storage_key) >= sizeof(object->storage_key) ||
+	    has_storage_key == has_external_path ||
+	    (has_storage_key &&
+	     strlen(storage_key) >= sizeof(object->storage_key)) ||
+	    (has_external_path &&
+	     strlen(external_path) >= sizeof(object->external_path)) ||
 	    byte_size > INT64_MAX || !object) {
 		return ARCHIVE_DATABASE_INVALID_ARGUMENT;
 	}
@@ -444,14 +453,21 @@ archive_database_status_t archive_database_register_object(
 	sqlite3_stmt* statement = NULL;
 	if (status == ARCHIVE_DATABASE_OK) {
 		result = sqlite3_prepare_v2(database,
-			"INSERT INTO object(sha256, byte_size, media_type, storage_key) "
-			"VALUES(?1, ?2, ?3, ?4) ON CONFLICT(sha256) DO NOTHING;", -1,
+			"INSERT INTO object(sha256, byte_size, media_type, storage_key, external_path) "
+			"VALUES(?1, ?2, ?3, ?4, ?5) ON CONFLICT(sha256) DO NOTHING;", -1,
 			&statement, NULL);
 		if (result != SQLITE_OK ||
 		    sqlite3_bind_text(statement, 1, sha256, -1, SQLITE_STATIC) != SQLITE_OK ||
 		    sqlite3_bind_int64(statement, 2, (sqlite3_int64)byte_size) != SQLITE_OK ||
 		    sqlite3_bind_text(statement, 3, media_type, -1, SQLITE_STATIC) != SQLITE_OK ||
-		    sqlite3_bind_text(statement, 4, storage_key, -1, SQLITE_STATIC) != SQLITE_OK ||
+		    (has_storage_key ?
+		     sqlite3_bind_text(statement, 4, storage_key, -1,
+		                       SQLITE_STATIC) :
+		     sqlite3_bind_null(statement, 4)) != SQLITE_OK ||
+		    (has_external_path ?
+		     sqlite3_bind_text(statement, 5, external_path, -1,
+		                       SQLITE_STATIC) :
+		     sqlite3_bind_null(statement, 5)) != SQLITE_OK ||
 		    sqlite3_step(statement) != SQLITE_DONE) {
 			archive_database_set_error(error, error_capacity,
 			                           "could not register immutable object: %s",
@@ -465,7 +481,8 @@ archive_database_status_t archive_database_register_object(
 	}
 	if (status == ARCHIVE_DATABASE_OK) {
 		result = sqlite3_prepare_v2(database,
-			"SELECT id, sha256, byte_size, media_type, storage_key, inline_data IS NOT NULL "
+			"SELECT id, sha256, byte_size, media_type, storage_key, external_path,"
+			" inline_data IS NOT NULL "
 			"FROM object WHERE sha256 = ?1;", -1, &statement, NULL);
 		if (result != SQLITE_OK ||
 		    sqlite3_bind_text(statement, 1, sha256, -1, SQLITE_STATIC) != SQLITE_OK ||
@@ -478,13 +495,20 @@ archive_database_status_t archive_database_register_object(
 			const char* stored_sha256 = (const char*)sqlite3_column_text(statement, 1);
 			const char* stored_media_type = (const char*)sqlite3_column_text(statement, 3);
 			const char* stored_storage_key = (const char*)sqlite3_column_text(statement, 4);
+			const char* stored_external_path =
+				(const char*)sqlite3_column_text(statement, 5);
 			sqlite3_int64 stored_byte_size = sqlite3_column_int64(statement, 2);
-			if (!stored_sha256 || !stored_media_type || !stored_storage_key ||
-			    sqlite3_column_int(statement, 5) ||
+			if (!stored_sha256 || !stored_media_type ||
+			    sqlite3_column_int(statement, 6) ||
+			    has_storage_key != (stored_storage_key != NULL) ||
+			    has_external_path != (stored_external_path != NULL) ||
 			    strcmp(stored_sha256, sha256) != 0 ||
 			    stored_byte_size != (sqlite3_int64)byte_size ||
 			    strcmp(stored_media_type, media_type) != 0 ||
-			    strcmp(stored_storage_key, storage_key) != 0) {
+			    (has_storage_key &&
+			     strcmp(stored_storage_key, storage_key) != 0) ||
+			    (has_external_path &&
+			     strcmp(stored_external_path, external_path) != 0)) {
 				archive_database_set_error(error, error_capacity,
 					"immutable object digest is already registered with different metadata");
 				status = ARCHIVE_DATABASE_CONFLICT;
@@ -493,7 +517,12 @@ archive_database_status_t archive_database_register_object(
 				memcpy(object->sha256, sha256, 65);
 				object->byte_size = byte_size;
 				memcpy(object->media_type, media_type, strlen(media_type) + 1);
-				memcpy(object->storage_key, storage_key, strlen(storage_key) + 1);
+				if (has_storage_key)
+					memcpy(object->storage_key, storage_key,
+					       strlen(storage_key) + 1);
+				if (has_external_path)
+					memcpy(object->external_path, external_path,
+					       strlen(external_path) + 1);
 				object->already_registered = !inserted;
 			}
 		}
@@ -513,6 +542,120 @@ archive_database_status_t archive_database_register_object(
 		archive_database_set_error(error, error_capacity, "could not close archive database");
 		status = ARCHIVE_DATABASE_IO_ERROR;
 	}
+	return status;
+}
+
+archive_database_status_t archive_database_register_object(
+		const archive_repository_t* repository, const char* sha256,
+		u64 byte_size, const char* media_type, const char* storage_key,
+		archive_database_object_t* object, char* error,
+		size_t error_capacity) {
+	return archive_database_register_located_object(
+		repository, sha256, byte_size, media_type, storage_key,
+		NULL, object, error, error_capacity);
+}
+
+archive_database_status_t archive_database_register_external_object(
+		const archive_repository_t* repository, const char* sha256,
+		u64 byte_size, const char* media_type, const char* external_path,
+		archive_database_object_t* object, char* error,
+		size_t error_capacity) {
+	return archive_database_register_located_object(
+		repository, sha256, byte_size, media_type, NULL,
+		external_path, object, error, error_capacity);
+}
+
+archive_database_status_t archive_database_find_object(
+		const archive_repository_t* repository, const char* sha256,
+		archive_database_object_t* object, char* error,
+		size_t error_capacity) {
+	if (object) memset(object, 0, sizeof(*object));
+	if (!repository || !repository->root[0] ||
+	    !archive_database_sha256_is_valid(sha256) || !object)
+		return ARCHIVE_DATABASE_INVALID_ARGUMENT;
+	char path[ARCHIVE_PATH_CAPACITY];
+	if (!archive_database_path(repository, path, sizeof(path)))
+		return ARCHIVE_DATABASE_INVALID_ARGUMENT;
+	sqlite3* database = NULL;
+	int result = sqlite3_open_v2(
+		path, &database,
+		SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
+	if (result != SQLITE_OK) {
+		archive_database_set_error(
+			error, error_capacity,
+			"could not open archive database '%s': %s", path,
+			database ? sqlite3_errmsg(database) :
+				"SQLite open failed");
+		sqlite3_close(database);
+		return ARCHIVE_DATABASE_IO_ERROR;
+	}
+	archive_database_status_t status =
+		archive_database_configure(database, error, error_capacity);
+	if (status == ARCHIVE_DATABASE_OK)
+		status = archive_database_validate_open(
+			database, error, error_capacity);
+	sqlite3_stmt* statement = NULL;
+	if (status == ARCHIVE_DATABASE_OK) {
+		result = sqlite3_prepare_v2(
+			database,
+			"SELECT id,byte_size,media_type,"
+			" COALESCE(storage_key,''),"
+			" COALESCE(external_path,''),"
+			" inline_data IS NOT NULL"
+			" FROM object WHERE sha256=?1;",
+			-1, &statement, NULL);
+		if (result != SQLITE_OK ||
+		    sqlite3_bind_text(
+			    statement, 1, sha256, -1,
+			    SQLITE_STATIC) != SQLITE_OK ||
+		    sqlite3_step(statement) != SQLITE_ROW) {
+			archive_database_set_error(
+				error, error_capacity,
+				"could not read immutable object record: %s",
+				sqlite3_errmsg(database));
+			status = ARCHIVE_DATABASE_IO_ERROR;
+		} else {
+			const char* media_type =
+				(const char*)sqlite3_column_text(statement, 2);
+			const char* storage_key =
+				(const char*)sqlite3_column_text(statement, 3);
+			const char* external_path =
+				(const char*)sqlite3_column_text(statement, 4);
+			i64 byte_size = sqlite3_column_int64(statement, 1);
+			bool has_storage_key =
+				storage_key && storage_key[0];
+			bool has_external_path =
+				external_path && external_path[0];
+			if (!media_type || !storage_key || !external_path ||
+			    byte_size < 0 ||
+			    has_storage_key == has_external_path ||
+			    sqlite3_column_int(statement, 5) ||
+			    strlen(media_type) >= sizeof(object->media_type) ||
+			    strlen(storage_key) >= sizeof(object->storage_key) ||
+			    strlen(external_path) >=
+				    sizeof(object->external_path)) {
+				status = ARCHIVE_DATABASE_CONFLICT;
+			} else {
+				object->id = sqlite3_column_int64(statement, 0);
+				memcpy(object->sha256, sha256, 65);
+				object->byte_size = (u64)byte_size;
+				snprintf(object->media_type,
+				         sizeof(object->media_type), "%s",
+				         media_type);
+				snprintf(object->storage_key,
+				         sizeof(object->storage_key), "%s",
+				         storage_key);
+				snprintf(object->external_path,
+				         sizeof(object->external_path), "%s",
+				         external_path);
+				object->already_registered = true;
+			}
+		}
+		sqlite3_finalize(statement);
+	}
+	if (sqlite3_close(database) != SQLITE_OK &&
+	    status == ARCHIVE_DATABASE_OK)
+		status = ARCHIVE_DATABASE_IO_ERROR;
 	return status;
 }
 
@@ -578,7 +721,7 @@ archive_database_status_t archive_database_register_inline_object(
 	}
 	if (status == ARCHIVE_DATABASE_OK) {
 		result = sqlite3_prepare_v2(database,
-			"SELECT id, byte_size, media_type, storage_key, inline_data "
+			"SELECT id, byte_size, media_type, storage_key, external_path, inline_data "
 			"FROM object WHERE sha256=?1;", -1, &statement, NULL);
 		if (result != SQLITE_OK ||
 		    sqlite3_bind_text(statement, 1, sha256, -1, SQLITE_STATIC) != SQLITE_OK ||
@@ -589,11 +732,12 @@ archive_database_status_t archive_database_register_inline_object(
 		} else {
 			const char* stored_media_type =
 				(const char*)sqlite3_column_text(statement, 2);
-			const void* stored_data = sqlite3_column_blob(statement, 4);
+			const void* stored_data = sqlite3_column_blob(statement, 5);
 			i64 stored_size = sqlite3_column_int64(statement, 1);
 			if (!stored_media_type || sqlite3_column_type(statement, 3) != SQLITE_NULL ||
+			    sqlite3_column_type(statement, 4) != SQLITE_NULL ||
 			    !stored_data || stored_size != (i64)size ||
-			    sqlite3_column_bytes(statement, 4) != (i32)size ||
+			    sqlite3_column_bytes(statement, 5) != (i32)size ||
 			    strcmp(stored_media_type, media_type) != 0 ||
 			    memcmp(stored_data, data, size) != 0) {
 				archive_database_set_error(error, error_capacity,
@@ -659,7 +803,7 @@ archive_database_status_t archive_database_read_inline_object(
 	u8* result_data = NULL;
 	if (status == ARCHIVE_DATABASE_OK) {
 		result = sqlite3_prepare_v2(database,
-			"SELECT byte_size, media_type, storage_key, inline_data "
+			"SELECT byte_size, media_type, storage_key, external_path, inline_data "
 			"FROM object WHERE sha256=?1;", -1, &statement, NULL);
 		if (result != SQLITE_OK ||
 		    sqlite3_bind_text(statement, 1, sha256, -1, SQLITE_STATIC) != SQLITE_OK ||
@@ -671,12 +815,13 @@ archive_database_status_t archive_database_read_inline_object(
 			i64 stored_size = sqlite3_column_int64(statement, 0);
 			const char* stored_media_type =
 				(const char*)sqlite3_column_text(statement, 1);
-			const void* stored_data = sqlite3_column_blob(statement, 3);
+			const void* stored_data = sqlite3_column_blob(statement, 4);
 			if (stored_size != (i64)expected_size || !stored_media_type ||
 			    strcmp(stored_media_type, expected_media_type) != 0 ||
 			    sqlite3_column_type(statement, 2) != SQLITE_NULL ||
+			    sqlite3_column_type(statement, 3) != SQLITE_NULL ||
 			    !stored_data ||
-			    sqlite3_column_bytes(statement, 3) != (i32)expected_size) {
+			    sqlite3_column_bytes(statement, 4) != (i32)expected_size) {
 				archive_database_set_error(error, error_capacity,
 					"inline object metadata or size does not match its reference");
 				status = ARCHIVE_DATABASE_CONFLICT;
@@ -1157,7 +1302,8 @@ archive_database_status_t archive_database_publish_shells(
 			publication->frame_source : "STORED";
 		const char* frame_policy_version =
 			publication->frame_policy_version[0] ?
-			publication->frame_policy_version : "part10-delta-payload-v7";
+			publication->frame_policy_version :
+				"part10-cached-delta-payload-v9";
 		if ((strcmp(provider_kind, "part10") != 0 &&
 		     strcmp(provider_kind, "mrxs-native") != 0) ||
 		    !adapter_version[0] ||
@@ -1483,7 +1629,8 @@ archive_database_status_t archive_database_publish_shells(
 				publication->frame_source : "STORED";
 			const char* frame_policy_version =
 				publication->frame_policy_version[0] ?
-				publication->frame_policy_version : "part10-delta-payload-v7";
+				publication->frame_policy_version :
+					"part10-cached-delta-payload-v9";
 			const char* provider_sql =
 				"INSERT INTO instance_provider(instance_id, provider_kind, "
 				"source_object_id, parameters_object_id, adapter_version) "
@@ -1595,7 +1742,7 @@ archive_database_status_t archive_database_publish_shells(
 				    statement, 2,
 				    publication->frame_policy_version[0] ?
 				    publication->frame_policy_version :
-				    "part10-delta-payload-v7",
+				    "part10-cached-delta-payload-v9",
 				    -1, SQLITE_STATIC) != SQLITE_OK ||
 			    sqlite3_step(statement) != SQLITE_DONE) {
 				status = ARCHIVE_DATABASE_IO_ERROR;

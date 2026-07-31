@@ -75,6 +75,21 @@ static bool archive_series_record_is_valid(const archive_series_record_t* record
 	       archive_index_text_is_valid(record->modality) && archive_index_text_is_valid(record->description);
 }
 
+static bool archive_index_external_path_is_valid(const char* path) {
+	if (!path || !path[0] ||
+	    strlen(path) >= ARCHIVE_PATH_CAPACITY)
+		return false;
+#if defined(_WIN32)
+	return ((((path[0] >= 'A' && path[0] <= 'Z') ||
+	          (path[0] >= 'a' && path[0] <= 'z')) &&
+	         path[1] == ':' &&
+	         (path[2] == '\\' || path[2] == '/')) ||
+	        (path[0] == '\\' && path[1] == '\\'));
+#else
+	return path[0] == '/';
+#endif
+}
+
 static bool archive_instance_record_is_valid(const archive_instance_record_t* record) {
 	if (!record) return false;
 	bool shell_valid =
@@ -93,16 +108,24 @@ static bool archive_instance_record_is_valid(const archive_instance_record_t* re
 		record->recipe_byte_size > 0 &&
 		dicom_uid_is_valid_string(record->transfer_syntax_uid,
 		                          strlen(record->transfer_syntax_uid));
-	bool provider_valid = (!record->provider[0] && !record->object_key[0]) ||
+	bool provider_valid = (!record->provider[0] &&
+	                       !record->object_key[0] &&
+	                       !record->external_path[0]) ||
 	                      (strcmp(record->provider, "part10") == 0 &&
-	                       strncmp(record->object_key, "objects/", 8) == 0 &&
-	                       !strstr(record->object_key, "..") &&
-	                       !strchr(record->object_key, '\\') &&
+	                       ((record->object_key[0] &&
+	                         !record->external_path[0] &&
+	                         strncmp(record->object_key, "objects/", 8) == 0 &&
+	                         !strstr(record->object_key, "..") &&
+	                         !strchr(record->object_key, '\\')) ||
+	                        (!record->object_key[0] &&
+	                         archive_index_external_path_is_valid(
+			                         record->external_path))) &&
 	                       archive_index_sha256_is_valid(record->object_sha256) &&
 	                       record->object_byte_size > 0 &&
 	                       shell_valid) ||
 	                      (strcmp(record->provider, "mrxs-native") == 0 &&
 	                       !record->object_key[0] &&
+	                       !record->external_path[0] &&
 	                       archive_index_sha256_is_valid(
 		                       record->object_sha256) &&
 	                       record->object_byte_size > 0 &&
@@ -283,7 +306,8 @@ bool archive_index_open(archive_index_t* index, const archive_repository_t* repo
 		"SELECT i.study_instance_uid, i.series_instance_uid, i.sop_instance_uid,"
 		" i.sop_class_uid, i.instance_number, i.frame_count, i.image_flavor,"
 		" i.total_pixel_matrix_columns, i.total_pixel_matrix_rows,"
-		" source.storage_key, source.sha256, source.byte_size,"
+		" COALESCE(source.storage_key,''), COALESCE(source.external_path,''),"
+		" source.sha256, source.byte_size,"
 		" shell.storage_key, shell.sha256, shell.byte_size,"
 		" i.shell_instance_index, fr.transfer_syntax_uid, ip.provider_kind,"
 		" b.bundle_digest, r.fingerprint,"
@@ -313,26 +337,28 @@ bool archive_index_open(archive_index_t* index, const archive_repository_t* repo
 		                                sizeof(record.total_pixel_matrix_columns), statement, 7) ||
 		    !archive_index_copy_integer(record.total_pixel_matrix_rows,
 		                                sizeof(record.total_pixel_matrix_rows), statement, 8) ||
-		    !archive_index_copy_column(record.provider, sizeof(record.provider), statement, 17) ||
+		    !archive_index_copy_column(record.provider, sizeof(record.provider), statement, 18) ||
 		    !archive_index_copy_column(record.object_key, sizeof(record.object_key), statement, 9) ||
-		    !archive_index_copy_column(record.object_sha256, sizeof(record.object_sha256), statement, 10) ||
-		    (record.object_byte_size = (u64)sqlite3_column_int64(statement, 11)) == 0 ||
-		    !archive_index_copy_column(record.shell_key, sizeof(record.shell_key), statement, 12) ||
-		    !archive_index_copy_column(record.shell_sha256, sizeof(record.shell_sha256), statement, 13) ||
-		    (record.shell_byte_size = (u64)sqlite3_column_int64(statement, 14)) == 0 ||
-		    (record.shell_instance_index = (u32)sqlite3_column_int64(statement, 15)) !=
-		        (u64)sqlite3_column_int64(statement, 15) ||
+		    !archive_index_copy_column(record.external_path,
+		                               sizeof(record.external_path), statement, 10) ||
+		    !archive_index_copy_column(record.object_sha256, sizeof(record.object_sha256), statement, 11) ||
+		    (record.object_byte_size = (u64)sqlite3_column_int64(statement, 12)) == 0 ||
+		    !archive_index_copy_column(record.shell_key, sizeof(record.shell_key), statement, 13) ||
+		    !archive_index_copy_column(record.shell_sha256, sizeof(record.shell_sha256), statement, 14) ||
+		    (record.shell_byte_size = (u64)sqlite3_column_int64(statement, 15)) == 0 ||
+		    (record.shell_instance_index = (u32)sqlite3_column_int64(statement, 16)) !=
+		        (u64)sqlite3_column_int64(statement, 16) ||
 		    !archive_index_copy_column(record.transfer_syntax_uid,
-		                               sizeof(record.transfer_syntax_uid), statement, 16) ||
+		                               sizeof(record.transfer_syntax_uid), statement, 17) ||
 		    !archive_index_copy_column(record.bundle_sha256,
-		                               sizeof(record.bundle_sha256), statement, 18) ||
+		                               sizeof(record.bundle_sha256), statement, 19) ||
 		    !archive_index_copy_column(record.representation_fingerprint,
-		                               sizeof(record.representation_fingerprint), statement, 19) ||
+		                               sizeof(record.representation_fingerprint), statement, 20) ||
 		    !archive_index_copy_column(record.recipe_key,
-		                               sizeof(record.recipe_key), statement, 20) ||
+		                               sizeof(record.recipe_key), statement, 21) ||
 		    !archive_index_copy_column(record.recipe_sha256,
-		                               sizeof(record.recipe_sha256), statement, 21) ||
-		    (record.recipe_byte_size = (u64)sqlite3_column_int64(statement, 22)) == 0 ||
+		                               sizeof(record.recipe_sha256), statement, 22) ||
+		    (record.recipe_byte_size = (u64)sqlite3_column_int64(statement, 23)) == 0 ||
 		    !archive_instance_record_is_valid(&record) ||
 		    !archive_index_has_series(index, record.study_instance_uid, record.series_instance_uid) ||
 		    !archive_index_append_instance(index, &record)) {

@@ -10,6 +10,7 @@
 
 #include "archive_instance_provider.h"
 
+#include "archive_database.h"
 #include "archive_object.h"
 #include "archive_mrxs_adapter.h"
 #include "archive_sha256.h"
@@ -26,6 +27,7 @@
 #define ARCHIVE_PROVIDER_MAX_FRAME_SIZE MEGABYTES(64)
 #define ARCHIVE_PROVIDER_WORK_QUEUE_CAPACITY 1024
 #define ARCHIVE_PROVIDER_CACHE_CAPACITY 16
+#define ARCHIVE_PROVIDER_MRXS_DESCRIPTOR_MAX MEGABYTES(16)
 /*
  * Leave room to acquire a new shell before evicting the per-instance entry that
  * may hold the final reference to an older shell.
@@ -49,6 +51,12 @@ static void archive_provider_set_error(char* error, size_t capacity, const char*
 
 static bool archive_provider_owns_global_thread_pool;
 
+typedef struct archive_provider_mrxs_sources_t {
+	file_handle_t* files;
+	u64* sizes;
+	u32 count;
+} archive_provider_mrxs_sources_t;
+
 typedef struct archive_provider_shell_cache_entry_t {
 	bool occupied;
 	i32 refcount;
@@ -59,7 +67,7 @@ typedef struct archive_provider_shell_cache_entry_t {
 	u8* data;
 	size_t size;
 	archive_shell_view_t shell;
-	archive_mrxs_adapter_t* mrxs;
+	archive_provider_mrxs_sources_t* mrxs_sources;
 } archive_provider_shell_cache_entry_t;
 
 typedef struct archive_provider_cache_entry_t {
@@ -72,6 +80,7 @@ typedef struct archive_provider_cache_entry_t {
 	archive_provider_shell_cache_entry_t* shared_shell;
 	archive_shell_instance_t instance;
 	file_handle_t source_file;
+	archive_shell_payload_range_t* payload_ranges;
 	char* metadata_json;
 	size_t metadata_size;
 } archive_provider_cache_entry_t;
@@ -84,21 +93,29 @@ static archive_provider_shell_cache_entry_t
 static u64 archive_provider_cache_clock;
 static archive_instance_provider_cache_stats_t archive_provider_cache_stats;
 
+static void archive_provider_mrxs_sources_destroy(
+		archive_provider_mrxs_sources_t* sources) {
+	if (!sources) return;
+	for (u32 i = 0; i < sources->count; ++i)
+		file_handle_close(sources->files[i]);
+	free(sources->sizes);
+	free(sources->files);
+	free(sources);
+}
+
 static void archive_provider_shell_cache_entry_destroy(
 		archive_provider_shell_cache_entry_t* entry) {
 	if (!entry || !entry->occupied) return;
 	ASSERT(entry->refcount == 0);
 	free(entry->data);
-	if (entry->mrxs) {
-		archive_mrxs_adapter_close(entry->mrxs);
-		free(entry->mrxs);
-	}
+	archive_provider_mrxs_sources_destroy(entry->mrxs_sources);
 	memset(entry, 0, sizeof(*entry));
 }
 
 static void archive_provider_cache_entry_destroy(archive_provider_cache_entry_t* entry) {
 	if (!entry || !entry->occupied) return;
 	free(entry->metadata_json);
+	free(entry->payload_ranges);
 	file_handle_close(entry->source_file);
 	if (entry->shared_shell) {
 		ASSERT(entry->shared_shell->occupied &&
@@ -772,15 +789,22 @@ static bool archive_provider_hash_file(const char* path, char sha256[65], u64* b
 	return true;
 }
 
-static bool archive_provider_path_is_external_reference(const char* path) {
-#if defined(_WIN32)
-	DWORD attributes = GetFileAttributesA(path);
-	return attributes != INVALID_FILE_ATTRIBUTES &&
-	       (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-#else
-	struct stat info = {0};
-	return lstat(path, &info) == 0 && S_ISLNK(info.st_mode);
-#endif
+static bool archive_provider_source_path(
+		const archive_repository_t* repository,
+		const archive_instance_record_t* record,
+		char path[ARCHIVE_PATH_CAPACITY]) {
+	if (!repository || !record || !path) return false;
+	if (record->external_path[0]) {
+		i32 length = snprintf(
+			path, ARCHIVE_PATH_CAPACITY, "%s",
+			record->external_path);
+		return length > 0 &&
+			length < ARCHIVE_PATH_CAPACITY;
+	}
+	return record->object_key[0] &&
+		archive_repository_make_path(
+			repository, record->object_key, path,
+			ARCHIVE_PATH_CAPACITY);
 }
 
 static bool archive_provider_read_exact_file(const char* path, u64 expected_size,
@@ -902,7 +926,7 @@ static bool archive_provider_regenerate_aggregate_shell(
 	char* cursor = text;
 	char* line = archive_provider_recipe_next_line(&cursor);
 	bool success = line &&
-		strcmp(line, "slidescape-virtual-dicom-recipe-v7") == 0;
+		strcmp(line, "slidescape-virtual-dicom-recipe-v9") == 0;
 	const char* bundle_sha256 = NULL;
 	const char* study_uid = NULL;
 	const char* series_uid = NULL;
@@ -952,18 +976,27 @@ static bool archive_provider_regenerate_aggregate_shell(
 			success = false;
 			break;
 		}
-		char storage_key[257];
+		archive_database_object_t source_object = {0};
 		char source_path[ARCHIVE_PATH_CAPACITY];
-		i32 key_length = snprintf(
-			storage_key, sizeof(storage_key),
-			"objects/sha256/%.2s/%s", source_sha256[i], source_sha256[i]);
 		char actual_sha256[65];
 		u64 actual_size = 0;
-		success = key_length > 0 &&
-		          (size_t)key_length < sizeof(storage_key) &&
-		          archive_repository_make_path(
-			          repository, storage_key, source_path,
-			          sizeof(source_path)) &&
+		success =
+		          archive_database_find_object(
+			          repository, source_sha256[i],
+			          &source_object, error,
+			          error_capacity) == ARCHIVE_DATABASE_OK &&
+		          source_object.byte_size == (u64)byte_size &&
+		          strcmp(source_object.media_type,
+		                 "application/dicom") == 0 &&
+		          ((source_object.external_path[0] &&
+		            snprintf(source_path, sizeof(source_path), "%s",
+		                     source_object.external_path) > 0 &&
+		            strlen(source_object.external_path) <
+			            sizeof(source_path)) ||
+		           (source_object.storage_key[0] &&
+		            archive_repository_make_path(
+			            repository, source_object.storage_key,
+			            source_path, sizeof(source_path)))) &&
 		          archive_provider_hash_file(
 			          source_path, actual_sha256, &actual_size) &&
 		          actual_size == (u64)byte_size &&
@@ -1107,8 +1140,8 @@ static bool archive_provider_regenerate_shell(
 	char retained_recipe_sha256[65];
 	archive_shell_buffer_t regenerated = {0};
 	dicom_series_t dicom = {0};
-	bool success = archive_repository_make_path(
-		repository, record->object_key, source_path, sizeof(source_path));
+	bool success = archive_provider_source_path(
+		repository, record, source_path);
 	if (success && record->recipe_key[0]) {
 		success =
 			archive_repository_make_path(repository, record->recipe_key,
@@ -1130,27 +1163,29 @@ static bool archive_provider_regenerate_shell(
 		                     retained_recipe_sha256) &&
 		strcmp(retained_recipe_sha256, record->recipe_sha256) == 0;
 	if (success && retained_recipe_size >=
-	    strlen("slidescape-virtual-dicom-recipe-v6") &&
-	    memcmp(retained_recipe, "slidescape-virtual-dicom-recipe-v6",
-	           strlen("slidescape-virtual-dicom-recipe-v6")) == 0) {
-		archive_provider_set_error(
-			error, error_capacity,
-			"Part 10 shell recipe v6 uses the removed explicit payload layout; "
-			"reingest the source to publish a v7 shell");
-		dicom_destroy(&dicom);
-		free(retained_recipe);
-		return false;
-	}
-	if (success && retained_recipe_size >=
-	    strlen("slidescape-virtual-dicom-recipe-v7\n") &&
-	    memcmp(retained_recipe, "slidescape-virtual-dicom-recipe-v7\n",
-	           strlen("slidescape-virtual-dicom-recipe-v7\n")) == 0) {
+	    strlen("slidescape-virtual-dicom-recipe-v9\n") &&
+	    memcmp(retained_recipe, "slidescape-virtual-dicom-recipe-v9\n",
+	           strlen("slidescape-virtual-dicom-recipe-v9\n")) == 0) {
 		success = archive_provider_regenerate_aggregate_shell(
 			repository, record, retained_recipe, retained_recipe_size,
 			error, error_capacity);
 		dicom_destroy(&dicom);
 		free(retained_recipe);
 		return success;
+	}
+	if (success &&
+	    (retained_recipe_size <
+		     strlen("slidescape-virtual-dicom-recipe-v9-single\n") ||
+	     memcmp(retained_recipe,
+	            "slidescape-virtual-dicom-recipe-v9-single\n",
+	            strlen("slidescape-virtual-dicom-recipe-v9-single\n")) != 0)) {
+		archive_provider_set_error(
+			error, error_capacity,
+			"Part 10 shell recipe predates the current shell format; "
+			"reingest the source to publish a v9 shell");
+		dicom_destroy(&dicom);
+		free(retained_recipe);
+		return false;
 	}
 	archive_shell_part10_recipe_input_t recipe_input = {
 		.bundle_sha256 = record->bundle_sha256,
@@ -1209,7 +1244,8 @@ static bool archive_provider_regenerate_shell(
 	return success;
 }
 
-static archive_mrxs_adapter_t* archive_provider_open_mrxs(
+static archive_provider_mrxs_sources_t*
+archive_provider_open_mrxs_sources(
 		const archive_repository_t* repository,
 		const archive_instance_record_t* record,
 		char* error, size_t error_capacity) {
@@ -1235,8 +1271,8 @@ static archive_mrxs_adapter_t* archive_provider_open_mrxs(
 	char extra = '\0';
 	int fields = sscanf(
 		text,
-		"slidescape-mrxs-native-recipe-v3\n"
-		"adapter\tslidescape-mrxs\t3\n"
+		"slidescape-mrxs-native-recipe-v5\n"
+		"adapter\tslidescape-mrxs\t5\n"
 		"bundle-descriptor-sha256\t%64[0-9a-f]\n"
 		"bundle-descriptor-size\t%llu\n"
 		"representation-fingerprint\t%64[0-9a-f]\n"
@@ -1247,19 +1283,153 @@ static archive_mrxs_adapter_t* archive_provider_open_mrxs(
 		descriptor_size == record->object_byte_size &&
 		strcmp(descriptor_sha256, record->object_sha256) == 0 &&
 		strcmp(fingerprint, record->representation_fingerprint) == 0;
-	archive_mrxs_adapter_t* adapter =
-		valid ? calloc(1, sizeof(*adapter)) : NULL;
-	if (!adapter || !archive_mrxs_adapter_open(
-			adapter, source_path, fingerprint, error, error_capacity)) {
-		free(adapter);
-		adapter = NULL;
-	}
 	free(text);
-	if (!adapter && (!error || !error[0]))
+	if (!valid) {
+		if (!error || !error[0])
+			archive_provider_set_error(
+				error, error_capacity,
+				"could not validate retained MRXS provider recipe");
+		return NULL;
+	}
+
+	u8* descriptor = NULL;
+	size_t descriptor_bytes = 0;
+	if (archive_object_read_inline_bytes(
+			repository, descriptor_sha256,
+			(u64)descriptor_size,
+			"application/vnd.slidescape.mrxs-bundle",
+			ARCHIVE_PROVIDER_MRXS_DESCRIPTOR_MAX,
+			&descriptor, &descriptor_bytes,
+			error, error_capacity) != ARCHIVE_OBJECT_OK)
+		return NULL;
+	char* descriptor_text = malloc(descriptor_bytes + 1);
+	if (!descriptor_text) {
+		free(descriptor);
+		return NULL;
+	}
+	memcpy(descriptor_text, descriptor, descriptor_bytes);
+	descriptor_text[descriptor_bytes] = '\0';
+	free(descriptor);
+	const char* header = "slidescape-mrxs-bundle-v1\n";
+	valid = descriptor_bytes >= strlen(header) &&
+		memcmp(descriptor_text, header, strlen(header)) == 0;
+
+	u32 dat_count = 0;
+	char* cursor = valid ? descriptor_text + strlen(header) : NULL;
+	while (cursor && *cursor) {
+		char* newline = strchr(cursor, '\n');
+		if (!newline) {
+			valid = false;
+			break;
+		}
+		*newline = '\0';
+		unsigned object_index = 0;
+		char logical_name[ARCHIVE_PATH_CAPACITY] = {0};
+		char digest[65] = {0};
+		unsigned long long byte_size = 0;
+		char extra = '\0';
+		int parsed = sscanf(
+			cursor, "object\t%u\t%1023[^\t]\t%64[0-9a-f]\t%llu%c",
+			&object_index, logical_name, digest, &byte_size, &extra);
+		if (parsed != 4 || object_index < 3) {
+			if (parsed != 4) valid = false;
+		} else if (object_index - 3 != dat_count) {
+			valid = false;
+		} else {
+			++dat_count;
+		}
+		cursor = newline + 1;
+	}
+	if (!valid || !dat_count) {
+		free(descriptor_text);
 		archive_provider_set_error(
 			error, error_capacity,
-			"could not validate retained MRXS provider recipe");
-	return adapter;
+			"retained MRXS bundle descriptor is invalid");
+		return NULL;
+	}
+
+	archive_provider_mrxs_sources_t* sources =
+		calloc(1, sizeof(*sources));
+	if (sources) {
+		sources->files = calloc(dat_count, sizeof(*sources->files));
+		sources->sizes = calloc(dat_count, sizeof(*sources->sizes));
+		sources->count = dat_count;
+	}
+	if (!sources || !sources->files || !sources->sizes) {
+		archive_provider_mrxs_sources_destroy(sources);
+		free(descriptor_text);
+		return NULL;
+	}
+	char directory[ARCHIVE_PATH_CAPACITY];
+	snprintf(directory, sizeof(directory), "%s", source_path);
+	char* extension = strrchr(directory, '.');
+	valid = extension && strcasecmp(extension, ".mrxs") == 0;
+	if (valid) *extension = '\0';
+
+	/*
+	 * Restore the line delimiters replaced during validation, then open only
+	 * the data files needed for shell-native byte-range lookup. Slidedat.ini
+	 * and Index.dat are intentionally not opened or parsed here.
+	 */
+	for (size_t i = strlen(header); i < descriptor_bytes; ++i)
+		if (descriptor_text[i] == '\0')
+			descriptor_text[i] = '\n';
+	cursor = valid ? descriptor_text + strlen(header) : NULL;
+	while (cursor && *cursor && valid) {
+		char* newline = strchr(cursor, '\n');
+		if (!newline) {
+			valid = false;
+			break;
+		}
+		*newline = '\0';
+		unsigned object_index = 0;
+		char logical_name[ARCHIVE_PATH_CAPACITY] = {0};
+		char digest[65] = {0};
+		unsigned long long byte_size = 0;
+		int parsed = sscanf(
+			cursor, "object\t%u\t%1023[^\t]\t%64[0-9a-f]\t%llu",
+			&object_index, logical_name, digest, &byte_size);
+		if (parsed != 4) {
+			valid = false;
+		} else if (object_index >= 3) {
+			const char* prefix = "companion/";
+			const char* relative = logical_name + strlen(prefix);
+			if (strncmp(logical_name, prefix, strlen(prefix)) != 0 ||
+			    !relative[0] || strstr(relative, "..") ||
+			    relative[0] == '/' || relative[0] == '\\') {
+				valid = false;
+			} else {
+				char path[ARCHIVE_PATH_CAPACITY];
+				struct stat info = {0};
+				u32 file_index = object_index - 3;
+				if (snprintf(path, sizeof(path), "%s%s%s",
+				             directory, PATH_SEP, relative) >=
+					    (i32)sizeof(path) ||
+				    platform_stat(path, &info) != 0 ||
+				    !S_ISREG(info.st_mode) ||
+				    (u64)info.st_size != (u64)byte_size) {
+					valid = false;
+				} else {
+					sources->files[file_index] =
+						open_file_handle_for_simultaneous_access(path);
+					sources->sizes[file_index] = (u64)byte_size;
+					valid =
+						sources->files[file_index] != 0;
+				}
+			}
+		}
+		cursor = newline + 1;
+	}
+	free(descriptor_text);
+	if (!valid) {
+		archive_provider_mrxs_sources_destroy(sources);
+		sources = NULL;
+	}
+	if (!sources && (!error || !error[0]))
+		archive_provider_set_error(
+			error, error_capacity,
+			"could not open retained MRXS payload sources");
+	return sources;
 }
 
 static void archive_provider_shell_cache_release(
@@ -1338,15 +1508,13 @@ archive_provider_shared_shell_acquire(
 		}
 		platform_mutex_unlock(&archive_provider_regeneration_mutex);
 	}
-	archive_mrxs_adapter_t* mrxs = success && is_mrxs ?
-		archive_provider_open_mrxs(
+	archive_provider_mrxs_sources_t* mrxs_sources =
+		success && is_mrxs ?
+		archive_provider_open_mrxs_sources(
 			repository, record, error, error_capacity) : NULL;
-	if (success && is_mrxs) success = mrxs != NULL;
+	if (success && is_mrxs) success = mrxs_sources != NULL;
 	if (!success) {
-		if (mrxs) {
-			archive_mrxs_adapter_close(mrxs);
-			free(mrxs);
-		}
+		archive_provider_mrxs_sources_destroy(mrxs_sources);
 		free(shell_data);
 		if (!error || !error[0])
 			archive_provider_set_error(
@@ -1372,10 +1540,8 @@ archive_provider_shared_shell_acquire(
 				entry->last_used = ++archive_provider_cache_clock;
 			}
 			platform_mutex_unlock(&archive_provider_cache_mutex);
-			if (mrxs) {
-				archive_mrxs_adapter_close(mrxs);
-				free(mrxs);
-			}
+			archive_provider_mrxs_sources_destroy(
+				mrxs_sources);
 			free(shell_data);
 			if (!matches)
 				archive_provider_set_error(
@@ -1390,10 +1556,7 @@ archive_provider_shared_shell_acquire(
 	}
 	if (!available) {
 		platform_mutex_unlock(&archive_provider_cache_mutex);
-		if (mrxs) {
-			archive_mrxs_adapter_close(mrxs);
-			free(mrxs);
-		}
+		archive_provider_mrxs_sources_destroy(mrxs_sources);
 		free(shell_data);
 		archive_provider_set_error(
 			error, error_capacity,
@@ -1415,7 +1578,7 @@ archive_provider_shared_shell_acquire(
 	available->data = shell_data;
 	available->size = (size_t)record->shell_byte_size;
 	available->shell = shell;
-	available->mrxs = mrxs;
+	available->mrxs_sources = mrxs_sources;
 	platform_mutex_unlock(&archive_provider_cache_mutex);
 	return available;
 }
@@ -1426,7 +1589,10 @@ static archive_provider_cache_entry_t* archive_provider_instance_cache_acquire(
 	bool is_part10 = record && strcmp(record->provider, "part10") == 0;
 	bool is_mrxs = record && strcmp(record->provider, "mrxs-native") == 0;
 	if (!repository || !record || (!is_part10 && !is_mrxs) ||
-	    !record->shell_key[0] || (is_part10 && !record->object_key[0]) ||
+	    !record->shell_key[0] ||
+	    (is_part10 &&
+	     !record->object_key[0] &&
+	     !record->external_path[0]) ||
 	    record->shell_byte_size == 0 || record->shell_byte_size > SIZE_MAX) {
 		archive_provider_set_error(error, error_capacity,
 		                           "published instance has no supported shell provider");
@@ -1452,6 +1618,7 @@ static archive_provider_cache_entry_t* archive_provider_instance_cache_acquire(
 	char source_path[ARCHIVE_PATH_CAPACITY];
 	char* metadata = NULL;
 	file_handle_t source_file = 0;
+	archive_shell_payload_range_t* payload_ranges = NULL;
 	archive_shell_instance_t instance = {0};
 	size_t metadata_size = 0;
 	archive_provider_shell_cache_entry_t* shared_shell =
@@ -1464,21 +1631,19 @@ static archive_provider_cache_entry_t* archive_provider_instance_cache_acquire(
 			record, &shared_shell->shell, &instance,
 			error, error_capacity) &&
 		(!is_part10 ||
-		 archive_repository_make_path(
-			 repository, record->object_key,
-			 source_path, sizeof(source_path)));
+		 archive_provider_source_path(
+			 repository, record, source_path));
 	if (success && is_part10 &&
-	    archive_provider_path_is_external_reference(source_path)) {
-		char actual_sha256[65];
-		u64 actual_size = 0;
-		success = archive_provider_hash_file(
-			          source_path, actual_sha256, &actual_size) &&
-		          actual_size == record->object_byte_size &&
-		          strcmp(actual_sha256, record->object_sha256) == 0;
+	    record->external_path[0]) {
+		struct stat info = {0};
+		success = platform_stat(source_path, &info) == 0 &&
+		          S_ISREG(info.st_mode) &&
+		          (u64)info.st_size == record->object_byte_size;
 		if (!success)
 			archive_provider_set_error(
 				error, error_capacity,
-				"externally referenced Part 10 source changed or is unavailable");
+				"externally referenced Part 10 source size changed "
+				"or is unavailable");
 	}
 	u64 metadata_capacity = 0;
 	success = success && archive_provider_get_metadata_capacity(
@@ -1495,8 +1660,17 @@ static archive_provider_cache_entry_t* archive_provider_instance_cache_acquire(
 		source_file = open_file_handle_for_simultaneous_access(source_path);
 		success = source_file != 0;
 	}
+	if (success && is_part10) {
+		payload_ranges = calloc(
+			instance.frame_count, sizeof(*payload_ranges));
+		success = payload_ranges &&
+			archive_shell_build_payload_ranges(
+				&shared_shell->shell, &instance,
+				payload_ranges, instance.frame_count);
+	}
 	if (!success) {
 		file_handle_close(source_file);
+		free(payload_ranges);
 		free(metadata);
 		archive_provider_shell_cache_release(shared_shell);
 		if (!error || !error[0])
@@ -1518,6 +1692,7 @@ static archive_provider_cache_entry_t* archive_provider_instance_cache_acquire(
 			entry->last_used = ++archive_provider_cache_clock;
 			platform_mutex_unlock(&archive_provider_cache_mutex);
 			file_handle_close(source_file);
+			free(payload_ranges);
 			free(metadata);
 			archive_provider_shell_cache_release(shared_shell);
 			return entry;
@@ -1529,6 +1704,7 @@ static archive_provider_cache_entry_t* archive_provider_instance_cache_acquire(
 	if (!available) {
 		platform_mutex_unlock(&archive_provider_cache_mutex);
 		file_handle_close(source_file);
+		free(payload_ranges);
 		free(metadata);
 		archive_provider_shell_cache_release(shared_shell);
 		archive_provider_set_error(error, error_capacity,
@@ -1547,6 +1723,7 @@ static archive_provider_cache_entry_t* archive_provider_instance_cache_acquire(
 	available->shared_shell = shared_shell;
 	available->instance = instance;
 	available->source_file = source_file;
+	available->payload_ranges = payload_ranges;
 	available->metadata_json = metadata;
 	available->metadata_size = metadata_size;
 	platform_mutex_unlock(&archive_provider_cache_mutex);
@@ -1710,7 +1887,9 @@ i32 archive_instance_provider_get_frame_representations(
 			entry->instance.provider_kind ==
 				ARCHIVE_SHELL_PROVIDER_MRXS_NATIVE &&
 			entry->instance.provider_parameter_version ==
-				ARCHIVE_MRXS_ADAPTER_VERSION;
+				ARCHIVE_MRXS_ADAPTER_VERSION &&
+			entry->instance.payload_map_kind ==
+				ARCHIVE_SHELL_PAYLOAD_NATIVE_OFFSET_SIZE_SOA;
 		archive_provider_cache_release(entry);
 		if (!valid) return 0;
 		archive_frame_representation_t generated = {0};
@@ -1768,10 +1947,11 @@ static bool archive_provider_read_shell_frame(
 	if (!entry || !data || !size) return false;
 	*data = NULL;
 	*size = 0;
-	archive_shell_payload_range_t range = {0};
-	if (!archive_shell_get_payload_range(
-			&entry->shared_shell->shell, &entry->instance,
-	                                     frame_index, &range) ||
+	if (!entry->payload_ranges || frame_index >= entry->instance.frame_count)
+		return false;
+	archive_shell_payload_range_t range =
+		entry->payload_ranges[frame_index];
+	if (
 	    range.source_index != entry->instance.source_index ||
 	    range.size > ARCHIVE_PROVIDER_MAX_FRAME_SIZE) return false;
 	u8* encoded = malloc(range.size);
@@ -1796,6 +1976,48 @@ static bool archive_provider_read_shell_frame(
 	return true;
 }
 
+static bool archive_provider_read_mrxs_frame(
+		const archive_provider_cache_entry_t* entry,
+		u32 frame_index, u8** data, size_t* size,
+		char* error, size_t error_capacity) {
+	if (!entry || !entry->shared_shell ||
+	    !entry->shared_shell->mrxs_sources ||
+	    !data || !size)
+		return false;
+	archive_shell_native_payload_t payload = {0};
+	archive_provider_mrxs_sources_t* sources =
+		entry->shared_shell->mrxs_sources;
+	if (!archive_shell_get_native_payload(
+			&entry->shared_shell->shell, &entry->instance,
+			frame_index, &payload) ||
+	    payload.file_index >= sources->count ||
+	    payload.size > ARCHIVE_PROVIDER_MAX_FRAME_SIZE ||
+	    payload.offset > sources->sizes[payload.file_index] ||
+	    payload.size >
+		    sources->sizes[payload.file_index] - payload.offset) {
+		archive_provider_set_error(
+			error, error_capacity,
+			"MRXS shell payload range is invalid");
+		return false;
+	}
+	u8* jpeg = malloc(payload.size);
+	if (!jpeg) return false;
+	size_t read = file_handle_read_at_offset(
+		jpeg, sources->files[payload.file_index],
+		payload.offset, payload.size);
+	if (read != payload.size || payload.size < 4 ||
+	    jpeg[0] != 0xff || jpeg[1] != 0xd8) {
+		free(jpeg);
+		archive_provider_set_error(
+			error, error_capacity,
+			"MRXS shell payload is not a standalone JPEG frame");
+		return false;
+	}
+	*data = jpeg;
+	*size = payload.size;
+	return true;
+}
+
 bool archive_instance_provider_get_frame(const archive_repository_t* repository,
 		const archive_instance_record_t* record, u32 one_based_frame,
 		const archive_frame_representation_t* representation,
@@ -1812,40 +2034,15 @@ bool archive_instance_provider_get_frame(const archive_repository_t* repository,
 			repository, record, error, error_capacity);
 	if (!entry) return false;
 	const archive_shell_instance_t* instance = &entry->instance;
-	u32 provider_frame = one_based_frame;
-	if (entry->shared_shell->mrxs &&
-	    instance->provider_kind == ARCHIVE_SHELL_PROVIDER_MRXS_NATIVE &&
-	    instance->frame_map_kind != ARCHIVE_SHELL_FRAME_MAP_REGULAR_GRID) {
-		archive_shell_frame_t shell_frame = {0};
-		bool mapped = one_based_frame <= instance->frame_count &&
-			archive_shell_get_frame(
-				&entry->shared_shell->shell, instance,
-				one_based_frame - 1, &shell_frame) &&
-			shell_frame.row_position > 0 &&
-			shell_frame.column_position > 0 &&
-			(shell_frame.row_position - 1) % instance->rows == 0 &&
-			(shell_frame.column_position - 1) % instance->columns == 0;
-		u32 tile_row = mapped ?
-			(shell_frame.row_position - 1) / instance->rows : 0;
-		u32 tile_column = mapped ?
-			(shell_frame.column_position - 1) / instance->columns : 0;
-		mapped = mapped &&
-			tile_row < instance->tiles_per_column &&
-			tile_column < instance->tiles_per_row &&
-			(u64)tile_row * instance->tiles_per_row + tile_column <
-				UINT32_MAX;
-		provider_frame = mapped ?
-			tile_row * instance->tiles_per_row + tile_column + 1 : 0;
-	}
-	if (entry->shared_shell->mrxs &&
+	if (entry->shared_shell->mrxs_sources &&
 	    instance->provider_kind == ARCHIVE_SHELL_PROVIDER_MRXS_NATIVE &&
 	    representation->source == ARCHIVE_FRAME_REPRESENTATION_GENERATED &&
 	    strcmp(representation->media_type, "image/jpeg") == 0 &&
 	    strcmp(representation->transfer_syntax_uid,
 	           "1.2.840.10008.1.2.4.50") == 0 &&
-	    archive_mrxs_adapter_get_jpeg_frame(
-		    entry->shared_shell->mrxs, record->shell_instance_index,
-		    provider_frame,
+	    one_based_frame <= instance->frame_count &&
+	    archive_provider_read_mrxs_frame(
+		    entry, one_based_frame - 1,
 		    &frame->data, &frame->size, error, error_capacity)) {
 		snprintf(frame->media_type, sizeof(frame->media_type),
 		         "image/jpeg");

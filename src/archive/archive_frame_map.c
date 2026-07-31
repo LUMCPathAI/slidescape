@@ -97,18 +97,6 @@ static i32 archive_frame_map_find_float(const float* values, i32 count, float va
 	return -1;
 }
 
-static bool archive_frame_map_id_is_valid(const char* value) {
-	if (!value || !value[0]) return false;
-	size_t length = 0;
-	for (; value[length]; ++length) {
-		char c = value[length];
-		if (length >= 64 ||
-		    !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-		      (c >= '0' && c <= '9') || c == '-' || c == '_')) return false;
-	}
-	return length > 0;
-}
-
 static bool archive_frame_map_build_tiled_full(archive_frame_map_t* map,
 		const dicom_instance_t* instance, char* error, size_t error_capacity) {
 	u64 tiles_per_row =
@@ -393,60 +381,6 @@ bool archive_frame_map_parse(archive_frame_map_t* map, const u8* data, size_t si
 	}
 	archive_frame_map_destroy(map);
 	*map = parsed;
-	return true;
-}
-
-bool archive_frame_map_stage(const archive_repository_t* repository,
-		const char* representation_id, u32 representation_version,
-		const archive_frame_map_t* map, char* object_key, size_t object_key_capacity,
-		char* error, size_t error_capacity) {
-	if (!repository || !representation_id || !representation_id[0] ||
-	    !representation_version || !object_key || !object_key_capacity ||
-	    !archive_frame_map_id_is_valid(representation_id) ||
-	    !archive_frame_map_metadata_is_valid(map)) {
-		archive_frame_map_set_error(error, error_capacity,
-			"frame-map staging arguments are invalid");
-		return false;
-	}
-	i32 key_length = snprintf(object_key, object_key_capacity,
-		"staging/%s.v%u.frame-map-v%u.bin", representation_id,
-		representation_version, ARCHIVE_FRAME_MAP_SCHEMA_VERSION);
-	if (key_length < 0 || (size_t)key_length >= object_key_capacity) return false;
-	char path[ARCHIVE_PATH_CAPACITY];
-	char temporary[ARCHIVE_PATH_CAPACITY];
-	if (!archive_repository_make_path(repository, object_key, path, sizeof(path))) return false;
-	i32 temporary_length = snprintf(temporary, sizeof(temporary), "%s.tmp", path);
-	if (temporary_length < 0 || (size_t)temporary_length >= sizeof(temporary)) return false;
-	FILE* existing = fopen(path, "rb");
-	if (existing) {
-		fclose(existing);
-		archive_frame_map_set_error(error, error_capacity,
-			"staged frame map '%s' already exists", path);
-		return false;
-	}
-	FILE* file = fopen(temporary, "wb");
-	if (!file) {
-		archive_frame_map_set_error(error, error_capacity,
-			"could not create staged frame map '%s': %s", temporary, strerror(errno));
-		return false;
-	}
-	u8 header[ARCHIVE_FRAME_MAP_HEADER_SIZE];
-	u8 buffer[ARCHIVE_FRAME_MAP_ENTRY_SIZE];
-	archive_frame_map_encode_header(map, header);
-	bool failed = fwrite(header, 1, ARCHIVE_FRAME_MAP_HEADER_SIZE, file) !=
-		ARCHIVE_FRAME_MAP_HEADER_SIZE;
-	for (u32 frame = 0; frame < map->frame_count && !failed; ++frame) {
-		archive_frame_map_encode_entry(map->entries + frame, buffer);
-		failed = fwrite(buffer, 1, sizeof(buffer), file) != sizeof(buffer);
-	}
-	if (fclose(file) != 0) failed = true;
-	if (!failed && rename(temporary, path) != 0) failed = true;
-	if (failed) {
-		remove(temporary);
-		archive_frame_map_set_error(error, error_capacity,
-			"could not commit staged frame map '%s'", path);
-		return false;
-	}
 	return true;
 }
 

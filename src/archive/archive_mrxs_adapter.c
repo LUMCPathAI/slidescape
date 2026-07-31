@@ -200,8 +200,8 @@ bool archive_mrxs_adapter_build_recipe(const char* mrxs_path,
 	if (!result) return false;
 	i32 length = snprintf(
 		result, capacity,
-		"slidescape-mrxs-native-recipe-v3\n"
-		"adapter\tslidescape-mrxs\t3\n"
+		"slidescape-mrxs-native-recipe-v5\n"
+		"adapter\tslidescape-mrxs\t5\n"
 		"bundle-descriptor-sha256\t%s\n"
 		"bundle-descriptor-size\t%llu\n"
 		"representation-fingerprint\t%s\n"
@@ -230,7 +230,10 @@ bool archive_mrxs_adapter_build_shell(archive_mrxs_adapter_t* adapter,
 	dicom_instance_t* instances = calloc(count, sizeof(*instances));
 	archive_shell_build_part10_input_t* inputs =
 		calloc(count, sizeof(*inputs));
-	if (!instances || !inputs) {
+	archive_shell_native_payload_t** payloads =
+		calloc(count, sizeof(*payloads));
+	if (!instances || !inputs || !payloads) {
+		free(payloads);
 		free(inputs);
 		free(instances);
 		return false;
@@ -271,7 +274,22 @@ bool archive_mrxs_adapter_build_shell(archive_mrxs_adapter_t* adapter,
 			for (u32 j = 0; j <= i; ++j) {
 				arrfree(instances[j].per_frame_plane_position_slide);
 				arrfree(instances[j].optical_paths);
+				free(payloads[j]);
 			}
+			free(payloads);
+			free(inputs);
+			free(instances);
+			return false;
+		}
+		payloads[i] = calloc(
+			occupied_frame_count, sizeof(*payloads[i]));
+		if (!payloads[i]) {
+			for (u32 j = 0; j <= i; ++j) {
+				arrfree(instances[j].per_frame_plane_position_slide);
+				arrfree(instances[j].optical_paths);
+				free(payloads[j]);
+			}
+			free(payloads);
 			free(inputs);
 			free(instances);
 			return false;
@@ -296,10 +314,13 @@ bool archive_mrxs_adapter_build_shell(archive_mrxs_adapter_t* adapter,
 		instance->is_image_orientation_slide_known = true;
 		instance->image_orientation_slide[0] = 1.0f;
 		instance->image_orientation_slide[4] = 1.0f;
+		u32 frame_index = 0;
 		for (i32 tile_index = 0;
 		     tile_index < level->width_in_tiles * level->height_in_tiles;
 		     ++tile_index) {
 			if (!level->tiles[tile_index].hier_entry.length) continue;
+			mrxs_hier_entry_t entry =
+				level->tiles[tile_index].hier_entry;
 			u32 tile_x = (u32)(tile_index % level->width_in_tiles);
 			u32 tile_y = (u32)(tile_index / level->width_in_tiles);
 			dicom_plane_position_slide_t position = {0};
@@ -314,6 +335,12 @@ bool archive_mrxs_adapter_build_shell(archive_mrxs_adapter_t* adapter,
 				(float)(position.row_position_in_total_image_pixel_matrix - 1) *
 				instance->pixel_spacing.x;
 			arrput(instance->per_frame_plane_position_slide, position);
+			payloads[i][frame_index++] =
+				(archive_shell_native_payload_t){
+					.file_index = entry.file,
+					.offset = entry.offset,
+					.size = entry.length,
+				};
 		}
 		dicom_optical_path_t optical_path = {0};
 		optical_path.OpticalPathIdentifier.present = true;
@@ -330,7 +357,8 @@ bool archive_mrxs_adapter_build_shell(archive_mrxs_adapter_t* adapter,
 			.representation_fingerprint = representation_fingerprint,
 			.provider_kind = ARCHIVE_SHELL_PROVIDER_MRXS_NATIVE,
 			.provider_parameter_version = ARCHIVE_MRXS_ADAPTER_VERSION,
-			.provider_uses_frame_index = true,
+			.native_payloads = payloads[i],
+			.native_payload_count = occupied_frame_count,
 		};
 	}
 	archive_shell_build_part10_aggregate_input_t aggregate = {
@@ -343,7 +371,9 @@ bool archive_mrxs_adapter_build_shell(archive_mrxs_adapter_t* adapter,
 	for (u32 i = 0; i < count; ++i) {
 		arrfree(instances[i].per_frame_plane_position_slide);
 		arrfree(instances[i].optical_paths);
+		free(payloads[i]);
 	}
+	free(payloads);
 	free(inputs);
 	free(instances);
 	return success;

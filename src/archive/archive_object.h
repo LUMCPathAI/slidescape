@@ -33,6 +33,7 @@ typedef struct archive_object_t {
 	u64 byte_size;
 	char media_type[129];
 	char storage_key[257];
+	char external_path[ARCHIVE_PATH_CAPACITY];
 	bool already_present;
 } archive_object_t;
 
@@ -45,9 +46,9 @@ archive_object_status_t archive_object_import_file(const archive_repository_t* r
 		const char* source_path, const char* media_type, archive_object_t* object,
 		char* error, size_t error_capacity);
 /*
- * Development-only zero-copy placement. The content-addressed object path is a
- * filesystem link to `source_path`; moving, deleting, or modifying the source can
- * invalidate the archive. The source is fully hashed before registration.
+ * Development-only zero-copy placement. The absolute external source locator is
+ * stored in SQLite; moving, deleting, or modifying the source can invalidate the
+ * archive. The source is fully hashed before registration.
  */
 archive_object_status_t archive_object_reference_file(
 		const archive_repository_t* repository, const char* source_path,

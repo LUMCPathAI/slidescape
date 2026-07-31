@@ -102,11 +102,11 @@ work.
   duplicate verification, and idempotent SQLite registration;
 - atomic Part 10 bundle publication in SQLite and SQLite-backed reconstruction of
   the in-memory QIDO/provider index;
-- virtual-shell binary format v1 with an aligned section directory, stable
+- virtual-shell binary format v2 with an aligned section directory, stable
   source-digest references, inline optical-path/ICC data, compact regular or explicit
   frame semantics, fixed-stride or delta-offset payload lookup, and validated
   single-instance and aggregate Part 10 writers/loaders;
-- SQLite schema v4 publication of one aggregate shell per initial Study/Series
+- SQLite schema v5 publication of one aggregate shell per initial Study/Series
   logical-slide group, with a durable shell-directory index and individual DICOMweb
   addressing for every SOP Instance;
 - dedicated content-addressed fast-tier shell storage, canonical retained Part 10
@@ -121,19 +121,19 @@ work.
   one `TILED_SPARSE` VOLUME instance per native pyramid level in one aggregate shell;
   compact row runs enumerate only occupied native positions, and frame WADO passes
   their standalone JPEG tiles through without decoding;
-- development-only external Part 10 ingestion from an arbitrary file or directory
-  using content-addressed filesystem links instead of copying source bytes. Linked
-  objects are checksummed during ingestion and again on first provider-cache use;
-  moving, changing, or deleting the external source invalidates retrieval;
+- development-only external Part 10 ingestion from an arbitrary file or directory.
+  Canonical absolute paths are stored in SQLite instead of copying bytes or creating
+  filesystem links under `objects/`. Sources are checksummed during ingestion;
+  provider-cache admission checks availability and size, so moving, changing, or
+  deleting the external source invalidates retrieval;
 - SQLite index reconstruction from published shell representations, a bounded
   aggregate-shell cache shared by every instance in the logical slide, and a bounded
   per-instance provider cache. The shared entry owns the validated shell bytes and,
-  for MRXS, the parsed native adapter; the instance entries project metadata and
-  retain only instance-specific source state;
-- a versioned repository layout separating immutable objects, bundle manifests,
+  for MRXS, the open native data-file handles; the instance entries project metadata
+  and retain only instance-specific source state;
+- a versioned repository layout separating immutable objects, bundle provenance,
   representations, durable published state, disposable derived data, and staging;
 - shared DICOM UID validation and bounded source/virtual-instance C contracts;
-- best-effort single-writer staging of bounded JSON manifests;
 - route classification for QIDO, WADO metadata/frames, and STOW;
 - bounded study-, series-, and instance-level QIDO DICOM JSON with exact UID filters,
   `limit`, and `offset`;
@@ -148,11 +148,10 @@ work.
 - startup validation that published series have a study and a complete contiguous
   instance directory, and that instances have a series;
 - read and write socket deadlines and Unix broken-pipe protection;
-- focused repository, routing, manifest, index, and client-parser tests.
+- focused repository, routing, index, shell, and client-parser tests.
 
-The flat TSV compatibility snapshots have been removed. The handwritten manifest
-JSON remains disposable scaffolding rather than a canonical metadata schema. Current
-limitations are:
+The flat TSV compatibility snapshots and the superseded staged JSON manifest path
+have been removed. Current limitations are:
 
 - the index is loaded once at startup and does not provide live publication;
 - duplicate checks are simple and not designed for cloud-scale cardinality;
@@ -186,17 +185,26 @@ limitations are:
   Little Endian `application/octet-stream`. Series metadata uses the same shell
   projection and verifies complete ordered index coverage. Broader photometric
   generation and STOW remain.
+- development `--reference` Part 10 sources are hashed during ingestion, but ordinary
+  cache admission now checks only target availability and byte size rather than
+  rehashing an entire WSI. This removes a large cold-open cost while preserving the
+  explicitly non-durable reference-mode contract. Owned immutable objects and shell
+  regeneration continue to use their published SHA-256 identities. Reference mode
+  stores an absolute external path in SQLite; it creates neither an object payload
+  nor a symbolic link under `objects/`;
 - the MRXS spike deliberately retains an absolute local source path in its inline
   recipe and does not copy the approximately 4.7 GB fixture into archive ownership.
   Its descriptor proves what was admitted, but request-time reads trust that external
   location rather than rehashing the entire bundle. This is suitable for format-
   neutrality testing only, not cloud durability or mutation-safe clinical serving;
-- the pinned MRXS v3 profile accepts only brightfield JPEG pyramids with known pixel
+- the pinned MRXS v5 profile accepts only brightfield JPEG pyramids with known pixel
   spacing, no tile overlap, one optical path/focal plane, and at most 16 levels.
   Associated images, fluorescence, arbitrary overlap reconstruction, specimen
   governance, and diagnostic ICC/color policy remain. It publishes native occupancy
   as `TILED_SPARSE`; missing grid positions are not DICOM frames and cannot be
-  requested;
+  requested. Each occupied frame now carries a shell-native data-file index, byte
+  offset, and JPEG length. Normal serving opens the retained `.dat` files from the
+  admitted bundle descriptor and no longer parses `Slidedat.ini` or `Index.dat`;
 
 The pinned Orthanc harness is a protocol oracle, but not a safe performance oracle
 for the private 487 MB / 38,478-frame UMCU top-level instance. Orthanc 1.12.11 with
@@ -241,7 +249,7 @@ Proceed in this order:
 The shared tile-cache locking/lifetime prerequisite and bounded four-frame DICOMweb
 batching are complete. Continue with:
 
-1. Close the pinned MRXS v3 semantic profile before making it durable: validate the
+1. Close the pinned MRXS v5 semantic profile before making it durable: validate the
    admitted JPEG profile, photometric/subsampling agreement, lossy-compression and
    derivation metadata, ICC/color policy, missing-versus-corrupt tile handling, and
    sampled native/virtual/materialized parity.

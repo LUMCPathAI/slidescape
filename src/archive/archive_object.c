@@ -63,6 +63,17 @@ static bool archive_object_media_type_is_valid(const char* media_type) {
 	return true;
 }
 
+static bool archive_object_absolute_source_path(
+		const char* source_path, char path[ARCHIVE_PATH_CAPACITY]) {
+#if defined(_WIN32)
+	DWORD length = GetFullPathNameA(
+		source_path, ARCHIVE_PATH_CAPACITY, path, NULL);
+	return length > 0 && length < ARCHIVE_PATH_CAPACITY;
+#else
+	return realpath(source_path, path) != NULL;
+#endif
+}
+
 static bool archive_object_is_directory(const char* path) {
 	struct stat info;
 	return stat(path, &info) == 0 && S_ISDIR(info.st_mode);
@@ -265,75 +276,6 @@ static archive_object_status_t archive_object_install(const archive_repository_t
 	return ARCHIVE_OBJECT_OK;
 }
 
-static archive_object_status_t archive_object_install_reference(
-		const archive_repository_t* repository, const char* source_path,
-		const char* sha256, char storage_key[257], bool* already_present,
-		char* error, size_t error_capacity) {
-	char objects_path[ARCHIVE_PATH_CAPACITY];
-	char sha_path[ARCHIVE_PATH_CAPACITY];
-	char prefix_directory[ARCHIVE_PATH_CAPACITY];
-	char object_path[ARCHIVE_PATH_CAPACITY];
-	if (!archive_repository_make_path(
-			repository, "objects", objects_path, sizeof(objects_path)) ||
-	    !archive_repository_make_path(
-		    repository, "objects/sha256", sha_path, sizeof(sha_path)))
-		return ARCHIVE_OBJECT_STORAGE_ERROR;
-	i32 prefix_length = snprintf(
-		prefix_directory, sizeof(prefix_directory), "%s/%c%c",
-		sha_path, sha256[0], sha256[1]);
-	i32 key_length = snprintf(
-		storage_key, 257, "objects/sha256/%c%c/%s",
-		sha256[0], sha256[1], sha256);
-	if (prefix_length <= 0 ||
-	    (size_t)prefix_length >= sizeof(prefix_directory) ||
-	    key_length <= 0 || key_length >= 257 ||
-	    !archive_repository_make_path(
-		    repository, storage_key, object_path, sizeof(object_path)) ||
-	    !archive_object_ensure_directory(
-		    sha_path, objects_path, error, error_capacity) ||
-	    !archive_object_ensure_directory(
-		    prefix_directory, sha_path, error, error_capacity))
-		return ARCHIVE_OBJECT_STORAGE_ERROR;
-	*already_present = false;
-#if defined(_WIN32)
-	DWORD flags = 0;
-#if defined(SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)
-	flags |= SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
-#endif
-	if (!CreateSymbolicLinkA(object_path, source_path, flags)) {
-		DWORD link_error = GetLastError();
-		if (link_error != ERROR_ALREADY_EXISTS &&
-		    link_error != ERROR_FILE_EXISTS) {
-			archive_object_set_error(
-				error, error_capacity,
-				"could not create referenced object link: %lu",
-				(unsigned long)link_error);
-			return ARCHIVE_OBJECT_STORAGE_ERROR;
-		}
-		*already_present = true;
-	}
-#else
-	if (symlink(source_path, object_path) != 0) {
-		if (errno != EEXIST) {
-			archive_object_set_error(
-				error, error_capacity,
-				"could not create referenced object link: %s",
-				strerror(errno));
-			return ARCHIVE_OBJECT_STORAGE_ERROR;
-		}
-		*already_present = true;
-	} else if (!archive_object_sync_directory(prefix_directory)) {
-		archive_object_set_error(
-			error, error_capacity,
-			"could not make referenced object locator durable: %s",
-			strerror(errno));
-		remove(object_path);
-		return ARCHIVE_OBJECT_STORAGE_ERROR;
-	}
-#endif
-	return ARCHIVE_OBJECT_OK;
-}
-
 static archive_object_status_t archive_object_register(const archive_repository_t* repository,
 		const char* sha256, u64 byte_size, const char* media_type, const char* storage_key,
 		bool file_already_present, archive_object_t* object,
@@ -443,44 +385,43 @@ archive_object_status_t archive_object_reference_file(
 	if (!repository || !source_path || !source_path[0] ||
 	    !archive_object_media_type_is_valid(media_type) || !object)
 		return ARCHIVE_OBJECT_INVALID_ARGUMENT;
-	char sha256[65];
-	u64 byte_size = 0;
-	if (!archive_object_hash_file(source_path, sha256, &byte_size)) {
-		archive_object_set_error(error, error_capacity,
-		                         "could not hash referenced source '%s'",
-		                         source_path);
+	char absolute_source_path[ARCHIVE_PATH_CAPACITY];
+	if (!archive_object_absolute_source_path(
+			source_path, absolute_source_path)) {
+		archive_object_set_error(
+			error, error_capacity,
+			"could not resolve referenced source '%s': %s",
+			source_path, strerror(errno));
 		return ARCHIVE_OBJECT_SOURCE_ERROR;
 	}
-	char storage_key[257];
-	bool already_present = false;
-	archive_object_status_t status = archive_object_install_reference(
-		repository, source_path, sha256, storage_key, &already_present,
-		error, error_capacity);
-	if (status != ARCHIVE_OBJECT_OK) return status;
-	char object_path[ARCHIVE_PATH_CAPACITY];
-	if (!archive_repository_make_path(
-			repository, storage_key, object_path, sizeof(object_path))) {
-		return ARCHIVE_OBJECT_STORAGE_ERROR;
+	char sha256[65];
+	u64 byte_size = 0;
+	if (!archive_object_hash_file(
+			absolute_source_path, sha256, &byte_size)) {
+		archive_object_set_error(error, error_capacity,
+		                         "could not hash referenced source '%s'",
+		                         absolute_source_path);
+		return ARCHIVE_OBJECT_SOURCE_ERROR;
 	}
-	if (already_present) {
-		char retained_sha256[65];
-		u64 retained_size = 0;
-		if (!archive_object_hash_file(
-				object_path, retained_sha256, &retained_size) ||
-		    retained_size != byte_size || strcmp(retained_sha256, sha256) != 0) {
-			archive_object_set_error(
-				error, error_capacity,
-				"referenced object locator failed integrity verification");
-			return ARCHIVE_OBJECT_INTEGRITY_ERROR;
-		}
-	}
-	status = archive_object_register(
-		repository, sha256, byte_size, media_type, storage_key,
-		already_present, object, error, error_capacity);
-	if (status != ARCHIVE_OBJECT_OK && !already_present) {
-		remove(object_path);
-	}
-	return status;
+	archive_database_object_t registered = {0};
+	archive_database_status_t status =
+		archive_database_register_external_object(
+			repository, sha256, byte_size, media_type,
+			absolute_source_path, &registered, error, error_capacity);
+	if (status != ARCHIVE_DATABASE_OK)
+		return status == ARCHIVE_DATABASE_CONFLICT ?
+		       ARCHIVE_OBJECT_CONFLICT :
+		       ARCHIVE_OBJECT_DATABASE_ERROR;
+	object->id = registered.id;
+	memcpy(object->sha256, registered.sha256,
+	       sizeof(object->sha256));
+	object->byte_size = registered.byte_size;
+	memcpy(object->media_type, registered.media_type,
+	       sizeof(object->media_type));
+	memcpy(object->external_path, registered.external_path,
+	       sizeof(object->external_path));
+	object->already_present = registered.already_registered;
+	return ARCHIVE_OBJECT_OK;
 }
 
 static archive_object_status_t archive_object_store_bytes_in_tier(

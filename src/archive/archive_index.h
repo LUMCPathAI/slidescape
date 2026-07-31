@@ -49,11 +49,12 @@ typedef struct archive_instance_record_t {
 	char total_pixel_matrix_rows[17];
 	/*
 	 * These two fields select the byte provider; they are not part of QIDO output.
-	 * `object_key` is repository-relative and opaque to HTTP handlers. Production
-	 * storage will replace it with a database/object-store reference.
+	 * Owned `object_key` values are repository-relative. Development references
+	 * instead use an explicit absolute `external_path`.
 	 */
 	char provider[17];
 	char object_key[257];
+	char external_path[ARCHIVE_PATH_CAPACITY];
 	char object_sha256[65];
 	u64 object_byte_size;
 	char shell_key[257];

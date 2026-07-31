@@ -10,7 +10,6 @@
 
 #pragma once
 
-#include "archive_repository.h"
 #include "common.h"
 
 #ifdef __cplusplus
@@ -62,10 +61,6 @@ bool archive_frame_map_build_part10(archive_frame_map_t* map,
 bool archive_frame_map_serialize(const archive_frame_map_t* map, u8* dest,
 		size_t capacity, size_t* encoded_size, char* error, size_t error_capacity);
 bool archive_frame_map_parse(archive_frame_map_t* map, const u8* data, size_t size,
-		char* error, size_t error_capacity);
-bool archive_frame_map_stage(const archive_repository_t* repository,
-		const char* representation_id, u32 representation_version,
-		const archive_frame_map_t* map, char* object_key, size_t object_key_capacity,
 		char* error, size_t error_capacity);
 void archive_frame_map_destroy(archive_frame_map_t* map);
 

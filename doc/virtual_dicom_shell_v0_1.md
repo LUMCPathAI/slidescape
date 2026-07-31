@@ -1,8 +1,8 @@
 # Virtual DICOM Shell v0.1
 
-Status: binary format v1, single-instance and aggregate Part 10 writers/loaders, and
+Status: binary format v2, single-instance and aggregate Part 10 writers/loaders, and
 transactional multi-instance logical-slide publication are implemented. Aggregate
-policy v7 promotes canonically equal governed attributes and
+policy v9 promotes canonically equal governed attributes and
 container/specimen/preparation metadata into explicit shared sections, and uses
 delta-encoded encapsulated-frame payload maps.
 
@@ -103,7 +103,7 @@ per-section compression can be added later without changing the directory.
 The shared-metadata revision now promotes ten explicitly scoped patient, study, and
 series attributes plus canonically equal container/specimen/preparation sections.
 The remaining instance attribute tables contain only overrides and image-specific
-facts. Shared optical-path data remains a possible later optimization. Shared
+facts. Canonically identical optical-path/ICC sections are also shared. Shared
 sections are never inherited merely because an instance happens to be first. Each
 instance projects to a complete independent DICOM metadata dataset. Disagreement in
 a governed shared field rejects publication until an explicit governed resolution
@@ -111,12 +111,12 @@ policy exists.
 
 The format supports multiple instance records from its first version. The aggregate
 Part 10 writer combines validated single-instance sections into one SOP-ordered
-logical-slide directory, remapping source, string, section, and payload-source
+logical-slide directory, remapping source, string, and section
 references without changing the outer format.
 
 Future source-bundle packaging may use an uncompressed ZIP64 container to group
 related objects and instances into one logical unit. This is retained as a packaging
-option rather than made part of shell format v1.
+option rather than made part of shell format v2.
 
 The format uses 64-bit byte sizes and offsets and 32-bit structural counts. It has no
 arbitrary encoded-size ceiling, but all arithmetic is checked, the encoded size must
@@ -243,9 +243,11 @@ A separate compact specimen section retains Container Identifier and each Specim
 Identifier, Specimen UID, and Specimen Short Description.
 
 Aggregate publication retains that optical record layout under adapter recipe/policy
-`part10-delta-payload-v7`, adding the ordered multi-source recipe, logical-slide
-grouping contract, compact delta payload maps, and a typed specimen-preparation
-section. Preparation items are stored in
+`part10-cached-delta-payload-v9`, adding the ordered multi-source recipe,
+logical-slide grouping contract, compact delta payload maps, shared identical
+optical-path/ICC sections, and a typed specimen-preparation section. The provider
+expands delta maps once when an instance enters its cache, making subsequent
+frame-range lookup constant-time without enlarging the shell. Preparation items are stored in
 preorder with explicit specimen, step, and parent-item indices. Concept-name code
 components and CODE values retain their coding scheme and optional scheme version;
 content relationships are retained alongside explicit parent indices. TEXT, NUM
@@ -363,11 +365,15 @@ uses Slidescape's built-in MRXS reader. It produces:
 - normalized `TILED_SPARSE` geometry and compact occupied-row runs;
 - optical-path and color descriptions;
 - an `mrxs-native` locator containing the bundle digest, logical source names,
-  adapter semantic version, and bounded tile-index parameters.
+  adapter semantic version, and a structure-of-arrays payload map with the native
+  data-file index, 64-bit byte offset, and 32-bit JPEG length for every occupied
+  frame. When every frame in an instance uses one native data file, as in the P480
+  fixture, its file index is stored once in the payload header; a per-frame file-index
+  array is retained as the general multi-source fallback.
 
-At request time, frame WADO maps the DICOM frame to native MRXS tile coordinates.
-Policy `mrxs-jpeg-sparse-v3` returns standalone native JPEG tile bytes without
-decoding. Only occupied native positions become DICOM frames. The shell proves that
+At request time, policy `mrxs-jpeg-shell-payload-v5` reads the standalone native JPEG
+bytes directly from the shell locator without decoding or parsing `Slidedat.ini` and
+`Index.dat`. Only occupied native positions become DICOM frames. The shell proves that
 their row-major positions and physical X/Y coordinates fit the regular grid within a
 small floating-point tolerance, then stores consecutive occupied tiles as row runs.
 Unoccupied grid positions are absent under `TILED_SPARSE` semantics.
@@ -435,7 +441,7 @@ Required configuration or stakeholder policy:
 
 The single-instance writer materializes one parsed Part 10 instance, including core
 typed DICOM attributes, optical paths and ICC bytes, regular or explicit frame
-semantics, and fixed-stride, delta-offset, or provider-native frame-index payload
+semantics, and fixed-stride, delta-offset, explicit-offset, or provider-native SOA payload
 lookup. The aggregate writer
 combines those validated sections into one shared source/string/instance directory
 and preserves an independent provider and payload map for every SOP Instance. The
@@ -467,7 +473,7 @@ process. Production object storage and durable background repair jobs own
 cross-process availability, retry, and telemetry; public request handlers are not the
 primary reconstruction orchestrator.
 
-SQLite schema v4 publishes one representation and shell per initial Part 10
+SQLite schema v5 publishes one representation and shell per initial Part 10
 Study/Series group. Each instance retains its individual DICOMweb identity and source
 provider while referencing its persisted directory index in the aggregate shell.
 The aggregate v7 recipe records the SOP-ordered source set, grouping policy, and
