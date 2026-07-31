@@ -211,8 +211,11 @@ For each DICOM frame, a map resolves:
 DICOM-facing frame order is immutable. Provider byte lookup is encoded independently:
 the current Part 10 forms are fixed base/stride for native uncompressed pixels and,
 for encapsulated pixels, one 64-bit base plus a structure-of-arrays map of 32-bit
-deltas between frame starts. Each non-final frame size is the following start delta
-minus an optional sparse gap correction; the final frame size is explicit. Deltas
+deltas between frame starts and one equally sized correction array. Each non-final
+frame size is the following start delta minus its correction; the final frame size
+is explicit. If frame offsets are not strictly ascending and non-overlapping, or a
+delta cannot be represented, parallel absolute `u64` offset and `u32` size arrays
+are used instead. Deltas
 are accumulated in 64 bits, so the representation does not impose a 4 GiB instance
 limit. Provider lookup data may be reorganized for performance only if the bytes or
 deterministic generation rule promised for each frame remain unchanged.
@@ -357,18 +360,17 @@ uses Slidescape's built-in MRXS reader. It produces:
 - governed slide/specimen facts and provenance;
 - deterministic DICOM UIDs;
 - one aggregate shell with one VOLUME instance per native pyramid level;
-- normalized regular-grid geometry and compact implicit frame maps;
+- normalized `TILED_SPARSE` geometry and compact occupied-row runs;
 - optical-path and color descriptions;
 - an `mrxs-native` locator containing the bundle digest, logical source names,
   adapter semantic version, and bounded tile-index parameters.
 
 At request time, frame WADO maps the DICOM frame to native MRXS tile coordinates.
-Policy `mrxs-jpeg-v2` returns standalone native JPEG tile bytes without decoding.
-For a regular-grid slot with no stored MRXS tile, it generates a deterministic
-background JPEG using the level's declared fill color. Consequently the virtual
-DICOM instance is `TILED_FULL` even though its native storage is sparse: every
-published frame position is retrievable in the selected JPEG Baseline
-representation.
+Policy `mrxs-jpeg-sparse-v3` returns standalone native JPEG tile bytes without
+decoding. Only occupied native positions become DICOM frames. The shell proves that
+their row-major positions and physical X/Y coordinates fit the regular grid within a
+small floating-point tolerance, then stores consecutive occupied tiles as row runs.
+Unoccupied grid positions are absent under `TILED_SPARSE` semantics.
 
 This is a constrained development proof: the retained inline recipe contains the
 absolute source path, and request-time reads do not rehash the multi-gigabyte bundle.

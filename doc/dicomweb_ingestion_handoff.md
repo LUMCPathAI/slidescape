@@ -87,7 +87,7 @@ of up to four already-scheduled tiles without adding a coalescing delay. Tile wo
 combine frames from the same instance into RetrieveFrames and retry failed parts
 individually. A regression test pins that batching policy. Uncompressed
 bulk-data negotiation, servers that decline all advertised compressed syntaxes,
-additional multipart variants, optical paths, focal planes, sparse tiling,
+additional multipart variants, optical paths, focal planes, multidimensional sparse tiling,
 concatenations, associated images, and diagnostic color policy remain acceptance
 work.
 
@@ -118,9 +118,9 @@ work.
 - a deliberately constrained `brightfield_p480.mrxs` native-provider spike using
   Slidescape's built-in MRXS reader (never OpenSlide): ingestion checksums the
   `.mrxs`, `Slidedat.ini`, `Index.dat`, and every declared data file, then publishes
-  one `TILED_FULL` VOLUME instance per native pyramid level in one aggregate shell;
-  frame WADO passes native standalone JPEG tiles through without decoding and
-  synthesizes deterministic JPEG background frames for absent grid slots;
+  one `TILED_SPARSE` VOLUME instance per native pyramid level in one aggregate shell;
+  compact row runs enumerate only occupied native positions, and frame WADO passes
+  their standalone JPEG tiles through without decoding;
 - development-only external Part 10 ingestion from an arbitrary file or directory
   using content-addressed filesystem links instead of copying source bytes. Linked
   objects are checksummed during ingestion and again on first provider-cache use;
@@ -169,9 +169,11 @@ limitations are:
   the corresponding DICOM content-item sequences;
 - pre-v7 Part 10 development publications are no longer accepted. Policy v7 removes
   the flat 16-byte-per-frame explicit payload records. Encapsulated frames use one
-  64-bit base, 32-bit deltas between frame starts, one explicit final-frame size,
-  and sparse non-frame gap corrections; all other frame sizes are derived from the
-  next delta. Development repositories must be recreated and ingested again;
+  64-bit base plus parallel 32-bit frame-start delta and correction arrays, with one
+  explicit final-frame size; all other frame sizes are derived from the next delta.
+  Unordered, overlapping, or otherwise non-representable inputs use parallel
+  absolute-offset and size arrays. Development repositories must be recreated and
+  ingested again;
   automated representation upgrades remain future work;
 - staging is not crash-durable and is not safe as a multi-process transaction;
 - virtual-shell representation publication is atomic after its immutable inputs are
@@ -189,12 +191,12 @@ limitations are:
   Its descriptor proves what was admitted, but request-time reads trust that external
   location rather than rehashing the entire bundle. This is suitable for format-
   neutrality testing only, not cloud durability or mutation-safe clinical serving;
-- the pinned MRXS v2 profile accepts only brightfield JPEG pyramids with known pixel
+- the pinned MRXS v3 profile accepts only brightfield JPEG pyramids with known pixel
   spacing, no tile overlap, one optical path/focal plane, and at most 16 levels.
   Associated images, fluorescence, arbitrary overlap reconstruction, specimen
-  governance, and diagnostic ICC/color policy remain. `TILED_FULL` is a virtual
-  representation policy: every matrix position is retrievable, with absent native
-  entries represented by generated background JPEG frames;
+  governance, and diagnostic ICC/color policy remain. It publishes native occupancy
+  as `TILED_SPARSE`; missing grid positions are not DICOM frames and cannot be
+  requested;
 
 The pinned Orthanc harness is a protocol oracle, but not a safe performance oracle
 for the private 487 MB / 38,478-frame UMCU top-level instance. Orthanc 1.12.11 with
@@ -239,7 +241,7 @@ Proceed in this order:
 The shared tile-cache locking/lifetime prerequisite and bounded four-frame DICOMweb
 batching are complete. Continue with:
 
-1. Close the pinned MRXS v2 semantic profile before making it durable: validate the
+1. Close the pinned MRXS v3 semantic profile before making it durable: validate the
    admitted JPEG profile, photometric/subsampling agreement, lossy-compression and
    derivation metadata, ICC/color policy, missing-versus-corrupt tile handling, and
    sampled native/virtual/materialized parity.
@@ -252,7 +254,7 @@ batching are complete. Continue with:
    ingestion and object-based native locators.
 4. Add STOW and source-bundle admission on top of the hardened publication contract.
 5. Broaden native profiles and the viewer's normalized WSI model only after color,
-   associated-image, sparse tiling, concatenation, optical-path, focal-plane,
+   associated-image, multidimensional sparse tiling, concatenation, optical-path, focal-plane,
    overlap, specimen-governance, and scanner-variant policies are explicit.
 
 The aggregate and series-metadata slices are implemented with deterministic
@@ -290,7 +292,7 @@ staging JSON into a de facto database.
 - Multi-instance pyramids, missing levels, non-raster frame order, and concatenations
   are correct.
 - JPEG Baseline and JPEG 2000 behavior is explicit and tested.
-- Color, optical path, focal plane, sparse tiling, and associated images are either
+- Color, optical path, focal plane, multidimensional sparse tiling, and associated images are either
   supported or rejected with a clear profile error.
 
 ### Owned archive
@@ -354,12 +356,15 @@ adapter upgrades preserve published representation semantics.
 
 Before calling the viewer production-ready: bound/cancel DNS, connect, and TLS;
 complete transfer-syntax negotiation beyond native JPEG/JPEG 2000 pass-through;
-define explicit support or rejection for sparse tiling, concatenations, associated
+broaden sparse tiling beyond one optical path/focal plane, and define support or
+rejection for concatenations and associated
 images, optical paths, focal planes, and diagnostic color; retain cross-server parser
 and credential-redaction tests.
 
-The remote viewer currently admits only `TILED_FULL` VOLUME instances and its tile
-map has only one frame slot per X/Y tile. Before multidimensional acceptance, converge
+The remote viewer admits single-path/single-focal `TILED_FULL` and `TILED_SPARSE`
+VOLUME instances. Sparse per-frame positions are expanded into the existing dense
+X/Y tile map, with missing tiles marked empty and therefore never requested. Before
+multidimensional acceptance, converge
 the local Part 10 and DICOMweb paths on one normalized WSI model that can represent
 concatenation parts, sparse positions, optical paths, and focal planes without
 collisions. Add associated-image presentation, ICC/color handling, uncompressed

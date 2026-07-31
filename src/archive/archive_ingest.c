@@ -763,7 +763,7 @@ bool archive_ingest_mrxs(const archive_repository_t* repository,
 	char fingerprint[65] = {0};
 	i32 fingerprint_length = success ? snprintf(
 		fingerprint_input, sizeof(fingerprint_input),
-		"slidescape-mrxs-virtual-dicom-v2\n%s\n",
+				"slidescape-mrxs-virtual-dicom-v3\n%s\n",
 		descriptor_object.sha256) : -1;
 	if (success &&
 	    (fingerprint_length <= 0 ||
@@ -842,8 +842,12 @@ bool archive_ingest_mrxs(const archive_repository_t* repository,
 			                    sizeof(instance->image_flavor), "VOLUME");
 		instance->has_instance_number = true;
 		instance->instance_number = i + 1;
-		instance->frame_count =
-			(i64)level->width_in_tiles * level->height_in_tiles;
+		instance->frame_count = 0;
+		for (i32 tile_index = 0;
+		     tile_index < level->width_in_tiles * level->height_in_tiles;
+		     ++tile_index)
+			if (level->tiles[tile_index].hier_entry.length)
+				++instance->frame_count;
 		instance->rows = level->tile_height;
 		instance->columns = level->tile_width;
 		instance->total_pixel_matrix_rows =
@@ -866,7 +870,7 @@ bool archive_ingest_mrxs(const archive_repository_t* repository,
 			                    sizeof(publication.provider_kind),
 			                    "mrxs-native") &&
 			archive_ingest_copy(publication.adapter_version,
-			                    sizeof(publication.adapter_version), "2") &&
+			                    sizeof(publication.adapter_version), "3") &&
 			archive_ingest_copy(publication.frame_media_type,
 			                    sizeof(publication.frame_media_type),
 			                    "image/jpeg") &&
@@ -875,7 +879,7 @@ bool archive_ingest_mrxs(const archive_repository_t* repository,
 			                    "GENERATED") &&
 			archive_ingest_copy(publication.frame_policy_version,
 			                    sizeof(publication.frame_policy_version),
-			                    "mrxs-jpeg-v2");
+			                    "mrxs-jpeg-sparse-v3");
 		publication.shell_object_id = shell_object.id;
 		publication.recipe_object_id = recipe_object.id;
 		publication.instances = instances;

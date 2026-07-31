@@ -13,7 +13,6 @@
 #include "archive_sha256.h"
 #include "dicom.h"
 #include "image_loader.h"
-#include "jpeg_decoder.h"
 
 #include <stdarg.h>
 
@@ -201,8 +200,8 @@ bool archive_mrxs_adapter_build_recipe(const char* mrxs_path,
 	if (!result) return false;
 	i32 length = snprintf(
 		result, capacity,
-		"slidescape-mrxs-native-recipe-v2\n"
-		"adapter\tslidescape-mrxs\t2\n"
+		"slidescape-mrxs-native-recipe-v3\n"
+		"adapter\tslidescape-mrxs\t3\n"
 		"bundle-descriptor-sha256\t%s\n"
 		"bundle-descriptor-size\t%llu\n"
 		"representation-fingerprint\t%s\n"
@@ -259,8 +258,25 @@ bool archive_mrxs_adapter_build_shell(archive_mrxs_adapter_t* adapter,
 		instance->instance_number = (i64)i + 1;
 		instance->rows = (u16)level->tile_height;
 		instance->columns = (u16)level->tile_width;
-		instance->number_of_frames =
-			(i64)level->width_in_tiles * level->height_in_tiles;
+		u32 occupied_frame_count = 0;
+		for (i32 tile_index = 0;
+		     tile_index < level->width_in_tiles * level->height_in_tiles;
+		     ++tile_index)
+			if (level->tiles[tile_index].hier_entry.length)
+				++occupied_frame_count;
+		if (!occupied_frame_count) {
+			archive_mrxs_set_error(
+				error, error_capacity,
+				"MRXS pyramid level %u has no stored tiles", i);
+			for (u32 j = 0; j <= i; ++j) {
+				arrfree(instances[j].per_frame_plane_position_slide);
+				arrfree(instances[j].optical_paths);
+			}
+			free(inputs);
+			free(instances);
+			return false;
+		}
+		instance->number_of_frames = occupied_frame_count;
 		u32 scale = 1u << i;
 		instance->total_pixel_matrix_columns =
 			((u32)adapter->slide.base_width_in_pixels + scale - 1) / scale;
@@ -273,13 +289,32 @@ bool archive_mrxs_adapter_build_shell(archive_mrxs_adapter_t* adapter,
 		instance->pixel_spacing =
 			V2F(level->um_per_pixel_y / 1000.0f,
 			    level->um_per_pixel_x / 1000.0f);
-		instance->is_tiled_full = true;
+		instance->is_tiled_full = false;
 		instance->number_of_optical_paths = 1;
 		instance->total_pixel_matrix_focal_planes = 1;
 		instance->is_total_pixel_matrix_origin_known = true;
 		instance->is_image_orientation_slide_known = true;
 		instance->image_orientation_slide[0] = 1.0f;
 		instance->image_orientation_slide[4] = 1.0f;
+		for (i32 tile_index = 0;
+		     tile_index < level->width_in_tiles * level->height_in_tiles;
+		     ++tile_index) {
+			if (!level->tiles[tile_index].hier_entry.length) continue;
+			u32 tile_x = (u32)(tile_index % level->width_in_tiles);
+			u32 tile_y = (u32)(tile_index / level->width_in_tiles);
+			dicom_plane_position_slide_t position = {0};
+			position.column_position_in_total_image_pixel_matrix =
+				(i32)(tile_x * instance->columns + 1);
+			position.row_position_in_total_image_pixel_matrix =
+				(i32)(tile_y * instance->rows + 1);
+			position.offset_in_slide_coordinate_system.x =
+				(float)(position.column_position_in_total_image_pixel_matrix - 1) *
+				instance->pixel_spacing.y;
+			position.offset_in_slide_coordinate_system.y =
+				(float)(position.row_position_in_total_image_pixel_matrix - 1) *
+				instance->pixel_spacing.x;
+			arrput(instance->per_frame_plane_position_slide, position);
+		}
 		dicom_optical_path_t optical_path = {0};
 		optical_path.OpticalPathIdentifier.present = true;
 		snprintf(optical_path.OpticalPathIdentifier.value,
@@ -305,8 +340,10 @@ bool archive_mrxs_adapter_build_shell(archive_mrxs_adapter_t* adapter,
 	};
 	bool success = archive_shell_build_part10_aggregate(
 		&aggregate, shell, error, error_capacity);
-	for (u32 i = 0; i < count; ++i)
+	for (u32 i = 0; i < count; ++i) {
+		arrfree(instances[i].per_frame_plane_position_slide);
 		arrfree(instances[i].optical_paths);
+	}
 	free(inputs);
 	free(instances);
 	return success;
@@ -398,28 +435,8 @@ bool archive_mrxs_adapter_get_jpeg_frame(archive_mrxs_adapter_t* adapter,
 		*size = entry.length;
 		return true;
 	}
-	size_t pixel_count = (size_t)level->tile_width * level->tile_height;
-	if (pixel_count > SIZE_MAX / 4) return false;
-	u8* bgra = malloc(pixel_count * 4);
-	if (!bgra) return false;
-	u32 fill = level->image_fill_color_bgr;
-	for (size_t i = 0; i < pixel_count; ++i) {
-		bgra[i * 4] = (u8)fill;
-		bgra[i * 4 + 1] = (u8)(fill >> 8);
-		bgra[i * 4 + 2] = (u8)(fill >> 16);
-		bgra[i * 4 + 3] = 255;
-	}
-	u8* jpeg = NULL;
-	u64 jpeg_size = 0;
-	jpeg_encode_image(
-		bgra, level->tile_width, level->tile_height, 90,
-		&jpeg, &jpeg_size);
-	free(bgra);
-	if (!jpeg || !jpeg_size || jpeg_size > SIZE_MAX) {
-		free(jpeg);
-		return false;
-	}
-	*data = jpeg;
-	*size = (size_t)jpeg_size;
-	return true;
+	archive_mrxs_set_error(
+		error, error_capacity,
+		"requested MRXS grid position has no stored tile");
+	return false;
 }

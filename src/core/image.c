@@ -699,7 +699,8 @@ bool init_image_from_dicomweb(image_t* image, const dicomweb_remote_image_t* rem
 	if (!image || !remote || remote->instance_count <= 0) return false;
 	const dicomweb_instance_metadata_t* base = remote->instances;
 	if (!base->rows || !base->columns || !base->total_pixel_matrix_columns ||
-	    !base->total_pixel_matrix_rows || !base->is_tiled_full) return false;
+	    !base->total_pixel_matrix_rows || !base->frame_numbers ||
+	    !base->frame_map_count) return false;
 
 	image->type = IMAGE_TYPE_WSI;
 	image->backend = IMAGE_BACKEND_DICOMWEB;
@@ -743,7 +744,7 @@ bool init_image_from_dicomweb(image_t* image, const dicomweb_remote_image_t* rem
 	}
 	for (i32 i = 0; i < remote->instance_count; ++i) {
 		const dicomweb_instance_metadata_t* instance = remote->instances + i;
-		if (strcmp(instance->image_flavor, "VOLUME") != 0 || !instance->is_tiled_full ||
+		if (strcmp(instance->image_flavor, "VOLUME") != 0 ||
 		    instance->rows != image->tile_height || instance->columns != image->tile_width) continue;
 		double ratio = (double)base->total_pixel_matrix_columns /
 		               (double)instance->total_pixel_matrix_columns;
@@ -759,7 +760,12 @@ bool init_image_from_dicomweb(image_t* image, const dicomweb_remote_image_t* rem
 		level_image->height_in_tiles = (instance->total_pixel_matrix_rows + instance->rows - 1) /
 		                               instance->rows;
 		level_image->tile_count = level_image->width_in_tiles * level_image->height_in_tiles;
-		if ((i64)level_image->tile_count != instance->number_of_frames) return false;
+		if (instance->frame_map_count != (u32)level_image->tile_count ||
+		    (instance->is_tiled_full &&
+		     (i64)level_image->tile_count != instance->number_of_frames) ||
+		    (!instance->is_tiled_full &&
+		     instance->number_of_frames > level_image->tile_count))
+			return false;
 		level_image->tiles = (tile_t*)calloc(level_image->tile_count, sizeof(tile_t));
 		if (!level_image->tiles) return false;
 		for (i32 tile_index = 0; tile_index < level_image->tile_count; ++tile_index) {

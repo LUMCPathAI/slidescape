@@ -184,7 +184,9 @@ static bool build_frame_map(struct json_object_s* dataset, dicomweb_instance_met
 
 	struct json_array_s* per_frame = attribute_values(dataset, "52009230");
 	if (!per_frame || !per_frame->start) {
-		if ((u64)out->number_of_frames > tile_count) return false;
+		if (!out->is_tiled_full ||
+		    (u64)out->number_of_frames != tile_count)
+			return false;
 		for (u32 i = 0; i < (u32)out->number_of_frames; ++i) {
 			out->frame_numbers[i] = i + 1;
 		}
@@ -192,6 +194,7 @@ static bool build_frame_map(struct json_object_s* dataset, dicomweb_instance_met
 	}
 
 	u32 one_based_frame = 1;
+	u32 mapped_frame_count = 0;
 	for (struct json_array_element_s* element = per_frame->start;
 	     element; element = element->next, ++one_based_frame) {
 		if (element->value->type != json_type_object) continue;
@@ -204,9 +207,13 @@ static bool build_frame_map(struct json_object_s* dataset, dicomweb_instance_met
 		u64 tile_x = (u64)(column - 1) / out->columns;
 		u64 tile_y = (u64)(row - 1) / out->rows;
 		if (tile_x >= width_in_tiles || tile_y >= height_in_tiles) continue;
-		out->frame_numbers[tile_y * width_in_tiles + tile_x] = one_based_frame;
+		u64 tile_index = tile_y * width_in_tiles + tile_x;
+		if (out->frame_numbers[tile_index]) return false;
+		out->frame_numbers[tile_index] = one_based_frame;
+		++mapped_frame_count;
 	}
-	return one_based_frame - 1 == (u32)out->number_of_frames;
+	return one_based_frame - 1 == (u32)out->number_of_frames &&
+	       mapped_frame_count == (u32)out->number_of_frames;
 }
 
 bool dicomweb_parse_instance_metadata(const char* json, size_t json_size,

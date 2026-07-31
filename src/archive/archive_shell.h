@@ -41,10 +41,12 @@ typedef enum archive_shell_section_kind_t {
 typedef enum archive_shell_frame_map_kind_t {
 	ARCHIVE_SHELL_FRAME_MAP_REGULAR_GRID = 1,
 	ARCHIVE_SHELL_FRAME_MAP_EXPLICIT = 2,
+	ARCHIVE_SHELL_FRAME_MAP_SPARSE_RUNS = 3,
 } archive_shell_frame_map_kind_t;
 
 typedef enum archive_shell_payload_map_kind_t {
 	ARCHIVE_SHELL_PAYLOAD_FIXED_STRIDE = 1,
+	ARCHIVE_SHELL_PAYLOAD_OFFSET_SIZE_SOA = 2,
 	ARCHIVE_SHELL_PAYLOAD_FRAME_INDEX = 3,
 	ARCHIVE_SHELL_PAYLOAD_DELTA_OFFSETS = 4,
 } archive_shell_payload_map_kind_t;

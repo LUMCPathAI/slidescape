@@ -1162,7 +1162,7 @@ TEST_CASE("aggregate DICOM shell keeps each instance payload bound to its source
 	free(image);
 }
 
-TEST_CASE("P480 MRXS adapter builds a regular virtual DICOM pyramid") {
+TEST_CASE("P480 MRXS adapter builds a sparse virtual DICOM pyramid") {
 	const fixture_t* fixture = first_available_fixture("mrxs", "mrxs-p480");
 	if (!fixture) {
 		MESSAGE("Skipping P480 MRXS archive spike: private fixture is absent.");
@@ -1197,10 +1197,18 @@ TEST_CASE("P480 MRXS adapter builds a regular virtual DICOM pyramid") {
 	for (u32 i = 0; i < shell.instance_count; ++i) {
 		archive_shell_instance_t instance = {};
 		REQUIRE(archive_shell_get_instance(&shell, i, &instance));
+		const mrxs_level_t* level = adapter.slide.levels + i;
+		u32 occupied_count = 0;
+		for (i32 tile_index = 0;
+		     tile_index < level->width_in_tiles * level->height_in_tiles;
+		     ++tile_index)
+			if (level->tiles[tile_index].hier_entry.length)
+				++occupied_count;
 		CHECK(instance.provider_kind == ARCHIVE_SHELL_PROVIDER_MRXS_NATIVE);
 		CHECK(instance.provider_parameter_version == ARCHIVE_MRXS_ADAPTER_VERSION);
-		CHECK(instance.frame_map_kind == ARCHIVE_SHELL_FRAME_MAP_REGULAR_GRID);
+		CHECK(instance.frame_map_kind == ARCHIVE_SHELL_FRAME_MAP_SPARSE_RUNS);
 		CHECK(instance.payload_map_kind == ARCHIVE_SHELL_PAYLOAD_FRAME_INDEX);
+		CHECK(instance.frame_count == occupied_count);
 		CHECK(strcmp(instance.study_instance_uid,
 		             adapter.study_instance_uid) == 0);
 		CHECK(strcmp(instance.series_instance_uid,
@@ -1263,20 +1271,11 @@ TEST_CASE("P480 MRXS adapter builds a regular virtual DICOM pyramid") {
 	REQUIRE(blank_frame > 0);
 	u8* blank_jpeg = nullptr;
 	size_t blank_jpeg_size = 0;
-	REQUIRE(archive_mrxs_adapter_get_jpeg_frame(
+	CHECK_FALSE(archive_mrxs_adapter_get_jpeg_frame(
 		&adapter, lowest_level, blank_frame,
 		&blank_jpeg, &blank_jpeg_size, error, sizeof(error)));
-	i32 blank_width = 0;
-	i32 blank_height = 0;
-	i32 blank_channels = 0;
-	u8* decoded_blank = jpeg_decode_image(
-		blank_jpeg, (u32)blank_jpeg_size,
-		&blank_width, &blank_height, &blank_channels);
-	REQUIRE(decoded_blank != nullptr);
-	CHECK(blank_width == sample_level->tile_width);
-	CHECK(blank_height == sample_level->tile_height);
-	free(decoded_blank);
-	free(blank_jpeg);
+	CHECK(blank_jpeg == nullptr);
+	CHECK(blank_jpeg_size == 0);
 
 	char temp_path[ARCHIVE_PATH_CAPACITY];
 	REQUIRE(slidescape_test_make_temp_directory(
@@ -1335,8 +1334,12 @@ TEST_CASE("P480 MRXS adapter builds a regular virtual DICOM pyramid") {
 		snprintf(instance->image_flavor, sizeof(instance->image_flavor), "VOLUME");
 		instance->has_instance_number = true;
 		instance->instance_number = i + 1;
-		instance->frame_count =
-			(i64)level->width_in_tiles * level->height_in_tiles;
+		instance->frame_count = 0;
+		for (i32 tile_index = 0;
+		     tile_index < level->width_in_tiles * level->height_in_tiles;
+		     ++tile_index)
+			if (level->tiles[tile_index].hier_entry.length)
+				++instance->frame_count;
 		instance->rows = level->tile_height;
 		instance->columns = level->tile_width;
 		u32 scale = 1u << i;
@@ -1358,12 +1361,12 @@ TEST_CASE("P480 MRXS adapter builds a regular virtual DICOM pyramid") {
 	publication.instance_count = adapter.slide.level_count;
 	snprintf(publication.provider_kind, sizeof(publication.provider_kind),
 	         "mrxs-native");
-	snprintf(publication.adapter_version, sizeof(publication.adapter_version), "2");
+	snprintf(publication.adapter_version, sizeof(publication.adapter_version), "3");
 	snprintf(publication.frame_media_type, sizeof(publication.frame_media_type),
 	         "image/jpeg");
 	snprintf(publication.frame_source, sizeof(publication.frame_source), "GENERATED");
 	snprintf(publication.frame_policy_version,
-	         sizeof(publication.frame_policy_version), "mrxs-jpeg-v2");
+	         sizeof(publication.frame_policy_version), "mrxs-jpeg-sparse-v3");
 	REQUIRE(archive_database_publish_shells(
 		&repository, bundle.id, &publication, 1,
 		error, sizeof(error)) == ARCHIVE_DATABASE_OK);
@@ -1389,6 +1392,19 @@ TEST_CASE("P480 MRXS adapter builds a regular virtual DICOM pyramid") {
 		&repository, record, &metadata, &metadata_size,
 		error, sizeof(error)));
 	CHECK(strstr(metadata, adapter.sop_instance_uids[lowest_level]) != nullptr);
+	dicomweb_instance_metadata_t sparse_metadata = {};
+	REQUIRE(dicomweb_parse_instance_metadata(
+		metadata, metadata_size, &sparse_metadata));
+	CHECK_FALSE(sparse_metadata.is_tiled_full);
+	CHECK(sparse_metadata.number_of_frames ==
+	      strtoll(record->number_of_frames, nullptr, 10));
+	u32 mapped_frames = 0;
+	for (u32 tile_index = 0;
+	     tile_index < sparse_metadata.frame_map_count; ++tile_index)
+		if (sparse_metadata.frame_numbers[tile_index])
+			++mapped_frames;
+	CHECK(mapped_frames == (u32)sparse_metadata.number_of_frames);
+	dicomweb_instance_metadata_destroy(&sparse_metadata);
 	free(metadata);
 	archive_instance_provider_cache_stats_t cache_after_first =
 		archive_instance_provider_get_cache_stats();
@@ -1420,7 +1436,7 @@ TEST_CASE("P480 MRXS adapter builds a regular virtual DICOM pyramid") {
 	CHECK(strcmp(representation.media_type, "image/jpeg") == 0);
 	archive_instance_frame_t provided_frame = {};
 	REQUIRE(archive_instance_provider_get_frame(
-		&repository, record, sample_frame, &representation,
+		&repository, record, 1, &representation,
 		&provided_frame, error, sizeof(error)));
 	CHECK(provided_frame.size ==
 	      native_jpeg_size);

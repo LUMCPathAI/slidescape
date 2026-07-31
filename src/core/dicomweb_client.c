@@ -1146,7 +1146,8 @@ static image_t* dicomweb_prepare_configured_series(
 		dicomweb_instance_metadata_t metadata = {0};
 		bool parsed = dicomweb_parse_instance_metadata((const char*)response->buffer.data,
 		                                               response->content_length, &metadata);
-		if (parsed && strcmp(metadata.image_flavor, "VOLUME") == 0 && metadata.is_tiled_full) {
+		if (parsed && strcmp(metadata.image_flavor, "VOLUME") == 0 &&
+		    metadata.frame_numbers && metadata.frame_map_count) {
 			if (dicomweb_remote_reserve_instances(&remote, remote.instance_count + 1)) {
 				remote.instances[remote.instance_count++] = metadata;
 			} else {
@@ -1185,7 +1186,7 @@ static image_t* dicomweb_prepare_configured_series(
 			         metadata_parse_failures, metadata_parse_failures == 1 ? "" : "s");
 		} else {
 			snprintf(message, message_size,
-			         "DICOMweb series has no supported TILED_FULL VOLUME instances (%d inspected).",
+			         "DICOMweb series has no supported tiled VOLUME instances (%d inspected).",
 			         unsupported_instances);
 		}
 		dicomweb_remote_image_destroy(&remote);

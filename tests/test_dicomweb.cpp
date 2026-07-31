@@ -399,6 +399,54 @@ TEST_CASE("DICOMweb maps column-major frames to raster tiles") {
 	dicomweb_instance_metadata_destroy(&metadata);
 }
 
+TEST_CASE("DICOMweb expands TILED_SPARSE frames into a dense tile map") {
+	const char* json =
+		"[{"
+		"\"00080008\":{\"vr\":\"CS\",\"Value\":[\"ORIGINAL\",\"PRIMARY\",\"VOLUME\"]},"
+		"\"00080018\":{\"vr\":\"UI\",\"Value\":[\"instance\"]},"
+		"\"0020000D\":{\"vr\":\"UI\",\"Value\":[\"study\"]},"
+		"\"0020000E\":{\"vr\":\"UI\",\"Value\":[\"series\"]},"
+		"\"00280008\":{\"vr\":\"IS\",\"Value\":[3]},"
+		"\"00280010\":{\"vr\":\"US\",\"Value\":[256]},"
+		"\"00280011\":{\"vr\":\"US\",\"Value\":[256]},"
+		"\"00480006\":{\"vr\":\"UL\",\"Value\":[512]},"
+		"\"00480007\":{\"vr\":\"UL\",\"Value\":[512]},"
+		"\"00209311\":{\"vr\":\"CS\",\"Value\":[\"TILED_SPARSE\"]},"
+		"\"52009230\":{\"vr\":\"SQ\",\"Value\":["
+		"{\"0048021A\":{\"vr\":\"SQ\",\"Value\":[{\"0048021E\":{\"vr\":\"SL\",\"Value\":[1]},\"0048021F\":{\"vr\":\"SL\",\"Value\":[1]}}]}},"
+		"{\"0048021A\":{\"vr\":\"SQ\",\"Value\":[{\"0048021E\":{\"vr\":\"SL\",\"Value\":[1]},\"0048021F\":{\"vr\":\"SL\",\"Value\":[257]}}]}},"
+		"{\"0048021A\":{\"vr\":\"SQ\",\"Value\":[{\"0048021E\":{\"vr\":\"SL\",\"Value\":[257]},\"0048021F\":{\"vr\":\"SL\",\"Value\":[257]}}]}}"
+		"]}"
+		"}]";
+	dicomweb_instance_metadata_t metadata = {};
+	REQUIRE(dicomweb_parse_instance_metadata(
+		json, strlen(json), &metadata));
+	CHECK_FALSE(metadata.is_tiled_full);
+	REQUIRE(metadata.frame_map_count == 4);
+	CHECK(metadata.frame_numbers[0] == 1);
+	CHECK(metadata.frame_numbers[1] == 0);
+	CHECK(metadata.frame_numbers[2] == 2);
+	CHECK(metadata.frame_numbers[3] == 3);
+
+	dicomweb_remote_image_t remote = {};
+	remote.instances = (dicomweb_instance_metadata_t*)calloc(
+		1, sizeof(*remote.instances));
+	REQUIRE(remote.instances != nullptr);
+	remote.instances[0] = metadata;
+	remote.instance_count = 1;
+	remote.instance_capacity = 1;
+	image_t image = {};
+	REQUIRE(init_image_from_dicomweb(&image, &remote, false));
+	REQUIRE(image.level_images[0].tile_count == 4);
+	CHECK_FALSE(image.level_images[0].tiles[0].is_empty);
+	CHECK(image.level_images[0].tiles[1].is_empty);
+	CHECK_FALSE(image.level_images[0].tiles[2].is_empty);
+	CHECK_FALSE(image.level_images[0].tiles[3].is_empty);
+	free(image.level_images[0].tiles);
+	image.level_images[0].tiles = nullptr;
+	dicomweb_remote_image_destroy(&image.dicomweb);
+}
+
 TEST_CASE("DICOMweb parses archive study and series results") {
 	const char* studies_json =
 		"[{\"0020000D\":{\"vr\":\"UI\",\"Value\":[\"study-uid\"]},"

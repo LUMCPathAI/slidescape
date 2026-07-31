@@ -677,9 +677,11 @@ static bool archive_provider_write_shell_metadata(const archive_shell_view_t* sh
 		}
 		archive_provider_write(&writer, "]}");
 	}
-	if (instance->frame_map_kind == ARCHIVE_SHELL_FRAME_MAP_REGULAR_GRID)
-		archive_provider_write(&writer,
-			",\"00209311\":{\"vr\":\"CS\",\"Value\":[\"TILED_FULL\"]}");
+	archive_provider_write(
+		&writer,
+		instance->frame_map_kind == ARCHIVE_SHELL_FRAME_MAP_REGULAR_GRID ?
+			",\"00209311\":{\"vr\":\"CS\",\"Value\":[\"TILED_FULL\"]}" :
+			",\"00209311\":{\"vr\":\"CS\",\"Value\":[\"TILED_SPARSE\"]}");
 	if (instance->pixel_spacing_row_mm > 0.0f &&
 	    instance->pixel_spacing_column_mm > 0.0f) {
 		archive_provider_write_format(&writer,
@@ -687,7 +689,7 @@ static bool archive_provider_write_shell_metadata(const archive_shell_view_t* sh
 			"\"Value\":[{\"00280030\":{\"vr\":\"DS\",\"Value\":[%g,%g]}}]}}]}",
 			instance->pixel_spacing_row_mm, instance->pixel_spacing_column_mm);
 	}
-	if (instance->frame_map_kind == ARCHIVE_SHELL_FRAME_MAP_EXPLICIT) {
+	if (instance->frame_map_kind != ARCHIVE_SHELL_FRAME_MAP_REGULAR_GRID) {
 		archive_provider_write(&writer, ",\"52009230\":{\"vr\":\"SQ\",\"Value\":[");
 		for (u32 frame_index = 0; frame_index < instance->frame_count; ++frame_index) {
 			archive_shell_frame_t frame = {0};
@@ -806,7 +808,7 @@ static bool archive_provider_get_metadata_capacity(
 		const archive_shell_instance_t* instance, u64* capacity) {
 	if (!shell || !instance || !capacity) return false;
 	u64 result = KILOBYTES(4);
-	if (instance->frame_map_kind == ARCHIVE_SHELL_FRAME_MAP_EXPLICIT) {
+	if (instance->frame_map_kind != ARCHIVE_SHELL_FRAME_MAP_REGULAR_GRID) {
 		if ((u64)instance->frame_count > UINT64_MAX / 192) return false;
 		u64 frame_capacity = (u64)instance->frame_count * 192;
 		if (result > UINT64_MAX - frame_capacity) return false;
@@ -1233,8 +1235,8 @@ static archive_mrxs_adapter_t* archive_provider_open_mrxs(
 	char extra = '\0';
 	int fields = sscanf(
 		text,
-		"slidescape-mrxs-native-recipe-v2\n"
-		"adapter\tslidescape-mrxs\t2\n"
+		"slidescape-mrxs-native-recipe-v3\n"
+		"adapter\tslidescape-mrxs\t3\n"
 		"bundle-descriptor-sha256\t%64[0-9a-f]\n"
 		"bundle-descriptor-size\t%llu\n"
 		"representation-fingerprint\t%64[0-9a-f]\n"
@@ -1810,6 +1812,31 @@ bool archive_instance_provider_get_frame(const archive_repository_t* repository,
 			repository, record, error, error_capacity);
 	if (!entry) return false;
 	const archive_shell_instance_t* instance = &entry->instance;
+	u32 provider_frame = one_based_frame;
+	if (entry->shared_shell->mrxs &&
+	    instance->provider_kind == ARCHIVE_SHELL_PROVIDER_MRXS_NATIVE &&
+	    instance->frame_map_kind != ARCHIVE_SHELL_FRAME_MAP_REGULAR_GRID) {
+		archive_shell_frame_t shell_frame = {0};
+		bool mapped = one_based_frame <= instance->frame_count &&
+			archive_shell_get_frame(
+				&entry->shared_shell->shell, instance,
+				one_based_frame - 1, &shell_frame) &&
+			shell_frame.row_position > 0 &&
+			shell_frame.column_position > 0 &&
+			(shell_frame.row_position - 1) % instance->rows == 0 &&
+			(shell_frame.column_position - 1) % instance->columns == 0;
+		u32 tile_row = mapped ?
+			(shell_frame.row_position - 1) / instance->rows : 0;
+		u32 tile_column = mapped ?
+			(shell_frame.column_position - 1) / instance->columns : 0;
+		mapped = mapped &&
+			tile_row < instance->tiles_per_column &&
+			tile_column < instance->tiles_per_row &&
+			(u64)tile_row * instance->tiles_per_row + tile_column <
+				UINT32_MAX;
+		provider_frame = mapped ?
+			tile_row * instance->tiles_per_row + tile_column + 1 : 0;
+	}
 	if (entry->shared_shell->mrxs &&
 	    instance->provider_kind == ARCHIVE_SHELL_PROVIDER_MRXS_NATIVE &&
 	    representation->source == ARCHIVE_FRAME_REPRESENTATION_GENERATED &&
@@ -1818,7 +1845,7 @@ bool archive_instance_provider_get_frame(const archive_repository_t* repository,
 	           "1.2.840.10008.1.2.4.50") == 0 &&
 	    archive_mrxs_adapter_get_jpeg_frame(
 		    entry->shared_shell->mrxs, record->shell_instance_index,
-		    one_based_frame,
+		    provider_frame,
 		    &frame->data, &frame->size, error, error_capacity)) {
 		snprintf(frame->media_type, sizeof(frame->media_type),
 		         "image/jpeg");

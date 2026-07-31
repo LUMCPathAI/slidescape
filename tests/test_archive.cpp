@@ -1217,6 +1217,36 @@ TEST_CASE("virtual DICOM shell loads one aligned Part 10 serving object") {
 	}
 	archive_shell_buffer_destroy(&compact_encoded);
 
+	u32 unordered_offsets[6] = {45, 0, 75, 20, 150, 110};
+	u32 unordered_sizes[6] = {26, 16, 35, 25, 30, 40};
+	compact_source.pixel_data_offsets = unordered_offsets;
+	compact_source.pixel_data_sizes = unordered_sizes;
+	archive_shell_buffer_t unordered_encoded = {};
+	REQUIRE(archive_shell_build_part10(
+		&compact_input, &unordered_encoded, error, sizeof(error)));
+	archive_shell_view_t unordered_shell = {};
+	REQUIRE(archive_shell_open(
+		&unordered_shell, unordered_encoded.data, unordered_encoded.size,
+		error, sizeof(error)));
+	archive_shell_instance_t unordered_instance = {};
+	REQUIRE(archive_shell_get_instance(
+		&unordered_shell, 0, &unordered_instance));
+	CHECK(unordered_instance.payload_map_kind ==
+	      ARCHIVE_SHELL_PAYLOAD_OFFSET_SIZE_SOA);
+	for (u32 frame_index = 0; frame_index < COUNT(unordered_offsets);
+	     ++frame_index) {
+		archive_shell_payload_range_t unordered_payload = {};
+		REQUIRE(archive_shell_get_payload_range(
+			&unordered_shell, &unordered_instance, frame_index,
+			&unordered_payload));
+		CHECK(unordered_payload.offset ==
+		      sizeof(dicom_header_t) +
+			      compact_source.pixel_data_start_offset +
+			      unordered_offsets[frame_index]);
+		CHECK(unordered_payload.size == unordered_sizes[frame_index]);
+	}
+	archive_shell_buffer_destroy(&unordered_encoded);
+
 	archive_shell_optical_path_t stored_path = {};
 	REQUIRE(archive_shell_get_optical_path(&shell, &instance, 0, &stored_path));
 	CHECK(strcmp(stored_path.identifier, "A") == 0);
