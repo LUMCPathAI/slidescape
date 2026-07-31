@@ -31,9 +31,6 @@
 static const char* archive_repository_directories[] = {
 	"objects",
 	"shells",
-	"bundles",
-	"representations",
-	"derived",
 	"staging",
 };
 

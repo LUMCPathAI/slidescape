@@ -126,13 +126,17 @@ work.
   filesystem links under `objects/`. Sources are checksummed during ingestion;
   provider-cache admission checks availability and size, so moving, changing, or
   deleting the external source invalidates retrieval;
+- format-dispatched ingestion through
+  `ingest REPOSITORY --source PATH [--reference]`; `.mrxs` selects the constrained
+  MRXS adapter and currently requires `--reference`, while Part 10 accepts either
+  archive-owned import or reference mode;
 - SQLite index reconstruction from published shell representations, a bounded
   aggregate-shell cache shared by every instance in the logical slide, and a bounded
   per-instance provider cache. The shared entry owns the validated shell bytes and,
   for MRXS, the open native data-file handles; the instance entries project metadata
   and retain only instance-specific source state;
-- a versioned repository layout separating immutable objects, bundle provenance,
-  representations, durable published state, disposable derived data, and staging;
+- a compact repository layout containing owned immutable objects, fast-tier shells,
+  transient staging files, and durable SQLite publication state;
 - shared DICOM UID validation and bounded source/virtual-instance C contracts;
 - route classification for QIDO, WADO metadata/frames, and STOW;
 - bounded study-, series-, and instance-level QIDO DICOM JSON with exact UID filters,
@@ -155,10 +159,10 @@ have been removed. Current limitations are:
 
 - the index is loaded once at startup and does not provide live publication;
 - duplicate checks are simple and not designed for cloud-scale cardinality;
-- the current manifest describes provider ownership, regular versus explicit frame
-  geometry, slide coordinates, dimension counts/defaults, pixel spacing, and an
-  optional ICC digest; compact explicit spatial/dimension maps can now be generated
-  and validated. Aggregate recipe v7 retains the ordered source-object set and
+- the virtual shell describes provider ownership, regular versus explicit frame
+  geometry, slide coordinates, dimension counts/defaults, pixel spacing, and color
+  metadata; compact explicit spatial/dimension maps can be generated and validated.
+  Aggregate recipe v9 retains the ordered source-object set and
   grouping policy. The regenerated shell retains patient/study scalar identifiers
   and full patient names; optical-path identity, description, illumination codes,
   filter bands, objectives, DICOM Color Space, validated inline ICC bytes, and
@@ -166,7 +170,7 @@ have been removed. Current limitations are:
   nested specimen-preparation tree preserving concept names, CODE, TEXT, NUM with
   units, UIDREF, DATETIME, DATE, TIME, and PNAME values. Metadata WADO reconstructs
   the corresponding DICOM content-item sequences;
-- pre-v7 Part 10 development publications are no longer accepted. Policy v7 removes
+- pre-v9 Part 10 development publications are no longer accepted. Policy v9 removes
   the flat 16-byte-per-frame explicit payload records. Encapsulated frames use one
   64-bit base plus parallel 32-bit frame-start delta and correction arrays, with one
   explicit final-frame size; all other frame sizes are derived from the next delta.
@@ -174,7 +178,8 @@ have been removed. Current limitations are:
   absolute-offset and size arrays. Development repositories must be recreated and
   ingested again;
   automated representation upgrades remain future work;
-- staging is not crash-durable and is not safe as a multi-process transaction;
+- transient object staging is private and atomically installed, but ingestion has no
+  durable multi-process job journal or automatic interrupted-job resumption;
 - virtual-shell representation publication is atomic after its immutable inputs are
   stored. Missing or corrupt Part 10 shells are lazily regenerated after validating
   the retained recipe and source digest, and are restored atomically only when the

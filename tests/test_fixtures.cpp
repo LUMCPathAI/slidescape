@@ -728,7 +728,7 @@ static void check_archive_part10_provider(dicom_instance_t* instance, u32 one_ba
 	snprintf(shell_prefix_path, sizeof(shell_prefix_path), "%s/shells/sha256", temp_path);
 	CHECK(rmdir(shell_prefix_path) == 0);
 	const char* children[] = {
-		"staging", "derived", "representations", "bundles", "shells", "objects"
+		"staging", "shells", "objects"
 	};
 	for (const char* child : children) {
 		char path[ARCHIVE_PATH_CAPACITY];
@@ -1412,7 +1412,7 @@ TEST_CASE("P480 MRXS adapter builds a sparse virtual DICOM pyramid") {
 	publication.instance_count = adapter.slide.level_count;
 	snprintf(publication.provider_kind, sizeof(publication.provider_kind),
 	         "mrxs-native");
-	snprintf(publication.adapter_version, sizeof(publication.adapter_version), "4");
+	snprintf(publication.adapter_version, sizeof(publication.adapter_version), "5");
 	snprintf(publication.frame_media_type, sizeof(publication.frame_media_type),
 	         "image/jpeg");
 	snprintf(publication.frame_source, sizeof(publication.frame_source), "GENERATED");
@@ -1512,7 +1512,7 @@ TEST_CASE("P480 MRXS adapter builds a sparse virtual DICOM pyramid") {
 	snprintf(path, sizeof(path), "%s/shells/sha256", temp_path);
 	CHECK(rmdir(path) == 0);
 	const char* children[] = {
-		"staging", "derived", "representations", "bundles", "shells", "objects"
+		"staging", "shells", "objects"
 	};
 	for (const char* child : children) {
 		snprintf(path, sizeof(path), "%s/%s", temp_path, child);

@@ -32,13 +32,14 @@ bool archive_ingest_part10_path(const archive_repository_t* repository,
 		archive_ingest_result_t* result, char* error, size_t error_capacity);
 
 /*
- * Constrained development adapter for a brightfield, non-overlapping MRXS
- * pyramid. Source bytes remain at `mrxs_path`; the archive retains a canonical
- * content manifest and the native-provider recipe.
+ * Dispatch an explicit source path to the supported adapter. MRXS currently
+ * requires reference_source because owned multi-file bundle import is not yet
+ * implemented.
  */
-bool archive_ingest_mrxs(const archive_repository_t* repository,
-		const char* mrxs_path, archive_ingest_result_t* result,
-		char* error, size_t error_capacity);
+bool archive_ingest_path(const archive_repository_t* repository,
+		const char* source_path, bool reference_source,
+		archive_ingest_result_t* result, char* error,
+		size_t error_capacity);
 
 #ifdef __cplusplus
 }

@@ -78,6 +78,17 @@ static bool archive_ingest_has_dcm_extension(const char* name) {
 	       (extension[3] == 'm' || extension[3] == 'M');
 }
 
+static bool archive_ingest_has_mrxs_extension(const char* name) {
+	size_t length = strlen(name);
+	if (length < 5) return false;
+	const char* extension = name + length - 5;
+	return extension[0] == '.' &&
+	       (extension[1] == 'm' || extension[1] == 'M') &&
+	       (extension[2] == 'r' || extension[2] == 'R') &&
+	       (extension[3] == 'x' || extension[3] == 'X') &&
+	       (extension[4] == 's' || extension[4] == 'S');
+}
+
 static bool archive_ingest_append_path(archive_ingest_paths_t* paths, const char* path) {
 	if (strlen(path) >= ARCHIVE_PATH_CAPACITY) return false;
 	if (paths->count == paths->capacity) {
@@ -729,7 +740,7 @@ bool archive_ingest_part10_objects(const archive_repository_t* repository,
 		repository, source_path, false, result, error, error_capacity);
 }
 
-bool archive_ingest_mrxs(const archive_repository_t* repository,
+static bool archive_ingest_mrxs(const archive_repository_t* repository,
 		const char* mrxs_path, archive_ingest_result_t* result,
 		char* error, size_t error_capacity) {
 	if (result) memset(result, 0, sizeof(*result));
@@ -889,7 +900,7 @@ bool archive_ingest_mrxs(const archive_repository_t* repository,
 			                    sizeof(publication.provider_kind),
 			                    "mrxs-native") &&
 			archive_ingest_copy(publication.adapter_version,
-			                    sizeof(publication.adapter_version), "4") &&
+			                    sizeof(publication.adapter_version), "5") &&
 			archive_ingest_copy(publication.frame_media_type,
 			                    sizeof(publication.frame_media_type),
 			                    "image/jpeg") &&
@@ -922,4 +933,32 @@ bool archive_ingest_mrxs(const archive_repository_t* repository,
 	free(descriptor);
 	archive_mrxs_adapter_close(&adapter);
 	return success;
+}
+
+bool archive_ingest_path(const archive_repository_t* repository,
+		const char* source_path, bool reference_source,
+		archive_ingest_result_t* result, char* error,
+		size_t error_capacity) {
+	if (result) memset(result, 0, sizeof(*result));
+	if (error && error_capacity) error[0] = '\0';
+	if (!repository || !source_path || !source_path[0]) {
+		archive_ingest_set_error(
+			error, error_capacity, "source path is required");
+		return false;
+	}
+	if (archive_ingest_has_mrxs_extension(source_path)) {
+		if (!reference_source) {
+			archive_ingest_set_error(
+				error, error_capacity,
+				"MRXS ingestion currently requires --reference; "
+				"owned multi-file bundle import is not implemented");
+			return false;
+		}
+		return archive_ingest_mrxs(
+			repository, source_path, result, error,
+			error_capacity);
+	}
+	return archive_ingest_part10_path(
+		repository, source_path, reference_source, result,
+		error, error_capacity);
 }

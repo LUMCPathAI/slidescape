@@ -26,10 +26,9 @@ static void archive_print_usage(const char* executable) {
 		"  %s init REPOSITORY\n"
 		"  %s check REPOSITORY\n"
 		"  %s ingest REPOSITORY [--source PATH] [--reference]\n"
-		"  %s ingest-mrxs REPOSITORY SOURCE.mrxs\n"
 		"  %s list REPOSITORY [--base-url URL]\n"
 		"  %s serve REPOSITORY [--port PORT] [--max-requests COUNT]\n",
-		executable, executable, executable, executable, executable, executable);
+		executable, executable, executable, executable, executable);
 }
 
 static bool archive_print_series_urls(
@@ -108,7 +107,7 @@ int main(int argc, char** argv) {
 		}
 		archive_ingest_result_t result = {0};
 		bool ingested = source_path ?
-			archive_ingest_part10_path(
+			archive_ingest_path(
 				&repository, source_path, reference_source,
 				&result, error, sizeof(error)) :
 			archive_ingest_part10_objects(
@@ -122,30 +121,9 @@ int main(int argc, char** argv) {
 			       "and must not be moved, changed, or deleted; their absolute paths "
 			       "are stored in SQLite and objects/ contains no reference payloads "
 			       "or symbolic links.\n");
-		printf("Published %d DICOM instance%s in %d series and %d stud%s\n",
+		printf("Published %d virtual DICOM instance%s in %d series and %d stud%s\n",
 		       result.instance_count, result.instance_count == 1 ? "" : "s",
 		       result.series_count, result.study_count, result.study_count == 1 ? "y" : "ies");
-		if (!archive_print_series_urls(
-				&repository, "http://127.0.0.1:8043/dicom-web",
-				error, sizeof(error)))
-			fprintf(stderr, "Could not list published series URLs: %s\n", error);
-		return 0;
-	}
-	if (strcmp(argv[1], "ingest-mrxs") == 0) {
-		if (argc != 4) {
-			archive_print_usage(argv[0]);
-			return 2;
-		}
-		archive_ingest_result_t result = {0};
-		if (!archive_ingest_mrxs(
-				&repository, argv[3], &result, error, sizeof(error))) {
-			fprintf(stderr, "MRXS ingestion failed: %s\n",
-			        error[0] ? error : "unknown error");
-			return 1;
-		}
-		printf("Published MRXS pyramid as %d virtual DICOM instances "
-		       "in %d series and %d study\n",
-		       result.instance_count, result.series_count, result.study_count);
 		if (!archive_print_series_urls(
 				&repository, "http://127.0.0.1:8043/dicom-web",
 				error, sizeof(error)))

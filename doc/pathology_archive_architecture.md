@@ -20,16 +20,13 @@ REPOSITORY/
   archive.sqlite3   transactional metadata, publication, and QIDO authority
   objects/           immutable content-addressed source payloads
   shells/            immutable content-addressed fast-tier virtual DICOM shells
-  bundles/           source-bundle manifests and provenance
-  representations/   governed virtual-DICOM manifests
-  derived/           disposable frame and Part 10 caches
-  staging/           unpublished ingest transactions
+  staging/           transient files used by atomic object installation
 ```
 
 The directories describe ownership boundaries, not a commitment to a local-filesystem
 production backend. Object storage and a transactional database may implement the same
-interfaces later. In particular, `derived/` is never canonical, and data under
-`staging/` must not be discoverable through QIDO or retrievable through WADO.
+interfaces later. Data under `staging/` is never canonical and must not be
+discoverable through QIDO or retrievable through WADO.
 
 Publication will be one atomic state transition covering the immutable source-bundle
 manifest, governed metadata version, virtual-DICOM representation manifests, and QIDO
@@ -356,11 +353,12 @@ The development recipe currently points to the original
 absolute path even though ingestion checksums every bundle member. This locator is
 not an owned, mutation-safe cloud source.
 
-Part 10 has a parallel development convenience: `ingest --source PATH --reference`
-stores canonical absolute paths in SQLite rather than copying bytes or creating
-entries under `objects/`. Provider-cache admission checks availability and size
-without rehashing the WSI. This is explicitly external ownership, not durable
-archive storage.
+External development ingestion uses one command for all detected formats:
+`ingest REPOSITORY --source PATH --reference`. Part 10 canonical absolute paths are
+stored in SQLite rather than copied into `objects/`; MRXS retains its bundle path in
+the inline provider recipe. Provider-cache admission avoids rehashing the WSI. MRXS
+currently requires `--reference` because owned multi-file bundle import is not yet
+implemented. This is explicitly external ownership, not durable archive storage.
 
 The viewer tile-cache locking/lifetime prerequisite and bounded four-frame DICOMweb
 batching are complete. The next implementation slices are:

@@ -222,7 +222,7 @@ TEST_CASE("fast-tier repair atomically restores published shell bytes") {
 	snprintf(path, sizeof(path), "%s/shells/sha256", temp_path);
 	CHECK(archive_test_rmdir(path) == 0);
 	const char* children[] = {
-		"staging", "derived", "representations", "bundles", "shells", "objects"
+		"staging", "shells", "objects"
 	};
 	for (const char* child : children) {
 		snprintf(path, sizeof(path), "%s/%s", temp_path, child);
@@ -259,6 +259,11 @@ TEST_CASE("pathology archive repository has explicit immutable and publication b
 
 	CHECK(archive_repository_initialize(&repository, temp_path, error, sizeof(error)) == ARCHIVE_REPOSITORY_OK);
 	CHECK(archive_repository_open(&repository, temp_path, error, sizeof(error)) == ARCHIVE_REPOSITORY_OK);
+	archive_ingest_result_t unsupported_ingest = {};
+	CHECK_FALSE(archive_ingest_path(
+		&repository, "missing.mrxs", false, &unsupported_ingest,
+		error, sizeof(error)));
+	CHECK(strstr(error, "requires --reference") != nullptr);
 	snprintf(path, sizeof(path), "%s/%s", temp_path, ARCHIVE_DATABASE_FILENAME);
 	FILE* database_file = fopen(path, "rb");
 	REQUIRE(database_file != nullptr);
@@ -507,7 +512,7 @@ TEST_CASE("pathology archive repository has explicit immutable and publication b
 	archive_index_destroy(&index);
 
 	const char* children[] = {
-		"staging", "derived", "representations", "bundles", "shells", "objects"
+		"staging", "shells", "objects"
 	};
 	for (const char* child : children) {
 		snprintf(path, sizeof(path), "%s/%s", temp_path, child);
@@ -739,7 +744,7 @@ TEST_CASE("pathology archive stores immutable objects by verified SHA-256") {
 	snprintf(path, sizeof(path), "%s/shells/sha256", temp_path);
 	CHECK(archive_test_rmdir(path) == 0);
 	const char* children[] = {
-		"staging", "derived", "representations", "bundles", "shells", "objects"
+		"staging", "shells", "objects"
 	};
 	for (const char* child : children) {
 		snprintf(path, sizeof(path), "%s/%s", temp_path, child);
