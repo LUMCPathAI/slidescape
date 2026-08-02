@@ -609,6 +609,95 @@ static bool linux_load_pending_single_instance_commandline(app_state_t* app_stat
 #if APPLE
 extern "C" void macos_register_url_handler(void);
 extern "C" char* macos_copy_next_open_url(void);
+typedef void (*macos_live_resize_callback_t)(void* userdata);
+extern "C" bool macos_start_live_resize_redraw(SDL_Window* window,
+		macos_live_resize_callback_t callback, void* userdata);
+extern "C" void macos_stop_live_resize_redraw(void);
+
+typedef struct macos_resize_redraw_context_t {
+	app_state_t* app_state;
+	SDL_Window* window;
+	bool is_rendering;
+} macos_resize_redraw_context_t;
+#endif
+
+static void linux_render_frame(app_state_t* app_state, input_t* input, SDL_Window* window, float delta_t) {
+	int display_w = 0;
+	int display_h = 0;
+	if (!(SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED)) {
+		presenter_get_drawable_size(&display_w, &display_h);
+	}
+
+	ImGuiIO& io = ImGui::GetIO();
+
+	profiler_begin(PROFILER_SECTION_GUI_NEW_FRAME);
+	presenter_imgui_new_frame();
+	ImGui_ImplSDL2_NewFrame();
+	ImGui::NewFrame();
+	profiler_end(PROFILER_SECTION_GUI_NEW_FRAME);
+
+	profiler_begin(PROFILER_SECTION_VIEWER);
+	viewer_update_and_render(app_state, input, display_w, display_h, delta_t);
+	profiler_end(PROFILER_SECTION_VIEWER);
+
+	profiler_begin(PROFILER_SECTION_IMGUI_RENDER);
+	profiler_begin(PROFILER_SECTION_IMGUI_BUILD);
+	ImGui::Render();
+	profiler_end(PROFILER_SECTION_IMGUI_BUILD);
+	presenter_set_viewport((int) io.DisplaySize.x, (int) io.DisplaySize.y);
+
+	profiler_begin(PROFILER_SECTION_IMGUI_EXTRA_RENDER);
+	if (ImDrawData* draw_data = gui_get_merged_extra_drawlists_data(ImGui::GetMainViewport(), io.DisplayFramebufferScale)) {
+		if (enable_persistent_extra_drawlist_buffers && enable_merged_extra_drawlists) {
+			presenter_render_cached_imgui_draw_data(draw_data, global_extra_drawlists_generation);
+		} else {
+			presenter_render_imgui_draw_data(draw_data);
+		}
+	}
+	profiler_end(PROFILER_SECTION_IMGUI_EXTRA_RENDER);
+
+	profiler_begin(PROFILER_SECTION_IMGUI_MAIN_RENDER);
+	presenter_render_imgui_draw_data(ImGui::GetDrawData());
+	profiler_end(PROFILER_SECTION_IMGUI_MAIN_RENDER);
+	profiler_end(PROFILER_SECTION_IMGUI_RENDER);
+
+	profiler_begin(PROFILER_SECTION_PRESENT);
+	presenter_present();
+	profiler_end(PROFILER_SECTION_PRESENT);
+}
+
+#if APPLE
+static void macos_redraw_during_resize(void* userdata) {
+	macos_resize_redraw_context_t* context = (macos_resize_redraw_context_t*)userdata;
+	if (context->is_rendering) {
+		return;
+	}
+
+	context->is_rendering = true;
+
+	// Cocoa runs a modal event loop while the user resizes a window. A timer in
+	// that loop redraws at the current screen's maximum refresh rate.
+	input_t resize_input = *curr_input;
+	for (u32 i = 0; i < COUNT(resize_input.mouse_buttons); ++i) {
+		resize_input.mouse_buttons[i].transition_count = 0;
+	}
+	for (u32 i = 0; i < COUNT(resize_input.abstract_controllers); ++i) {
+		controller_input_t* controller = resize_input.abstract_controllers + i;
+		for (u32 button_index = 0; button_index < COUNT(controller->buttons); ++button_index) {
+			controller->buttons[button_index].transition_count = 0;
+		}
+	}
+	resize_input.mouse_z = 0.0f;
+	resize_input.drag_vector = V2F(0.0f, 0.0f);
+	resize_input.mouse_moved = false;
+
+	bool profiler_was_paused = global_profiler.paused;
+	global_profiler.paused = true;
+	linux_render_frame(context->app_state, &resize_input, context->window, 0.0f);
+	global_profiler.paused = profiler_was_paused;
+
+	context->is_rendering = false;
+}
 #endif
 
 // Main code
@@ -872,6 +961,11 @@ int main(int argc, const char** argv)
 
 	presenter_init_viewer(app_state);
 
+#if APPLE
+	macos_resize_redraw_context_t macos_resize_context = {app_state, window, false};
+	macos_start_live_resize_redraw(window, macos_redraw_during_resize, &macos_resize_context);
+#endif
+
     // Load a slide from the command line or through the OS (double-click / drag on executable, etc.)
 	app_load_commandline_inputs(app_state);
 
@@ -951,14 +1045,6 @@ int main(int argc, const char** argv)
 	    }
 
 	    u32 current_window_flags = SDL_GetWindowFlags(window);
-        int w, h;
-        int display_w, display_h;
-        SDL_GetWindowSize(window, &w, &h);
-        if (current_window_flags & SDL_WINDOW_MINIMIZED) {
-	        w = h = 0;
-	        display_w = display_h = 0;
-        }
-		presenter_get_drawable_size(&display_w, &display_h);
 
         // After dragging a file onto the window to load it, we want to gain the window focus.
         // Detect if this was successfully done (see event handling code above) and warn the user if it failed.
@@ -971,45 +1057,7 @@ int main(int argc, const char** argv)
 	        }
         }
 
-        // Start the Dear ImGui frame
-	    profiler_begin(PROFILER_SECTION_GUI_NEW_FRAME);
-		presenter_imgui_new_frame();
-        ImGui_ImplSDL2_NewFrame();
-        ImGui::NewFrame();
-	    profiler_end(PROFILER_SECTION_GUI_NEW_FRAME);
-
-        // Update and render our application
-	    profiler_begin(PROFILER_SECTION_VIEWER);
-        viewer_update_and_render(app_state, curr_input, display_w, display_h, delta_t);
-	    profiler_end(PROFILER_SECTION_VIEWER);
-
-	    // Finish up by rendering the UI
-	    profiler_begin(PROFILER_SECTION_IMGUI_RENDER);
-	    profiler_begin(PROFILER_SECTION_IMGUI_BUILD);
-        ImGui::Render();
-	    profiler_end(PROFILER_SECTION_IMGUI_BUILD);
-		presenter_set_viewport((int) io.DisplaySize.x, (int) io.DisplaySize.y);
-
-	    // Render any ImGui content submitted to the extra draw lists on worker threads
-	    profiler_begin(PROFILER_SECTION_IMGUI_EXTRA_RENDER);
-	    if (ImDrawData* draw_data = gui_get_merged_extra_drawlists_data(ImGui::GetMainViewport(), io.DisplayFramebufferScale)) {
-		    if (enable_persistent_extra_drawlist_buffers && enable_merged_extra_drawlists) {
-			    presenter_render_cached_imgui_draw_data(draw_data, global_extra_drawlists_generation);
-		    } else {
-			    presenter_render_imgui_draw_data(draw_data);
-		    }
-	    }
-	    profiler_end(PROFILER_SECTION_IMGUI_EXTRA_RENDER);
-
-		// Render the rest of the ImGui draw data (submitted on the main thread)
-		profiler_begin(PROFILER_SECTION_IMGUI_MAIN_RENDER);
-		presenter_render_imgui_draw_data(ImGui::GetDrawData());
-	    profiler_end(PROFILER_SECTION_IMGUI_MAIN_RENDER);
-	    profiler_end(PROFILER_SECTION_IMGUI_RENDER);
-
-	    profiler_begin(PROFILER_SECTION_PRESENT);
-		presenter_present();
-	    profiler_end(PROFILER_SECTION_PRESENT);
+		linux_render_frame(app_state, curr_input, window, delta_t);
 
 	    profiler_end(PROFILER_SECTION_FRAME);
 
@@ -1029,6 +1077,9 @@ int main(int argc, const char** argv)
 	viewer_save_options_sync(app_state);
 
 	// Cleanup
+#if APPLE
+	macos_stop_live_resize_redraw();
+#endif
 	gui_destroy_all_extra_drawlists();
     ImGui_ImplSDL2_Shutdown();
 	presenter_shutdown();
