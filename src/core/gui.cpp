@@ -947,6 +947,101 @@ void gui_draw_insert_annotation_submenu(app_state_t* app_state) {
 	}
 }
 
+simple_image_t* gui_find_associated_image(app_state_t* app_state, bool find_label) {
+	i32 image_count = arrlen(app_state->loaded_images);
+	for (i32 pass = 0; pass < 2; ++pass) {
+		for (i32 image_index = 0; image_index < image_count; ++image_index) {
+			image_t* image = app_state->loaded_images[image_index];
+			if ((pass == 0) != image->is_enabled) continue;
+			simple_image_t* associated_image = find_label ? &image->label_image : &image->macro_image;
+			if (associated_image->is_valid) return associated_image;
+		}
+	}
+	return NULL;
+}
+
+typedef struct associated_image_window_constraints_t {
+	float aspect_ratio;
+	float decoration_width;
+	float decoration_height;
+	i32 resize_axis;
+} associated_image_window_constraints_t;
+
+enum associated_image_resize_axis_t {
+	ASSOCIATED_IMAGE_RESIZE_AXIS_NONE = 0,
+	ASSOCIATED_IMAGE_RESIZE_AXIS_WIDTH,
+	ASSOCIATED_IMAGE_RESIZE_AXIS_HEIGHT,
+};
+
+static void gui_constrain_associated_image_window(ImGuiSizeCallbackData* data) {
+	associated_image_window_constraints_t* constraints = (associated_image_window_constraints_t*)data->UserData;
+	if (constraints->resize_axis == ASSOCIATED_IMAGE_RESIZE_AXIS_NONE) {
+		float width_delta = fabsf(data->DesiredSize.x - data->CurrentSize.x);
+		float height_delta = fabsf(data->DesiredSize.y - data->CurrentSize.y);
+		constraints->resize_axis = width_delta >= height_delta ?
+			ASSOCIATED_IMAGE_RESIZE_AXIS_WIDTH : ASSOCIATED_IMAGE_RESIZE_AXIS_HEIGHT;
+	}
+	if (constraints->resize_axis == ASSOCIATED_IMAGE_RESIZE_AXIS_WIDTH) {
+		float content_width = data->DesiredSize.x - constraints->decoration_width;
+		data->DesiredSize.y = constraints->decoration_height + content_width / constraints->aspect_ratio;
+	} else {
+		float content_height = data->DesiredSize.y - constraints->decoration_height;
+		data->DesiredSize.x = constraints->decoration_width + content_height * constraints->aspect_ratio;
+	}
+}
+
+static ImVec2 gui_associated_image_content_size(float aspect_ratio, float longest_side) {
+	if (aspect_ratio >= 1.0f) return ImVec2(longest_side, longest_side / aspect_ratio);
+	return ImVec2(longest_side * aspect_ratio, longest_side);
+}
+
+static void gui_draw_associated_image_window(app_state_t* app_state, const char* title,
+											 bool* show_window, bool draw_label, float initial_y,
+											 float default_longest_side) {
+	if (!*show_window) return;
+
+	simple_image_t* associated_image = gui_find_associated_image(app_state, draw_label);
+	if (!associated_image) return;
+	if (associated_image->width <= 0 || associated_image->height <= 0) return;
+
+	float aspect_ratio = (float)associated_image->width / (float)associated_image->height;
+	ImGuiIO& io = ImGui::GetIO();
+	ImGuiStyle& style = ImGui::GetStyle();
+	static associated_image_window_constraints_t window_constraints[2];
+	associated_image_window_constraints_t* constraints = window_constraints + (draw_label ? 0 : 1);
+	constraints->aspect_ratio = aspect_ratio;
+	constraints->decoration_width = style.WindowPadding.x * 2.0f;
+	constraints->decoration_height = ImGui::GetFrameHeight() + style.WindowPadding.y * 2.0f;
+	if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+		constraints->resize_axis = ASSOCIATED_IMAGE_RESIZE_AXIS_NONE;
+	}
+	ImVec2 default_content_size = gui_associated_image_content_size(aspect_ratio, default_longest_side);
+	ImVec2 default_window_size(default_content_size.x + constraints->decoration_width,
+							   default_content_size.y + constraints->decoration_height);
+	ImVec2 minimum_content_size = gui_associated_image_content_size(aspect_ratio, 120.0f);
+	float max_content_width = ATLEAST(io.DisplaySize.x - 80.0f, 120.0f);
+	float max_content_height = ATLEAST(io.DisplaySize.y - 100.0f, 120.0f);
+	float fitted_max_width = ATMOST(max_content_width, max_content_height * aspect_ratio);
+	ImVec2 maximum_content_size(fitted_max_width, fitted_max_width / aspect_ratio);
+
+	ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - default_window_size.x - 20.0f, initial_y), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSize(default_window_size, ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSizeConstraints(
+		ImVec2(minimum_content_size.x + constraints->decoration_width,
+			   minimum_content_size.y + constraints->decoration_height),
+		ImVec2(maximum_content_size.x + constraints->decoration_width,
+			   maximum_content_size.y + constraints->decoration_height),
+		gui_constrain_associated_image_window, constraints);
+	if (ImGui::Begin(title, show_window, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+		if (associated_image->texture != 0) {
+			ImGui::Image((ImTextureID)associated_image->texture, ImGui::GetContentRegionAvail());
+		} else {
+			ImGui::TextUnformatted("Loading image...");
+		}
+	}
+	ImGui::End();
+}
+
 static void gui_draw_main_menu_bar(app_state_t* app_state) {
 	check_presence_of_debug_test_files();
 
@@ -1041,7 +1136,11 @@ static void gui_draw_main_menu_bar(app_state_t* app_state) {
 			ImGui::Separator();
 			if (ImGui::MenuItem("Fullscreen", "F11", &is_fullscreen)) {}
 			if (ImGui::MenuItem("Image options...", NULL, &show_image_options_window)) {}
-			if (ImGui::MenuItem("Layers...", "L", &show_layers_window)) {}
+			if (ImGui::MenuItem("Layers...", "Ctrl+L", &show_layers_window)) {}
+			bool has_label_image = gui_find_associated_image(app_state, true) != NULL;
+			bool has_macro_image = gui_find_associated_image(app_state, false) != NULL;
+			if (ImGui::MenuItem("Label image", "L", &show_label_image_window, has_label_image)) {}
+			if (ImGui::MenuItem("Macro image", "O", &show_macro_image_window, has_macro_image)) {}
 			bool has_dicom_slides = has_image_loaded &&
 			                        ((app_state->loaded_images[0]->backend == IMAGE_BACKEND_DICOM &&
 			                          arrlen(app_state->loaded_images[0]->dicom.slides) > 1) ||
@@ -2410,6 +2509,10 @@ void gui_draw(app_state_t* app_state, input_t* input, i32 client_width, i32 clie
 	if (show_layers_window) {
 		draw_layers_window(app_state);
 	}
+	gui_draw_associated_image_window(app_state, "Label image###label_image_window", &show_label_image_window,
+									 true, 50.0f, 260.0f);
+	gui_draw_associated_image_window(app_state, "Macro image###macro_image_window", &show_macro_image_window,
+									 false, 350.0f, 340.0f);
 	draw_dicom_slides_window(app_state);
 
 	if (show_about_window) {

@@ -68,6 +68,7 @@ void gui_draw_polygon_outline_in_scene(v2f* points, i32 count, rgba_t color, boo
 void gui_draw_bounds_in_scene(bounds2f bounds, rgba_t color, float thickness, scene_t* scene, ImDrawList* drawlist);
 bool gui_draw_selected_annotation_submenu_section(app_state_t* app_state, scene_t* scene, annotation_set_t* annotation_set);
 void gui_draw_insert_annotation_submenu(app_state_t* app_state);
+simple_image_t* gui_find_associated_image(app_state_t* app_state, bool find_label);
 void gui_draw(app_state_t* app_state, input_t* input, i32 client_width, i32 client_height);
 void gui_do_modal_popups();
 void draw_profiler_window(app_state_t* app_state);
@@ -97,6 +98,8 @@ extern bool show_open_remote_window;
 extern bool show_open_uri_window;
 extern bool show_dicomweb_archive_window;
 extern bool show_layers_window;
+extern bool show_label_image_window;
+extern bool show_macro_image_window;
 extern bool show_dicom_slides_window;
 extern bool show_annotations_window;
 extern bool show_annotation_group_assignment_window;

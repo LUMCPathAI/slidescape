@@ -60,7 +60,7 @@ static bool cached_imgui_init_renderer(void) {
 	}
 
 	const char* vertex_shader_source =
-		"#version 130\n"
+		"#version 330 core\n"
 		"uniform mat4 ProjMtx;\n"
 		"in vec2 Position;\n"
 		"in vec2 UV;\n"
@@ -74,7 +74,7 @@ static bool cached_imgui_init_renderer(void) {
 		"}\n";
 
 	const char* fragment_shader_source =
-		"#version 130\n"
+		"#version 330 core\n"
 		"uniform sampler2D Texture;\n"
 		"in vec2 Frag_UV;\n"
 		"in vec4 Frag_Color;\n"

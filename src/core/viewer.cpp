@@ -1790,8 +1790,14 @@ void do_after_scene_render(app_state_t* app_state, input_t* input) {
 		}
 	}
 	if (!gui_want_capture_keyboard) {
-		if (was_key_pressed(input, KEY_L)) {
-			show_layers_window = !show_layers_window;
+		u32 key_modifiers_without_shift = input->keyboard.modifiers & ~KMOD_SHIFT;
+		if (was_key_pressed(input, KEY_L) && key_modifiers_without_shift == KMOD_CTRL) {
+			show_layers_window = !show_layers_window; // Ctrl+L
+		} else if (was_key_pressed(input, KEY_L) && key_modifiers_without_shift == 0) {
+			show_label_image_window = !show_label_image_window; // L
+		}
+		if (was_key_pressed(input, KEY_O) && key_modifiers_without_shift == 0) {
+			show_macro_image_window = !show_macro_image_window; // O (overview)
 		}
 		if (was_key_pressed(input, KEY_H)) {
 			app_state->scene.enable_annotations = !app_state->scene.enable_annotations;
