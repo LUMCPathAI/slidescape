@@ -231,14 +231,8 @@ TEST_CASE("pathology archive recognizes its initial DICOMweb route profile") {
 
 TEST_CASE("fast-tier repair atomically restores published shell bytes") {
 	char temp_path[ARCHIVE_PATH_CAPACITY];
-#if defined(_WIN32)
-	char temp_base[L_tmpnam] = {};
-	REQUIRE(tmpnam_s(temp_base, sizeof(temp_base)) == 0);
-	snprintf(temp_path, sizeof(temp_path), "%s-shell-repair", temp_base);
-#else
 	REQUIRE(slidescape_test_make_temp_directory(
 		temp_path, sizeof(temp_path), "slidescape-shell-repair"));
-#endif
 	archive_repository_t repository = {};
 	char error[512] = {};
 	REQUIRE(archive_repository_initialize(
@@ -297,15 +291,9 @@ TEST_CASE("fast-tier repair atomically restores published shell bytes") {
 
 TEST_CASE("pathology archive repository has explicit immutable and publication boundaries") {
 	char temp_path[ARCHIVE_PATH_CAPACITY];
-#if defined(_WIN32)
-	char temp_base[L_tmpnam] = {0};
-	REQUIRE(tmpnam_s(temp_base, sizeof(temp_base)) == 0);
-	snprintf(temp_path, sizeof(temp_path), "%s-archive", temp_base);
-#else
 	bool created_temp_directory = slidescape_test_make_temp_directory(
 		temp_path, sizeof(temp_path), "slidescape-archive-test");
 	REQUIRE(created_temp_directory);
-#endif
 	archive_repository_t repository = {};
 	char error[512] = {0};
 	char path[ARCHIVE_PATH_CAPACITY];
@@ -587,14 +575,8 @@ TEST_CASE("pathology archive repository has explicit immutable and publication b
 
 TEST_CASE("pathology archive stores immutable objects by verified SHA-256") {
 	char temp_path[ARCHIVE_PATH_CAPACITY];
-#if defined(_WIN32)
-	char temp_base[L_tmpnam] = {0};
-	REQUIRE(tmpnam_s(temp_base, sizeof(temp_base)) == 0);
-	snprintf(temp_path, sizeof(temp_path), "%s-object", temp_base);
-#else
 	REQUIRE(slidescape_test_make_temp_directory(
 		temp_path, sizeof(temp_path), "slidescape-object-test"));
-#endif
 	archive_repository_t repository = {};
 	char error[512] = {};
 	REQUIRE(archive_repository_initialize(&repository, temp_path, error, sizeof(error)) ==
@@ -1467,14 +1449,12 @@ TEST_CASE("virtual DICOM shell loads one aligned Part 10 serving object") {
 
 TEST_CASE("virtual DICOM shell bounds a final encapsulated frame before trailing elements") {
 	char temp_path[ARCHIVE_PATH_CAPACITY];
-#if defined(_WIN32)
-	char temp_base[L_tmpnam] = {0};
-	REQUIRE(tmpnam_s(temp_base, sizeof(temp_base)) == 0);
-	snprintf(temp_path, sizeof(temp_path), "%s-last-frame.dcm", temp_base);
-#else
 	int descriptor = slidescape_test_make_temp_file(
 		temp_path, sizeof(temp_path), "slidescape-last-frame-test");
 	REQUIRE(descriptor >= 0);
+#if defined(_WIN32)
+	_close(descriptor);
+#else
 	close(descriptor);
 #endif
 	constexpr size_t source_size = 512;

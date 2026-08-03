@@ -17,6 +17,9 @@
 */
 
 #include "common.h"
+#if defined(_WIN32)
+#include <winsock2.h>
+#endif
 #include "platform.h"
 #include "viewer.h"
 #include "remote.h"
@@ -783,6 +786,37 @@ static void remote_request_set_error(const remote_request_options_t* options,
 	if (options && options->out_error) *options->out_error = error;
 }
 
+static int remote_net_recv_timeout(mbedtls_net_context* context, u8* buffer,
+		size_t size, u32 timeout_ms) {
+#if defined(_WIN32)
+	/*
+	 * Winsock fd_set stores socket handles in an array. Unlike POSIX fd_set,
+	 * the handle value itself does not need to be smaller than FD_SETSIZE.
+	 * mbedtls_net_recv_timeout() applies the POSIX descriptor-value check on
+	 * Windows too, rejecting otherwise valid Winsock handles.
+	 */
+	// TODO (pvalkema 2026-08-03): see if this special handling can be removed after Mbed TLS is updated to a newer version.
+	SOCKET socket_handle = (SOCKET)context->fd;
+	if (socket_handle == INVALID_SOCKET) return MBEDTLS_ERR_NET_INVALID_CONTEXT;
+	fd_set read_fds;
+	FD_ZERO(&read_fds);
+	FD_SET(socket_handle, &read_fds);
+	struct timeval timeout = {
+		(long)(timeout_ms / 1000),
+		(long)((timeout_ms % 1000) * 1000),
+	};
+	i32 ready = select(0, &read_fds, NULL, NULL, timeout_ms ? &timeout : NULL);
+	if (ready == 0) return MBEDTLS_ERR_SSL_TIMEOUT;
+	if (ready == SOCKET_ERROR) {
+		return WSAGetLastError() == WSAEINTR ? MBEDTLS_ERR_SSL_WANT_READ
+		                                      : MBEDTLS_ERR_NET_POLL_FAILED;
+	}
+	return mbedtls_net_recv(context, buffer, size);
+#else
+	return mbedtls_net_recv_timeout(context, buffer, size, timeout_ms);
+#endif
+}
+
 http_response_t* remote_connection_request_with_headers_and_options(
 	tls_connection_t* connection, const char* host, const char* path, const char* accept,
 	const char* extra_headers, bool close_after_request,
@@ -863,8 +897,8 @@ http_response_t* remote_connection_request_with_headers_and_options(
         }
         ret = connection->use_tls
               ? mbedtls_ssl_read(&connection->ssl, read_buffer, sizeof(read_buffer))
-              : mbedtls_net_recv_timeout(&connection->server_fd, read_buffer,
-                                         sizeof(read_buffer), read_poll_timeout_ms);
+              : remote_net_recv_timeout(&connection->server_fd, read_buffer,
+	                                    sizeof(read_buffer), read_poll_timeout_ms);
 
         if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
             ret == MBEDTLS_ERR_SSL_TIMEOUT) {

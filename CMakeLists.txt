@@ -600,7 +600,7 @@ if (BUILD_SLIDESCAPE_ARCHIVE)
     target_compile_definitions(slidescape_archive PRIVATE IS_SERVER=1)
     target_link_libraries(slidescape_archive PRIVATE slidescape_archive_core slidescape_nongui slidescape_jpeg)
     if (WIN32)
-        target_link_libraries(slidescape_archive PRIVATE ws2_32)
+        target_link_libraries(slidescape_archive PRIVATE ws2_32 winmm)
     endif()
 endif()
 

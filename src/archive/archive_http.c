@@ -15,6 +15,8 @@
 #include "archive_instance_provider.h"
 #include "archive_representation.h"
 #include "archive_routes.h"
+#include "memrw.h"
+#include "platform.h"
 #include "work_queue.h"
 
 #include <errno.h>
@@ -51,6 +53,23 @@ typedef struct archive_client_task_t {
 	const archive_index_t* index;
 } archive_client_task_t;
 
+static void archive_memrw_init_fixed(memrw_t* buffer, void* data, size_t capacity) {
+	*buffer = (memrw_t){0};
+	buffer->data = data;
+	buffer->capacity = capacity;
+	buffer->is_growing_disallowed = true;
+}
+
+static void archive_memrw_write_u64(memrw_t* buffer, u64 value) {
+	char digits[32];
+	size_t count = 0;
+	do {
+		digits[count++] = (char)('0' + value % 10);
+		value /= 10;
+	} while (value);
+	while (count) memrw_write(digits + --count, buffer, 1);
+}
+
 static bool archive_socket_startup(void) {
 #if defined(_WIN32)
 	WSADATA data;
@@ -84,15 +103,18 @@ static bool archive_send_all(archive_socket_t socket, const char* data, size_t s
 static bool archive_send_body(archive_socket_t socket, i32 status, const char* reason,
 		const char* content_type, const char* body, size_t body_size) {
 	char header[512];
-	i32 header_size = snprintf(header, sizeof(header),
-		"HTTP/1.1 %d %s\r\n"
-		"Content-Type: %s\r\n"
-		"Content-Length: %zu\r\n"
-		"Cache-Control: no-store\r\n"
-		"Connection: close\r\n\r\n",
-		status, reason, content_type, body_size);
-	return header_size > 0 && (size_t)header_size < sizeof(header) &&
-	       archive_send_all(socket, header, (size_t)header_size) &&
+	memrw_t builder;
+	archive_memrw_init_fixed(&builder, header, sizeof(header));
+	memrw_write_literal("HTTP/1.1 ", &builder);
+	archive_memrw_write_u64(&builder, (u64)status);
+	memrw_write_literal(" ", &builder);
+	memrw_write_string(reason, &builder);
+	memrw_write_literal("\r\nContent-Type: ", &builder);
+	memrw_write_string(content_type, &builder);
+	memrw_write_literal("\r\nContent-Length: ", &builder);
+	archive_memrw_write_u64(&builder, (u64)body_size);
+	memrw_write_literal("\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", &builder);
+	return archive_send_all(socket, header, builder.used_size) &&
 	       archive_send_all(socket, body, body_size);
 }
 
@@ -186,6 +208,27 @@ static void archive_destroy_frames(archive_instance_frame_t* frames, i32 count) 
 	for (i32 i = 0; i < count; ++i) archive_instance_frame_destroy(frames + i);
 }
 
+static void archive_write_frame_part_header(memrw_t* builder, bool include_separator,
+		const char* boundary, const archive_instance_frame_t* frame,
+		const archive_route_match_t* route, u32 frame_number) {
+	if (include_separator) memrw_write_literal("\r\n", builder);
+	memrw_write_literal("--", builder);
+	memrw_write_string(boundary, builder);
+	memrw_write_literal("\r\nContent-Type: ", builder);
+	memrw_write_string(frame->media_type, builder);
+	memrw_write_literal("; transfer-syntax=", builder);
+	memrw_write_string(frame->transfer_syntax_uid, builder);
+	memrw_write_literal("\r\nContent-Location: /dicom-web/studies/", builder);
+	memrw_write_string(route->study_uid, builder);
+	memrw_write_literal("/series/", builder);
+	memrw_write_string(route->series_uid, builder);
+	memrw_write_literal("/instances/", builder);
+	memrw_write_string(route->instance_uid, builder);
+	memrw_write_literal("/frames/", builder);
+	archive_memrw_write_u64(builder, frame_number);
+	memrw_write_literal("\r\n\r\n", builder);
+}
+
 static void archive_send_wado_response(archive_socket_t client,
 		const archive_repository_t* repository, const archive_index_t* index,
 		const archive_route_match_t* route, const char* request_headers) {
@@ -266,7 +309,10 @@ static void archive_send_wado_response(archive_socket_t client,
 		return;
 	}
 
-	archive_instance_frame_t frames[ARCHIVE_MAX_FRAMES_PER_REQUEST] = {0};
+	archive_instance_frame_t* frames = arena_push_array(
+		&threadlocal_thread_memory->temp_arena,
+		ARCHIVE_MAX_FRAMES_PER_REQUEST, archive_instance_frame_t);
+	memset(frames, 0, ARCHIVE_MAX_FRAMES_PER_REQUEST * sizeof(*frames));
 	static const char boundary[] = "slidescape-frame-boundary";
 	size_t body_size = 0;
 	for (i32 i = 0; i < frame_count; ++i) {
@@ -277,31 +323,34 @@ static void archive_send_wado_response(archive_socket_t client,
 			return;
 		}
 		char part_header[768];
-		i32 part_header_size = snprintf(part_header, sizeof(part_header),
-			"%s--%s\r\nContent-Type: %s; transfer-syntax=%s\r\n"
-			"Content-Location: /dicom-web/studies/%s/series/%s/instances/%s/frames/%u\r\n\r\n",
-			i ? "\r\n" : "", boundary, frames[i].media_type, frames[i].transfer_syntax_uid,
-			route->study_uid, route->series_uid, route->instance_uid, frame_numbers[i]);
-		if (part_header_size <= 0 || (size_t)part_header_size >= sizeof(part_header) ||
-		    frames[i].size > ARCHIVE_MAX_MULTIPART_RESPONSE_SIZE - body_size ||
-		    (size_t)part_header_size > ARCHIVE_MAX_MULTIPART_RESPONSE_SIZE -
+		memrw_t part_header_builder;
+		archive_memrw_init_fixed(&part_header_builder, part_header, sizeof(part_header));
+		archive_write_frame_part_header(&part_header_builder, i != 0, boundary,
+		                                frames + i, route, frame_numbers[i]);
+		size_t part_header_size = part_header_builder.used_size;
+		if (frames[i].size > ARCHIVE_MAX_MULTIPART_RESPONSE_SIZE - body_size ||
+		    part_header_size > ARCHIVE_MAX_MULTIPART_RESPONSE_SIZE -
 		                               body_size - frames[i].size) {
 			archive_destroy_frames(frames, i + 1);
 			archive_send_json(client, 413, "Content Too Large",
 			                  "{\"error\":\"frame_response_too_large\"}\n");
 			return;
 		}
-		body_size += (size_t)part_header_size + frames[i].size;
+		body_size += part_header_size + frames[i].size;
 	}
 	char closing[64];
-	i32 closing_size = snprintf(closing, sizeof(closing), "\r\n--%s--\r\n", boundary);
-	if (closing_size <= 0 || (size_t)closing_size >= sizeof(closing) ||
-	    (size_t)closing_size > ARCHIVE_MAX_MULTIPART_RESPONSE_SIZE - body_size) {
+	memrw_t closing_builder;
+	archive_memrw_init_fixed(&closing_builder, closing, sizeof(closing));
+	memrw_write_literal("\r\n--", &closing_builder);
+	memrw_write_string(boundary, &closing_builder);
+	memrw_write_literal("--\r\n", &closing_builder);
+	size_t closing_size = closing_builder.used_size;
+	if (closing_size > ARCHIVE_MAX_MULTIPART_RESPONSE_SIZE - body_size) {
 		archive_destroy_frames(frames, frame_count);
 		archive_send_json(client, 500, "Internal Server Error", "{\"error\":\"frame_response_failed\"}\n");
 		return;
 	}
-	body_size += (size_t)closing_size;
+	body_size += closing_size;
 	char* body = (char*)malloc(body_size);
 	if (!body) {
 		archive_destroy_frames(frames, frame_count);
@@ -311,32 +360,37 @@ static void archive_send_wado_response(archive_socket_t client,
 	size_t used = 0;
 	for (i32 i = 0; i < frame_count; ++i) {
 		char part_header[768];
-		i32 part_header_size = snprintf(part_header, sizeof(part_header),
-			"%s--%s\r\nContent-Type: %s; transfer-syntax=%s\r\n"
-			"Content-Location: /dicom-web/studies/%s/series/%s/instances/%s/frames/%u\r\n\r\n",
-			i ? "\r\n" : "", boundary, frames[i].media_type, frames[i].transfer_syntax_uid,
-			route->study_uid, route->series_uid, route->instance_uid, frame_numbers[i]);
-		memcpy(body + used, part_header, (size_t)part_header_size);
-		used += (size_t)part_header_size;
+		memrw_t part_header_builder;
+		archive_memrw_init_fixed(&part_header_builder, part_header, sizeof(part_header));
+		archive_write_frame_part_header(&part_header_builder, i != 0, boundary,
+		                                frames + i, route, frame_numbers[i]);
+		memcpy(body + used, part_header, part_header_builder.used_size);
+		used += part_header_builder.used_size;
 		memcpy(body + used, frames[i].data, frames[i].size);
 		used += frames[i].size;
 	}
-	memcpy(body + used, closing, (size_t)closing_size);
-	used += (size_t)closing_size;
+	memcpy(body + used, closing, closing_size);
+	used += closing_size;
 	ASSERT(used == body_size);
 	char content_type[160];
-	snprintf(content_type, sizeof(content_type),
-	         "multipart/related; type=\"%s\"; transfer-syntax=%s; boundary=%s",
-	         frames[0].media_type, frames[0].transfer_syntax_uid, boundary);
+	memrw_t content_type_builder;
+	archive_memrw_init_fixed(&content_type_builder, content_type, sizeof(content_type));
+	memrw_write_literal("multipart/related; type=\"", &content_type_builder);
+	memrw_write_string(frames[0].media_type, &content_type_builder);
+	memrw_write_literal("\"; transfer-syntax=", &content_type_builder);
+	memrw_write_string(frames[0].transfer_syntax_uid, &content_type_builder);
+	memrw_write_literal("; boundary=", &content_type_builder);
+	memrw_write_string(boundary, &content_type_builder);
+	memrw_putc('\0', &content_type_builder);
 	archive_send_body(client, 200, "OK", content_type, body, body_size);
 	free(body);
 	archive_destroy_frames(frames, frame_count);
 }
 
-static void archive_handle_request(archive_socket_t client, const archive_repository_t* repository,
-		const archive_index_t* index) {
-	char request[ARCHIVE_REQUEST_HEADER_LIMIT + 1] = {0};
-	if (!archive_read_request_headers(client, request, sizeof(request))) {
+static void archive_handle_request_with_buffer(archive_socket_t client,
+		const archive_repository_t* repository, const archive_index_t* index,
+		char* request) {
+	if (!archive_read_request_headers(client, request, ARCHIVE_REQUEST_HEADER_LIMIT + 1)) {
 		archive_send_json(client, 400, "Bad Request", "{\"error\":\"invalid_request_headers\"}\n");
 		return;
 	}
@@ -370,19 +424,31 @@ static void archive_handle_request(archive_socket_t client, const archive_reposi
 		archive_instance_provider_cache_stats_t stats =
 			archive_instance_provider_get_cache_stats();
 		char body[512];
-		snprintf(body, sizeof(body),
-			"{\"status\":\"ok\",\"service\":\"slidescape-pathology-archive\","
-			"\"repositorySchemaVersion\":1,\"part10Cache\":{"
-			"\"resident\":%d,\"capacity\":%d,\"hits\":%llu,\"misses\":%llu,"
-			"\"evictions\":%llu},\"shellCache\":{"
-			"\"resident\":%d,\"capacity\":%d,\"hits\":%llu,\"misses\":%llu,"
-			"\"evictions\":%llu}}\n",
-			stats.resident_count, stats.capacity, (unsigned long long)stats.hits,
-			(unsigned long long)stats.misses, (unsigned long long)stats.evictions,
-			stats.shell_resident_count, stats.shell_capacity,
-			(unsigned long long)stats.shell_hits,
-			(unsigned long long)stats.shell_misses,
-			(unsigned long long)stats.shell_evictions);
+		memrw_t builder;
+		archive_memrw_init_fixed(&builder, body, sizeof(body));
+		memrw_write_literal("{\"status\":\"ok\",\"service\":\"slidescape-pathology-archive\","
+			"\"repositorySchemaVersion\":1,\"part10Cache\":{\"resident\":", &builder);
+		archive_memrw_write_u64(&builder, (u64)stats.resident_count);
+		memrw_write_literal(",\"capacity\":", &builder);
+		archive_memrw_write_u64(&builder, (u64)stats.capacity);
+		memrw_write_literal(",\"hits\":", &builder);
+		archive_memrw_write_u64(&builder, stats.hits);
+		memrw_write_literal(",\"misses\":", &builder);
+		archive_memrw_write_u64(&builder, stats.misses);
+		memrw_write_literal(",\"evictions\":", &builder);
+		archive_memrw_write_u64(&builder, stats.evictions);
+		memrw_write_literal("},\"shellCache\":{\"resident\":", &builder);
+		archive_memrw_write_u64(&builder, (u64)stats.shell_resident_count);
+		memrw_write_literal(",\"capacity\":", &builder);
+		archive_memrw_write_u64(&builder, (u64)stats.shell_capacity);
+		memrw_write_literal(",\"hits\":", &builder);
+		archive_memrw_write_u64(&builder, stats.shell_hits);
+		memrw_write_literal(",\"misses\":", &builder);
+		archive_memrw_write_u64(&builder, stats.shell_misses);
+		memrw_write_literal(",\"evictions\":", &builder);
+		archive_memrw_write_u64(&builder, stats.shell_evictions);
+		memrw_write_literal("}}\n", &builder);
+		memrw_putc('\0', &builder);
 		archive_send_json(client, 200, "OK", body);
 		return;
 	}
@@ -398,10 +464,23 @@ static void archive_handle_request(archive_socket_t client, const archive_reposi
 		return;
 	}
 	char body[256];
-	snprintf(body, sizeof(body),
-		"{\"error\":\"not_implemented\",\"route\":\"%s\"}\n",
-		archive_route_kind_string(route.kind));
+	memrw_t builder;
+	archive_memrw_init_fixed(&builder, body, sizeof(body));
+	memrw_write_literal("{\"error\":\"not_implemented\",\"route\":\"", &builder);
+	memrw_write_string(archive_route_kind_string(route.kind), &builder);
+	memrw_write_literal("\"}\n", &builder);
+	memrw_putc('\0', &builder);
 	archive_send_json(client, 501, "Not Implemented", body);
+}
+
+static void archive_handle_request(archive_socket_t client, const archive_repository_t* repository,
+		const archive_index_t* index) {
+	temp_memory_t temp = begin_temp_memory_on_local_thread();
+	char* request = arena_push_array(&threadlocal_thread_memory->temp_arena,
+	                                 ARCHIVE_REQUEST_HEADER_LIMIT + 1, char);
+	memset(request, 0, ARCHIVE_REQUEST_HEADER_LIMIT + 1);
+	archive_handle_request_with_buffer(client, repository, index, request);
+	release_temp_memory(&temp);
 }
 
 static void archive_handle_client_task(i32 logical_thread_index, void* userdata) {

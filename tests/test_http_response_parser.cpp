@@ -2,6 +2,8 @@
 
 #include "http_response_parser.h"
 
+#include <string>
+
 TEST_CASE("HTTP response parser accepts split messages") {
 	http_response_parser_t parser = {};
 	REQUIRE(http_response_parser_init(&parser, 1024));

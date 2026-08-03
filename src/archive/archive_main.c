@@ -14,6 +14,7 @@
 #include "archive_repository.h"
 
 #include "common.h"
+#include "timerutils.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -60,6 +61,7 @@ static bool archive_parse_unsigned(const char* text, u64 maximum, u64* value) {
 }
 
 int main(int argc, char** argv) {
+	init_timer();
 	if (argc < 3) {
 		archive_print_usage(argv[0]);
 		return 2;

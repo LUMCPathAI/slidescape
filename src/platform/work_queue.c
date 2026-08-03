@@ -45,8 +45,12 @@ work_queue_t work_queue_create(const char* semaphore_name, i32 entry_count) {
 
 	i32 semaphore_initial_count = 0;
 #if WINDOWS
+	(void)semaphore_name;
 	LONG maximum_count = 1e6; // realistically, we'd only get up to the number of worker threads, though
-	queue.semaphore = CreateSemaphoreExA(0, semaphore_initial_count, maximum_count, semaphore_name, 0, SEMAPHORE_ALL_ACCESS);
+	/* Each pool needs an independent wake-up count. A fixed named semaphore
+	 * lets unrelated pools consume each other's task and shutdown signals. */
+	queue.semaphore = CreateSemaphoreExA(
+		0, semaphore_initial_count, maximum_count, NULL, 0, SEMAPHORE_ALL_ACCESS);
 #elif APPLE
 	// Prevent name collisions by appending a unique number
 	char semaphore_name_unique[64];
