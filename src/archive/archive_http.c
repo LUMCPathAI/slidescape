@@ -86,6 +86,53 @@ static void archive_socket_shutdown(void) {
 #endif
 }
 
+static archive_socket_t archive_create_loopback_listener(i32 family, u16 port) {
+	archive_socket_t server = socket(family, SOCK_STREAM, IPPROTO_TCP);
+	if (server == ARCHIVE_INVALID_SOCKET) return ARCHIVE_INVALID_SOCKET;
+	int reuse = 1;
+	setsockopt(server, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+	int result;
+	if (family == AF_INET6) {
+		/* Keep the listeners independent: this socket is for ::1 only. */
+		int ipv6_only = 1;
+		setsockopt(server, IPPROTO_IPV6, IPV6_V6ONLY,
+		           (const char*)&ipv6_only, sizeof(ipv6_only));
+		struct sockaddr_in6 address = {0};
+		address.sin6_family = AF_INET6;
+		address.sin6_addr = in6addr_loopback;
+		address.sin6_port = htons(port);
+		result = bind(server, (struct sockaddr*)&address, sizeof(address));
+	} else {
+		struct sockaddr_in address = {0};
+		address.sin_family = AF_INET;
+		address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		address.sin_port = htons(port);
+		result = bind(server, (struct sockaddr*)&address, sizeof(address));
+	}
+	if (result != 0 || listen(server, 16) != 0) {
+		archive_socket_close(server);
+		return ARCHIVE_INVALID_SOCKET;
+	}
+	return server;
+}
+
+static archive_socket_t archive_accept_loopback(archive_socket_t ipv4_server,
+		archive_socket_t ipv6_server) {
+	if (ipv6_server == ARCHIVE_INVALID_SOCKET) return accept(ipv4_server, NULL, NULL);
+	fd_set read_fds;
+	FD_ZERO(&read_fds);
+	FD_SET(ipv4_server, &read_fds);
+	FD_SET(ipv6_server, &read_fds);
+#if defined(_WIN32)
+	i32 ready = select(0, &read_fds, NULL, NULL, NULL);
+#else
+	i32 ready = select(MAX(ipv4_server, ipv6_server) + 1, &read_fds, NULL, NULL, NULL);
+#endif
+	if (ready <= 0) return ARCHIVE_INVALID_SOCKET;
+	if (FD_ISSET(ipv6_server, &read_fds)) return accept(ipv6_server, NULL, NULL);
+	return accept(ipv4_server, NULL, NULL);
+}
+
 static bool archive_send_all(archive_socket_t socket, const char* data, size_t size) {
 	while (size > 0) {
 #if defined(_WIN32)
@@ -507,30 +554,23 @@ int archive_http_serve(const archive_repository_t* repository, u16 port,
 		archive_socket_shutdown();
 		return 1;
 	}
-	archive_socket_t server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (server == ARCHIVE_INVALID_SOCKET) {
-		fprintf(stderr, "Could not create archive socket\n");
-		archive_index_destroy(&index);
-		archive_instance_provider_shutdown();
-		archive_socket_shutdown();
-		return 1;
-	}
-	int reuse = 1;
-	setsockopt(server, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
-	struct sockaddr_in address;
-	memset(&address, 0, sizeof(address));
-	address.sin_family = AF_INET;
-	address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	address.sin_port = htons(port);
-	if (bind(server, (struct sockaddr*)&address, sizeof(address)) != 0 || listen(server, 16) != 0) {
+	archive_socket_t ipv4_server = archive_create_loopback_listener(AF_INET, port);
+	if (ipv4_server == ARCHIVE_INVALID_SOCKET) {
 		fprintf(stderr, "Could not bind archive to 127.0.0.1:%u\n", (unsigned)port);
-		archive_socket_close(server);
 		archive_index_destroy(&index);
 		archive_instance_provider_shutdown();
 		archive_socket_shutdown();
 		return 1;
 	}
-	printf("Slidescape pathology archive listening on http://127.0.0.1:%u\n", (unsigned)port);
+	archive_socket_t ipv6_server = archive_create_loopback_listener(AF_INET6, port);
+	if (ipv6_server == ARCHIVE_INVALID_SOCKET) {
+		fprintf(stderr, "Warning: could not bind archive to [::1]:%u; IPv4 remains available\n",
+		        (unsigned)port);
+		printf("Slidescape pathology archive listening on http://127.0.0.1:%u\n", (unsigned)port);
+	} else {
+		printf("Slidescape pathology archive listening on http://localhost:%u (127.0.0.1 and ::1)\n",
+		       (unsigned)port);
+	}
 	printf("Repository: %s\n", repository->root);
 	printf("QIDO and Part 10 instance metadata/negotiated frame WADO are enabled on %d worker threads; other routes return 501.\n",
 	       thread_pool_get_active_worker_thread_count(&global_thread_pool));
@@ -538,7 +578,7 @@ int archive_http_serve(const archive_repository_t* repository, u16 port,
 
 	size_t handled = 0;
 	while (max_requests == 0 || handled < max_requests) {
-		archive_socket_t client = accept(server, NULL, NULL);
+		archive_socket_t client = archive_accept_loopback(ipv4_server, ipv6_server);
 		if (client == ARCHIVE_INVALID_SOCKET) {
 			fprintf(stderr, "Archive accept failed\n");
 			break;
@@ -555,7 +595,8 @@ int archive_http_serve(const archive_repository_t* repository, u16 port,
 		}
 		++handled;
 	}
-	archive_socket_close(server);
+	archive_socket_close(ipv4_server);
+	if (ipv6_server != ARCHIVE_INVALID_SOCKET) archive_socket_close(ipv6_server);
 	thread_pool_wait_for_completion(&global_thread_pool);
 	archive_index_destroy(&index);
 	archive_instance_provider_shutdown();
