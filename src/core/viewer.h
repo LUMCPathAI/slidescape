@@ -280,6 +280,7 @@ typedef struct app_state_t {
 //  prototypes
 void add_image(app_state_t* app_state, image_t* image, bool need_zoom_reset, bool need_image_registration);
 void unload_all_images(app_state_t* app_state);
+image_t* get_image_from_resource_id(app_state_t* app_state, i32 resource_id);
 bool load_generic_file(app_state_t* app_state, const char* filename, u32 filetype_hint);
 bool load_dicom_file_from_directory(app_state_t* app_state, const char* filename,
 		const char* directory, u32 filetype_hint);
@@ -304,6 +305,7 @@ const char* get_active_directory(app_state_t* app_state);
 const char* get_annotation_directory(app_state_t* app_state);
 void set_annotation_directory(app_state_t* app_state, const char* path);
 void slide_score_load_tile_batch_func(i32 logical_thread_index, void* userdata);
+void ssi_load_tile_batch_func(i32 logical_thread_index, void* userdata);
 
 // viewer_io_remote.cpp
 void tiff_load_tile_batch_func(i32 logical_thread_index, void* userdata);

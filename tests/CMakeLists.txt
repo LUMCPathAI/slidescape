@@ -5,10 +5,12 @@ add_executable(slidescape_tests
         test_dicomweb.cpp
         test_archive.cpp
         test_http_response_parser.cpp
+        test_http_request.cpp
         test_mathutils.cpp
         test_memrw.cpp
         test_stb_sprintf.cpp
         test_slide_score.cpp
+        test_ssi.cpp
         test_support.cpp
         test_stringutils.cpp
         test_tile_cache.cpp

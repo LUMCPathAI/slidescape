@@ -205,6 +205,32 @@ TEST_CASE("hard demand keeps an older viewer decode alive") {
 	tile_cache_test_image_destroy(&fixture);
 }
 
+TEST_CASE("retryable tile failure releases its reservation without marking empty") {
+	tile_cache_test_image_t fixture = {};
+	tile_cache_test_image_init(&fixture);
+	REQUIRE(fixture.image.tile_cache != nullptr);
+
+	REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	                                    TILE_CACHE_DEMAND_VIEWER_VISIBLE |
+	                                    TILE_CACHE_DEMAND_GPU_RESIDENCY,
+	                                    10, 0));
+	tile_cache_result_t result = {};
+	result.level = 0;
+	result.tile_index = 0;
+	result.failed = true;
+	result.retryable_failure = true;
+	tile_cache_result_action_t action = {};
+	REQUIRE(tile_cache_apply_result(&fixture.image, &result, true, &action));
+	CHECK_FALSE(action.mark_empty);
+	CHECK_FALSE(tile_cache_tile_is_busy(&fixture.image, 0, 0));
+	CHECK(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	                                  TILE_CACHE_DEMAND_VIEWER_VISIBLE |
+	                                  TILE_CACHE_DEMAND_GPU_RESIDENCY,
+	                                  10, 0));
+	tile_cache_cancel_decode(&fixture.image, 0, 0);
+	tile_cache_test_image_destroy(&fixture);
+}
+
 TEST_CASE("CPU tile pixels live until the final pin is released") {
 	tile_cache_test_image_t fixture = {};
 	tile_cache_test_image_init(&fixture);

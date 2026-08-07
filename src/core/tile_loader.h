@@ -78,6 +78,8 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 void tile_loader_set_remote_tiff_batch_callback(work_queue_callback_t* callback);
 void tile_loader_set_slide_score_batch_callback(work_queue_callback_t* callback);
 void tile_loader_set_dicomweb_batch_callback(work_queue_callback_t* callback);
+void tile_loader_set_ssi_batch_callback(work_queue_callback_t* callback);
+void tile_loader_cancel_stale_ssi_pending(image_t* image, i32 viewer_generation);
 
 #ifdef __cplusplus
 }

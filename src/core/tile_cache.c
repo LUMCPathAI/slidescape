@@ -26,7 +26,7 @@ typedef enum tile_cache_completion_event_kind_t {
 	TILE_CACHE_COMPLETION_EVENT_RESULT = 1,
 } tile_cache_completion_event_kind_t;
 
-#define TILE_CACHE_VIEWER_WISHLIST_MAX 128
+#define TILE_CACHE_VIEWER_WISHLIST_MAX 512
 
 typedef struct tile_cache_tile_t {
 	u8 request_state;
@@ -41,6 +41,7 @@ typedef struct tile_cache_tile_t {
 	bool8 decode_in_flight;
 	bool8 upload_pending;
 	bool8 upload_cpu_pinned;
+	bool8 viewer_inflight_counted;
 	bool8 is_empty;
 	u8* pixels;
 	renderer_texture_handle_t texture;
@@ -56,6 +57,7 @@ struct tile_cache_t {
 	bool8 lock_initialized;
 	bool8 stopping;
 	i32 active_read_count;
+	i32 inflight_viewer_tile_count;
 	completion_queue_t result_queue;
 	i32 viewer_generation;
 	bool8 viewer_state_initialized;
@@ -70,6 +72,44 @@ struct tile_cache_t {
 
 static int tile_cache_priority_compare(const void* a, const void* b) {
 	return ((load_tile_task_t*)b)->priority - ((load_tile_task_t*)a)->priority;
+}
+
+static bool tile_cache_ssi_tasks_share_chunk(image_t* image,
+		const load_tile_task_t* a, const load_tile_task_t* b) {
+	if (!image || !a || !b || a->level != b->level) return false;
+	level_image_t* level = image->level_images + a->level;
+	i32 a_x = a->tile_index % level->width_in_tiles;
+	i32 a_y = a->tile_index / level->width_in_tiles;
+	i32 b_x = b->tile_index % level->width_in_tiles;
+	i32 b_y = b->tile_index / level->width_in_tiles;
+	return a_x / 4 == b_x / 4 && a_y / 2 == b_y / 2;
+}
+
+static i32 tile_cache_group_complete_ssi_chunks(image_t* image,
+		load_tile_task_t* wishlist, i32 wishlist_count, i32 tile_limit) {
+	load_tile_task_t grouped[TILE_CACHE_VIEWER_WISHLIST_MAX];
+	bool8 consumed[TILE_CACHE_VIEWER_WISHLIST_MAX] = {0};
+	i32 grouped_count = 0;
+	for (i32 anchor_index = 0; anchor_index < wishlist_count; ++anchor_index) {
+		if (consumed[anchor_index]) continue;
+		i32 chunk_count = 0;
+		for (i32 i = anchor_index; i < wishlist_count; ++i) {
+			if (!consumed[i] &&
+			    tile_cache_ssi_tasks_share_chunk(image, wishlist + anchor_index, wishlist + i)) {
+				++chunk_count;
+			}
+		}
+		if (grouped_count + chunk_count > tile_limit) break;
+		for (i32 i = anchor_index; i < wishlist_count; ++i) {
+			if (!consumed[i] &&
+			    tile_cache_ssi_tasks_share_chunk(image, wishlist + anchor_index, wishlist + i)) {
+				grouped[grouped_count++] = wishlist[i];
+				consumed[i] = true;
+			}
+		}
+	}
+	memcpy(wishlist, grouped, grouped_count * sizeof(*wishlist));
+	return grouped_count;
 }
 
 static bool tile_cache_bounds2f_equal(bounds2f a, bounds2f b) {
@@ -93,6 +133,15 @@ static tile_cache_policy_t tile_cache_make_policy(image_t* image) {
 		result.max_inflight_tiles = 32;
 		result.max_submit_per_tick = 8;
 		result.batch_size = 1;
+		result.latency_bound = true;
+	} else if (image->backend == IMAGE_BACKEND_SSI) {
+		/*
+		 * SSI uses fixed 4x2 chunks. Twelve concurrent rectangles were the live
+		 * SlideCenter throughput sweet spot.
+		 */
+		result.max_inflight_tiles = 12 * TILE_LOAD_BATCH_MAX;
+		result.max_submit_per_tick = 12 * TILE_LOAD_BATCH_MAX;
+		result.batch_size = TILE_LOAD_BATCH_MAX;
 		result.latency_bound = true;
 	} else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
 		result.max_inflight_tiles = 32;
@@ -138,6 +187,25 @@ static bool tile_cache_has_hard_demand_locked(tile_cache_tile_t* tile) {
 	return tile->read_region_pin_count > 0 || tile->export_pin_count > 0 ||
 	       tile->registration_pin_count > 0 || hard_cpu_pin_count > 0 ||
 	       tile->gpu_pin_count > 0;
+}
+
+static void tile_cache_mark_viewer_inflight_locked(tile_cache_t* cache,
+		tile_cache_tile_t* tile) {
+	if (!cache || !tile || tile->viewer_inflight_counted ||
+	    !(tile->demand_mask & (TILE_CACHE_DEMAND_VIEWER_VISIBLE |
+	                           TILE_CACHE_DEMAND_VIEWER_PREFETCH))) return;
+	tile->viewer_inflight_counted = true;
+	++cache->inflight_viewer_tile_count;
+}
+
+static void tile_cache_unmark_viewer_inflight_locked(tile_cache_t* cache,
+		tile_cache_tile_t* tile) {
+	if (!cache || !tile || !tile->viewer_inflight_counted) return;
+	tile->viewer_inflight_counted = false;
+	ASSERT(cache->inflight_viewer_tile_count > 0);
+	if (cache->inflight_viewer_tile_count > 0) {
+		--cache->inflight_viewer_tile_count;
+	}
 }
 
 static void tile_cache_add_pin_demand_locked(tile_cache_tile_t* tile, u32 demand_flags) {
@@ -408,6 +476,7 @@ bool tile_cache_apply_result(image_t* image, tile_cache_result_t* result,
 		if (stale || !renderer_available || !result->want_gpu_residency ||
 		    !tile->cpu_resident || !tile->pixels) {
 			tile->upload_pending = false;
+			tile_cache_unmark_viewer_inflight_locked(cache, tile);
 			/*
 			 * A non-renderer consumer retains cached pixels so the viewer can
 			 * reserve a new upload. Stale/invalid work releases viewer-only data.
@@ -426,6 +495,7 @@ bool tile_cache_apply_result(image_t* image, tile_cache_result_t* result,
 
 	tile->decode_in_flight = false;
 	if (stale) {
+		tile_cache_unmark_viewer_inflight_locked(cache, tile);
 		if (!tile->cpu_resident && !tile->gpu_resident) {
 			tile->request_state = TILE_CACHE_UNREQUESTED;
 		}
@@ -435,8 +505,11 @@ bool tile_cache_apply_result(image_t* image, tile_cache_result_t* result,
 	}
 
 	if (!result->pixel_memory) {
-		tile->request_state = result->failed ? TILE_CACHE_FAILED : TILE_CACHE_READY;
-		out_action->mark_empty = result->failed || result->is_empty;
+		tile_cache_unmark_viewer_inflight_locked(cache, tile);
+		tile->request_state = result->retryable_failure ? TILE_CACHE_UNREQUESTED
+		                    : result->failed ? TILE_CACHE_FAILED : TILE_CACHE_READY;
+		out_action->mark_empty = result->is_empty ||
+		                         (result->failed && !result->retryable_failure);
 		platform_mutex_unlock(&cache->lock);
 		return true;
 	}
@@ -474,6 +547,9 @@ bool tile_cache_apply_result(image_t* image, tile_cache_result_t* result,
 		}
 	} else if (!retain_cpu_pixels) {
 		out_action->pixels_to_free = result->pixel_memory;
+	}
+	if (!tile->upload_pending) {
+		tile_cache_unmark_viewer_inflight_locked(cache, tile);
 	}
 
 	platform_mutex_unlock(&cache->lock);
@@ -587,6 +663,7 @@ bool tile_cache_try_begin_decode(image_t* image, i32 level, i32 tile_index, u32 
 	tile->demand_mask |= demand_flags;
 	tile->priority = priority;
 	tile->generation = generation;
+	tile_cache_mark_viewer_inflight_locked(cache, tile);
 	platform_mutex_unlock(&cache->lock);
 	return true;
 }
@@ -610,24 +687,31 @@ bool tile_cache_try_begin_upload(image_t* image, i32 level, i32 tile_index, u32 
 	tile->demand_mask |= demand_flags | TILE_CACHE_DEMAND_GPU_RESIDENCY;
 	tile->priority = priority;
 	tile->generation = generation;
+	tile_cache_mark_viewer_inflight_locked(cache, tile);
 	platform_mutex_unlock(&cache->lock);
 	return true;
 }
 
 void tile_cache_cancel_decode(image_t* image, i32 level, i32 tile_index) {
+	tile_cache_cancel_decode_batch(image, &level, &tile_index, 1);
+}
+
+void tile_cache_cancel_decode_batch(image_t* image, const i32* levels,
+		const i32* tile_indices, i32 tile_count) {
 	tile_cache_t* cache = image ? image->tile_cache : NULL;
-	if (!cache) {
+	if (!cache || !levels || !tile_indices || tile_count <= 0) {
 		return;
 	}
 	platform_mutex_lock(&cache->lock);
-	tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, level, tile_index);
-	if (!tile) {
-		platform_mutex_unlock(&cache->lock);
-		return;
-	}
-	tile->decode_in_flight = false;
-	if (!tile->cpu_resident && !tile->gpu_resident) {
-		tile->request_state = TILE_CACHE_UNREQUESTED;
+	for (i32 i = 0; i < tile_count; ++i) {
+		tile_cache_tile_t* tile = tile_cache_get_tile_locked(
+			cache, levels[i], tile_indices[i]);
+		if (!tile) continue;
+		tile->decode_in_flight = false;
+		tile_cache_unmark_viewer_inflight_locked(cache, tile);
+		if (!tile->cpu_resident && !tile->gpu_resident) {
+			tile->request_state = TILE_CACHE_UNREQUESTED;
+		}
 	}
 	platform_mutex_unlock(&cache->lock);
 }
@@ -645,6 +729,7 @@ void tile_cache_cancel_upload(image_t* image, i32 level, i32 tile_index) {
 		return;
 	}
 	tile->upload_pending = false;
+	tile_cache_unmark_viewer_inflight_locked(cache, tile);
 	pixels_to_free = tile_cache_release_upload_cpu_pin_locked(tile, true);
 	platform_mutex_unlock(&cache->lock);
 	free(pixels_to_free);
@@ -693,6 +778,7 @@ void tile_cache_store_gpu_texture(image_t* image, i32 level, i32 tile_index, ren
 	tile->texture = texture;
 	tile->gpu_resident = true;
 	tile->upload_pending = false;
+	tile_cache_unmark_viewer_inflight_locked(cache, tile);
 	tile->last_gpu_access_time = get_clock();
 	platform_mutex_unlock(&cache->lock);
 }
@@ -712,6 +798,7 @@ renderer_texture_handle_t tile_cache_take_gpu_texture(image_t* image, i32 level,
 	tile->texture = 0;
 	tile->gpu_resident = false;
 	tile->upload_pending = false;
+	tile_cache_unmark_viewer_inflight_locked(cache, tile);
 	platform_mutex_unlock(&cache->lock);
 	return result;
 }
@@ -779,8 +866,9 @@ bool tile_cache_task_is_stale(image_t* image, i32 level, i32 tile_index, i32 gen
 	}
 	platform_mutex_lock(&cache->lock);
 	tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, level, tile_index);
+	/* A still-visible in-flight tile is adopted by the newest viewer generation. */
 	bool result = tile && !tile_cache_has_hard_demand_locked(tile) &&
-	              generation != cache->viewer_generation;
+	              tile->generation != cache->viewer_generation;
 	platform_mutex_unlock(&cache->lock);
 	return result;
 }
@@ -822,26 +910,7 @@ static void tile_cache_update_viewer_generation(tile_cache_t* cache, tile_cache_
 /* cache->lock must be held by the caller. */
 static i32 tile_cache_count_inflight_viewer_tiles_locked(image_t* image) {
 	tile_cache_t* cache = image ? image->tile_cache : NULL;
-	if (!cache) {
-		return 0;
-	}
-	i32 result = 0;
-	for (i32 level = 0; level < image->level_count; ++level) {
-		level_image_t* level_image = image->level_images + level;
-		tile_cache_tile_t* tiles = cache->level_tiles[level];
-		if (!level_image->exists || !tiles) {
-			continue;
-		}
-		for (i32 tile_index = 0; tile_index < level_image->tile_count; ++tile_index) {
-			tile_cache_tile_t* tile = tiles + tile_index;
-			if ((tile->decode_in_flight || tile->upload_pending) &&
-			    (tile->demand_mask & TILE_CACHE_DEMAND_VIEWER_VISIBLE) &&
-			    !tile_cache_has_hard_demand_locked(tile)) {
-				++result;
-			}
-		}
-	}
-	return result;
+	return cache ? cache->inflight_viewer_tile_count : 0;
 }
 
 i32 tile_cache_request_viewer_tiles(image_t* image, tile_cache_viewer_request_t* request) {
@@ -855,6 +924,16 @@ i32 tile_cache_request_viewer_tiles(image_t* image, tile_cache_viewer_request_t*
 		return 0;
 	}
 	tile_cache_update_viewer_generation(cache, request);
+	i32 viewer_generation = cache->viewer_generation;
+	platform_mutex_unlock(&cache->lock);
+	if (image->backend == IMAGE_BACKEND_SSI) {
+		tile_loader_cancel_stale_ssi_pending(image, viewer_generation);
+	}
+	platform_mutex_lock(&cache->lock);
+	if (!tile_cache_accepts_work_locked(cache)) {
+		platform_mutex_unlock(&cache->lock);
+		return 0;
+	}
 
 	i32 inflight_room = cache->policy.max_inflight_tiles - tile_cache_count_inflight_viewer_tiles_locked(image);
 	if (inflight_room <= 0) {
@@ -895,6 +974,14 @@ i32 tile_cache_request_viewer_tiles(image_t* image, tile_cache_viewer_request_t*
 			                                                        image->origin_offset);
 			visible_tiles = clip_bounds2i(visible_tiles, crop_tile_bounds);
 		}
+		bounds2i directly_visible_tiles = visible_tiles;
+		if (image->backend == IMAGE_BACKEND_SSI) {
+			visible_tiles.min.x = (visible_tiles.min.x / 4) * 4;
+			visible_tiles.min.y = (visible_tiles.min.y / 2) * 2;
+			visible_tiles.max.x = ((visible_tiles.max.x + 3) / 4) * 4;
+			visible_tiles.max.y = ((visible_tiles.max.y + 1) / 2) * 2;
+			visible_tiles = clip_bounds2i(visible_tiles, level_tiles_bounds);
+		}
 
 		i32 base_priority = (image->level_count - level) * 100;
 		for (i32 tile_y = visible_tiles.min.y; tile_y < visible_tiles.max.y; ++tile_y) {
@@ -902,24 +989,36 @@ i32 tile_cache_request_viewer_tiles(image_t* image, tile_cache_viewer_request_t*
 				tile_t* geometry = get_tile(level_image, tile_x, tile_y);
 				i32 tile_index = geometry->tile_index;
 				tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, level, tile_index);
-				if (!tile || (tile->gpu_resident && tile->texture != 0) || geometry->is_empty ||
-				    tile->decode_in_flight || tile->upload_pending) {
+				if (!tile || (tile->gpu_resident && tile->texture != 0) || geometry->is_empty) {
 					continue;
 				}
 
+				float priority_x = image->backend == IMAGE_BACKEND_SSI
+					? (float)((tile_x / 4) * 4 + 2) : tile_x + 0.5f;
+				float priority_y = image->backend == IMAGE_BACKEND_SSI
+					? (float)((tile_y / 2) * 2 + 1) : tile_y + 0.5f;
 				float tile_distance_from_center_of_screen_x =
-						(request->camera_center.x - ((tile_x + 0.5f) * level_image->x_tile_side_in_um)) / level_image->um_per_pixel_x;
+						(request->camera_center.x - (priority_x * level_image->x_tile_side_in_um)) / level_image->um_per_pixel_x;
 				float tile_distance_from_center_of_screen_y =
-						(request->camera_center.y - ((tile_y + 0.5f) * level_image->y_tile_side_in_um)) / level_image->um_per_pixel_y;
+						(request->camera_center.y - (priority_y * level_image->y_tile_side_in_um)) / level_image->um_per_pixel_y;
 				float tile_distance_from_center_of_screen =
 						sqrtf(SQUARE(tile_distance_from_center_of_screen_x) + SQUARE(tile_distance_from_center_of_screen_y));
 				tile_distance_from_center_of_screen /= screen_radius;
 				float priority_bonus = (1.0f - tile_distance_from_center_of_screen) * 300.0f;
 				i32 priority = base_priority + (i32)priority_bonus;
 
-				tile->demand_mask |= TILE_CACHE_DEMAND_VIEWER_VISIBLE | TILE_CACHE_DEMAND_GPU_RESIDENCY;
+				bool directly_visible = tile_x >= directly_visible_tiles.min.x &&
+				                        tile_x < directly_visible_tiles.max.x &&
+				                        tile_y >= directly_visible_tiles.min.y &&
+				                        tile_y < directly_visible_tiles.max.y;
+				tile->demand_mask |= (directly_visible ? TILE_CACHE_DEMAND_VIEWER_VISIBLE
+				                                      : TILE_CACHE_DEMAND_VIEWER_PREFETCH) |
+				                     TILE_CACHE_DEMAND_GPU_RESIDENCY;
 				tile->generation = cache->viewer_generation;
 				tile->priority = priority;
+				if (tile->decode_in_flight || tile->upload_pending) {
+					continue;
+				}
 
 				if (wishlist_count >= COUNT(wishlist)) {
 					goto wishlist_full;
@@ -946,5 +1045,9 @@ wishlist_full:
 	qsort(wishlist, wishlist_count, sizeof(load_tile_task_t), tile_cache_priority_compare);
 	i32 tiles_to_load = ATMOST(wishlist_count, policy.max_submit_per_tick);
 	tiles_to_load = ATMOST(tiles_to_load, inflight_room);
+	if (image->backend == IMAGE_BACKEND_SSI) {
+		tiles_to_load = tile_cache_group_complete_ssi_chunks(
+			image, wishlist, wishlist_count, tiles_to_load);
+	}
 	return tile_loader_submit_requests(image, wishlist, tiles_to_load);
 }

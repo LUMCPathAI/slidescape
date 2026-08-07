@@ -18,7 +18,7 @@
 #include "tile_loader.h"
 #include "viewer.h"
 
-extern bool show_dicom_slides_window;
+extern bool show_slide_tray_window;
 
 static char dicomweb_last_status[512];
 static THREAD_LOCAL http_response_error_t dicomweb_last_transport_error;
@@ -822,7 +822,7 @@ bool dicomweb_async_commit_open(app_state_t* app_state,
 	image->resource_id = global_next_resource_id++;
 	unload_all_images(app_state);
 	add_image(app_state, image, true, false);
-	if (image->dicomweb.available_series_count > 1) show_dicom_slides_window = true;
+	if (image->dicomweb.available_series_count > 1) show_slide_tray_window = true;
 	set_status("Opened DICOMweb series with %d pyramid instances.",
 	           image->dicomweb.instance_count);
 	return true;
@@ -1227,7 +1227,7 @@ static bool dicomweb_open_configured_series(app_state_t* app_state,
 	image->resource_id = global_next_resource_id++;
 	unload_all_images(app_state);
 	add_image(app_state, image, true, false);
-	if (image->dicomweb.available_series_count > 1) show_dicom_slides_window = true;
+	if (image->dicomweb.available_series_count > 1) show_slide_tray_window = true;
 	set_status("%s", message);
 	console_print("%s\n", message);
 	return true;

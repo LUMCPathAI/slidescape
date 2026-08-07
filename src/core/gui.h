@@ -73,6 +73,7 @@ void gui_draw(app_state_t* app_state, input_t* input, i32 client_width, i32 clie
 void gui_do_modal_popups();
 void draw_profiler_window(app_state_t* app_state);
 void gui_add_modal_message_popup(const char* title, const char* message, ...);
+void gui_prompt_for_ssi_credentials(const char* uri, const char* status);
 void gui_add_modal_progress_bar_popup(const char* title, float* progress, bool allow_cancel);
 void draw_export_region_dialog(app_state_t* app_state);
 
@@ -100,7 +101,7 @@ extern bool show_dicomweb_archive_window;
 extern bool show_layers_window;
 extern bool show_label_image_window;
 extern bool show_macro_image_window;
-extern bool show_dicom_slides_window;
+extern bool show_slide_tray_window;
 extern bool show_annotations_window;
 extern bool show_annotation_group_assignment_window;
 extern bool show_annotation_group_filter_window;

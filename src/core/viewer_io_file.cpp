@@ -17,6 +17,8 @@
 */
 
 #include "common.h"
+
+#include <ctype.h>
 #include "viewer.h"
 #include "dicom_wsi.h"
 #include "stringutils.h"
@@ -24,11 +26,12 @@
 #include "stb_image.h"
 #include "remote.h"
 #include "jpeg_decoder.h"
+#include "ssi_transport.h"
 #include "tile_cache.h"
 
 #include "gui.h" // for global data, TODO: refactor
 
-static void slide_score_post_tile_result(load_tile_task_t* task, u8* pixel_memory, bool failed, bool is_empty) {
+static void remote_jpeg_post_tile_result(load_tile_task_t* task, u8* pixel_memory, bool failed, bool is_empty) {
 	image_t* image = task->image;
 	level_image_t* level_image = image->level_images + task->level;
 
@@ -42,6 +45,7 @@ static void slide_score_post_tile_result(load_tile_task_t* task, u8* pixel_memor
 	completion_task.want_gpu_residency = task->need_gpu_residency;
 	completion_task.want_cpu_residency = task->need_cpu_residency;
 	completion_task.failed = failed;
+	completion_task.retryable_failure = failed && image->backend == IMAGE_BACKEND_SSI;
 	completion_task.is_empty = is_empty;
 
 	if (!tile_cache_post_load_result(image, &completion_task)) {
@@ -181,10 +185,316 @@ void slide_score_load_tile_batch_func(i32 logical_thread_index, void* userdata) 
 			free(pixel_memory);
 			pixel_memory = NULL;
 		}
-		slide_score_post_tile_result(task, pixel_memory, failed, false);
+		remote_jpeg_post_tile_result(task, pixel_memory, failed, false);
 	}
 
 	atomic_subtract(&image->refcount, refcount_decrement_amount);
+}
+
+typedef struct ssi_tile_stats_t {
+	i32 request_count;
+	i32 useful_tile_count;
+	i32 rectangle_tile_count;
+	i32 decoded_count;
+	i32 stale_count;
+	i32 failed_count;
+	i32 window_request_count;
+	i32 window_useful_tile_count;
+	i32 window_rectangle_tile_count;
+	i32 window_decoded_tile_count;
+	i32 window_request_latency_ms;
+	i32 window_response_kib;
+	i64 window_start_clock;
+	i64 window_last_completion_clock;
+} ssi_tile_stats_t;
+
+static ssi_tile_stats_t ssi_tile_stats;
+static platform_mutex_t ssi_tile_stats_mutex = PLATFORM_MUTEX_INITIALIZER;
+
+static void ssi_record_tile_result(i32 useful_tiles, i32 rectangle_tiles,
+		i32 decoded_tiles, i32 stale_tiles, i32 failed_tiles, i64 request_start_clock,
+		i32 latency_ms, size_t response_size) {
+	platform_mutex_lock(&ssi_tile_stats_mutex);
+	i64 now = get_clock();
+	bool start_new_window = ssi_tile_stats.window_request_count == 0 ||
+		get_seconds_elapsed(ssi_tile_stats.window_last_completion_clock, now) > 1.0f;
+	if (start_new_window) {
+		ssi_tile_stats.window_request_count = 0;
+		ssi_tile_stats.window_useful_tile_count = 0;
+		ssi_tile_stats.window_rectangle_tile_count = 0;
+		ssi_tile_stats.window_decoded_tile_count = 0;
+		ssi_tile_stats.window_request_latency_ms = 0;
+		ssi_tile_stats.window_response_kib = 0;
+		ssi_tile_stats.window_start_clock = request_start_clock;
+	} else if (request_start_clock < ssi_tile_stats.window_start_clock) {
+		ssi_tile_stats.window_start_clock = request_start_clock;
+	}
+	ssi_tile_stats.window_last_completion_clock = now;
+	++ssi_tile_stats.request_count;
+	ssi_tile_stats.useful_tile_count += useful_tiles;
+	ssi_tile_stats.rectangle_tile_count += rectangle_tiles;
+	ssi_tile_stats.decoded_count += decoded_tiles;
+	ssi_tile_stats.stale_count += stale_tiles;
+	ssi_tile_stats.failed_count += failed_tiles;
+	++ssi_tile_stats.window_request_count;
+	ssi_tile_stats.window_useful_tile_count += useful_tiles;
+	ssi_tile_stats.window_rectangle_tile_count += rectangle_tiles;
+	ssi_tile_stats.window_decoded_tile_count += decoded_tiles;
+	ssi_tile_stats.window_request_latency_ms += latency_ms;
+	ssi_tile_stats.window_response_kib += (i32)(response_size / 1024);
+	bool print_stats = ssi_tile_stats.window_request_count % 8 == 0;
+	if (print_stats) {
+		float elapsed = get_seconds_elapsed(ssi_tile_stats.window_start_clock, now);
+		float throughput = elapsed > 0.0f
+			? (float)ssi_tile_stats.window_decoded_tile_count / elapsed : 0.0f;
+		float average_rectangle = (float)ssi_tile_stats.window_rectangle_tile_count /
+		                      (float)ssi_tile_stats.window_request_count;
+		float average_useful = (float)ssi_tile_stats.window_useful_tile_count /
+		                       (float)ssi_tile_stats.window_request_count;
+		float usefulness = ssi_tile_stats.window_rectangle_tile_count > 0
+			? (float)ssi_tile_stats.window_useful_tile_count * 100.0f /
+			  (float)ssi_tile_stats.window_rectangle_tile_count : 0.0f;
+		float average_latency = (float)ssi_tile_stats.window_request_latency_ms /
+		                        (float)ssi_tile_stats.window_request_count;
+		float average_kib = (float)ssi_tile_stats.window_response_kib /
+		                    (float)ssi_tile_stats.window_request_count;
+		ssi_transport_stats_t transport_stats = {};
+		ssi_transport_get_stats(&transport_stats);
+		console_print_verbose(
+			"SSI tile stats: requests=%d, useful tiles=%d, "
+			"rectangle tiles=%d (decoded=%d, stale=%d, failed=%d), "
+			"window=%.1f decoded tiles/s, average rectangle=%.1f tiles, "
+			"average useful=%.1f tiles (%.0f%%), "
+			"average request=%.1f ms, average response=%.1f KiB; "
+			"pool opens=%d, reuses=%d, waits=%d; "
+			"control reuses=%d, fallback handshakes=%d\n",
+			ssi_tile_stats.request_count, ssi_tile_stats.useful_tile_count,
+			ssi_tile_stats.rectangle_tile_count,
+			ssi_tile_stats.decoded_count, ssi_tile_stats.stale_count,
+			ssi_tile_stats.failed_count, throughput, average_rectangle, average_useful,
+			usefulness, average_latency, average_kib,
+			transport_stats.pool_opens, transport_stats.pool_reuses,
+			transport_stats.pool_waits, transport_stats.control_reuses,
+			transport_stats.control_fallback_handshakes);
+	}
+	platform_mutex_unlock(&ssi_tile_stats_mutex);
+}
+
+static bool ssi_response_body_contains(const http_response_t* response, const char* pattern) {
+	if (!response || !response->buffer.data || !pattern || !pattern[0]) return false;
+	size_t pattern_size = strlen(pattern);
+	for (size_t i = 0; i + pattern_size <= response->content_length; ++i) {
+		bool matches = true;
+		for (size_t j = 0; j < pattern_size; ++j) {
+			if (tolower(response->buffer.data[i + j]) != tolower((u8)pattern[j])) {
+				matches = false;
+				break;
+			}
+		}
+		if (matches) return true;
+	}
+	return false;
+}
+
+static bool ssi_response_requires_reauthentication(const http_response_t* response) {
+	if (!response) return false;
+	if (response->status_code == 401 || response->status_code == 403 ||
+	    response->status_code == 404) return true;
+	return response->status_code == 400 &&
+	       (ssi_response_body_contains(response, "token") ||
+	        ssi_response_body_contains(response, "session"));
+}
+
+void ssi_load_tile_batch_func(i32 logical_thread_index, void* userdata) {
+	load_tile_task_batch_t* batch = (load_tile_task_batch_t*)userdata;
+	image_t* image = batch->tile_tasks[0].image;
+	i32 refcount_decrement = 0;
+	for (i32 i = 0; i < batch->task_count; ++i) {
+		refcount_decrement += batch->tile_tasks[i].refcount_to_decrement;
+	}
+	if (image->is_deleted) {
+		atomic_subtract(&image->refcount, refcount_decrement);
+		return;
+	}
+	ASSERT(image->backend == IMAGE_BACKEND_SSI);
+	ssi_remote_image_t* remote = &image->ssi;
+
+	/* Defensive fallback for callers that did not use the compact SSI grouper. */
+	level_image_t* first_level = image->level_images + batch->tile_tasks[0].level;
+	i32 first_x = batch->tile_tasks[0].tile_index % first_level->width_in_tiles;
+	i32 first_y = batch->tile_tasks[0].tile_index / first_level->width_in_tiles;
+	for (i32 i = 1; i < batch->task_count; ++i) {
+		load_tile_task_t* task = batch->tile_tasks + i;
+		level_image_t* level = image->level_images + task->level;
+		i32 tile_x = task->tile_index % level->width_in_tiles;
+		i32 tile_y = task->tile_index / level->width_in_tiles;
+		if (task->level != batch->tile_tasks[0].level ||
+		    tile_x / 4 != first_x / 4 || tile_y / 2 != first_y / 2) {
+			for (i32 single_index = 0; single_index < batch->task_count; ++single_index) {
+				load_tile_task_batch_t single = {0};
+				single.task_count = 1;
+				single.tile_tasks[0] = batch->tile_tasks[single_index];
+				ssi_load_tile_batch_func(logical_thread_index, &single);
+			}
+			return;
+		}
+	}
+
+	load_tile_task_t* active_tasks[TILE_LOAD_BATCH_MAX] = {0};
+	i32 active_count = 0;
+	for (i32 i = 0; i < batch->task_count; ++i) {
+		load_tile_task_t* task = batch->tile_tasks + i;
+		if (task->may_discard_if_stale &&
+		    tile_cache_task_is_stale(image, task->level, task->tile_index, task->generation)) {
+			if (!tile_cache_post_stale_result(image, task->resource_id, task->level,
+			                                  task->tile_index)) {
+				tile_cache_cancel_decode(image, task->level, task->tile_index);
+			}
+			continue;
+		}
+		active_tasks[active_count++] = task;
+	}
+	if (active_count == 0) {
+		atomic_subtract(&image->refcount, refcount_decrement);
+		return;
+	}
+
+	level_image_t* level = image->level_images + active_tasks[0]->level;
+	ssi_level_geometry_t geometry = {0};
+	bool geometry_valid = ssi_get_level_geometry(&remote->properties,
+	                                             active_tasks[0]->level, &geometry);
+	i32 active_tile_x = active_tasks[0]->tile_index % level->width_in_tiles;
+	i32 active_tile_y = active_tasks[0]->tile_index / level->width_in_tiles;
+	i32 block_x_min = (active_tile_x / 4) * 4;
+	i32 block_y_min = (active_tile_y / 2) * 2;
+	i32 tile_x_min = ATLEAST(block_x_min, geometry.tile_x_min);
+	i32 tile_y_min = ATLEAST(block_y_min, geometry.tile_y_min);
+	i32 tile_x_max = ATMOST(block_x_min + 3, geometry.tile_x_max);
+	i32 tile_y_max = ATMOST(block_y_min + 1, geometry.tile_y_max);
+	i32 rectangle_tile_count = geometry_valid
+		? (tile_x_max - tile_x_min + 1) * (tile_y_max - tile_y_min + 1) : 0;
+
+	i64 request_start_clock = get_clock();
+	char path[1024];
+	bool failed = !geometry_valid || !ssi_build_tile_rectangle_path(path, sizeof(path), remote,
+		active_tasks[0]->level, tile_x_min, tile_y_min, tile_x_max, tile_y_max);
+	http_response_t* response = NULL;
+	for (i32 attempt = 0; !failed && attempt < 2; ++attempt) {
+		remote_request_options_t options = {};
+		options.read_poll_timeout_ms = 250;
+		options.write_timeout_seconds = 10.0f;
+		options.idle_read_timeout_seconds = 30.0f;
+		options.total_timeout_seconds = 60.0f;
+		options.max_response_body_size = MEGABYTES(32);
+		response = ssi_transport_request(
+			&remote->endpoint, image, SSI_TRANSPORT_WAIT_FOR_POOL,
+			REMOTE_HTTP_GET, path, "application/octet-stream", NULL,
+			NULL, 0, &options);
+		if (response && response->status_code == 429 && attempt == 0) {
+			http_response_destroy(response);
+			response = NULL;
+			platform_sleep(100);
+			continue;
+		}
+		if (response && response->status_code > 0) {
+			break;
+		}
+		if (response) {
+			http_response_destroy(response);
+			response = NULL;
+		}
+	}
+	if (!response || response->status_code != 200 || response->content_length == 0) {
+		failed = true;
+		if (ssi_response_requires_reauthentication(response)) {
+			atomic_compare_exchange(&remote->reauthentication_state, 1, 0);
+		}
+		console_print_error("[thread %d] SSI rectangle request failed: HTTP %d, "
+		                    "level %d tiles (%d,%d)-(%d,%d).\n", logical_thread_index,
+		                    response ? response->status_code : 0, active_tasks[0]->level,
+		                    tile_x_min, tile_y_min, tile_x_max, tile_y_max);
+	}
+
+	i32 stale_after_request = 0;
+	for (i32 i = 0; i < active_count; ++i) {
+		load_tile_task_t* task = active_tasks[i];
+		if (task->may_discard_if_stale &&
+		    tile_cache_task_is_stale(image, task->level, task->tile_index, task->generation)) {
+			if (!tile_cache_post_stale_result(image, task->resource_id, task->level,
+			                                  task->tile_index)) {
+				tile_cache_cancel_decode(image, task->level, task->tile_index);
+			}
+			active_tasks[i] = NULL;
+			++stale_after_request;
+		}
+	}
+
+	i32 decoded_width = 0;
+	i32 decoded_height = 0;
+	i32 channels = 0;
+	u8* decoded = NULL;
+	if (!failed && stale_after_request < active_count) {
+		decoded = jpeg_decode_image((u8*)response->buffer.data,
+		                            (u32)response->content_length,
+		                            &decoded_width, &decoded_height, &channels);
+		if (!decoded) failed = true;
+	}
+
+	i32 decoded_tile_count = 0;
+	i32 failed_tile_count = 0;
+	for (i32 i = 0; i < active_count; ++i) {
+		load_tile_task_t* task = active_tasks[i];
+		if (!task) continue;
+		size_t pixel_size = level->tile_width * level->tile_height * BYTES_PER_PIXEL;
+		u8* pixels = failed ? NULL : (u8*)malloc(pixel_size);
+		bool tile_failed = failed || pixels == NULL;
+		i32 tile_x = task->tile_index % level->width_in_tiles;
+		i32 tile_y = task->tile_index / level->width_in_tiles;
+		if (!tile_failed) {
+			memset(pixels, image->is_background_black ? 0 : 0xff, pixel_size);
+			i32 source_x = (tile_x - tile_x_min) * level->tile_width;
+			i32 source_y = (tile_y - tile_y_min) * level->tile_height;
+			i32 copy_width = ATMOST((i32)level->tile_width, decoded_width - source_x);
+			i32 copy_height = ATMOST((i32)level->tile_height, decoded_height - source_y);
+			if (copy_width <= 0 || copy_height <= 0) {
+				tile_failed = true;
+			} else {
+				for (i32 row = 0; row < copy_height; ++row) {
+					memcpy(pixels + row * level->tile_width * BYTES_PER_PIXEL,
+					       decoded + ((source_y + row) * decoded_width + source_x) * BYTES_PER_PIXEL,
+					       copy_width * BYTES_PER_PIXEL);
+				}
+			}
+		}
+		if (tile_failed) {
+			free(pixels);
+			pixels = NULL;
+			++failed_tile_count;
+		} else {
+			++decoded_tile_count;
+			if (atomic_compare_exchange(&remote->first_tile_decoded_reported, 1, 0)) {
+				ssi_transport_stats_t transport_stats = {};
+				ssi_transport_get_stats(&transport_stats);
+				console_print_verbose(
+					"SSI first tile decoded: %d ms after viewer ready "
+					"(level=%d, tile=%d,%d; pool opens=%d, reuses=%d, waits=%d)\n",
+					(i32)(get_seconds_elapsed(remote->viewer_ready_clock, get_clock()) * 1000.0f + 0.5f),
+					task->level, tile_x, tile_y,
+					transport_stats.pool_opens, transport_stats.pool_reuses,
+					transport_stats.pool_waits);
+			}
+		}
+		remote_jpeg_post_tile_result(task, pixels, tile_failed, false);
+	}
+	free(decoded);
+	i32 request_latency_ms = (i32)(
+		get_seconds_elapsed(request_start_clock, get_clock()) * 1000.0f + 0.5f);
+	ssi_record_tile_result(active_count, rectangle_tile_count, decoded_tile_count,
+	                       stale_after_request, failed_tile_count,
+	                       request_start_clock, request_latency_ms,
+	                       response ? response->content_length : 0);
+	if (response) http_response_destroy(response);
+	atomic_subtract(&image->refcount, refcount_decrement);
 }
 
 
@@ -203,7 +513,7 @@ bool viewer_load_new_image(app_state_t* app_state, file_info_t* file, directory_
 		add_image(app_state, image, is_base_image, !is_base_image);
 		if (is_base_image && image->backend == IMAGE_BACKEND_DICOM &&
 		    arrlen(image->dicom.slides) > 1) {
-			show_dicom_slides_window = true;
+			show_slide_tray_window = true;
 		}
 
         if (is_base_image) {

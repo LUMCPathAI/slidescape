@@ -20,6 +20,7 @@
 #include "viewer.h"
 #include "slide_score.h"
 #include "dicomweb_client.h"
+#include "ssi.h"
 #include "gui.h"
 #include "stringutils.h"
 
@@ -122,6 +123,14 @@ bool app_write_slide_score_api_key(const char* api_key) {
 }
 
 bool app_load_input(app_state_t* app_state, const char* input, u32 filetype_hint) {
+	if (filetype_hint == 0 && ssi_uri_is_supported(input)) {
+		if (ssi_try_open_uri(app_state, input)) return true;
+		if (!app_state->headless) {
+			gui_prompt_for_ssi_credentials(input, ssi_get_last_status());
+			return true;
+		}
+		return false;
+	}
 	if (filetype_hint == 0 && (strncmp(input, "https://", 8) == 0 ||
 	                           strncmp(input, "http://", 7) == 0) &&
 	    strstr(input, "/studies/") && strstr(input, "/series/")) {

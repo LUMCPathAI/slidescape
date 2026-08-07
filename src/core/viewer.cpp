@@ -218,6 +218,8 @@ void init_app_state(app_state_t* app_state, app_command_t command) {
 	tile_loader_set_remote_tiff_batch_callback(tiff_load_tile_batch_func);
 	tile_loader_set_slide_score_batch_callback(slide_score_load_tile_batch_func);
 	tile_loader_set_dicomweb_batch_callback(dicomweb_load_tile_batch_func);
+	tile_loader_set_ssi_batch_callback(ssi_load_tile_batch_func);
+	image_set_ssi_close_callback(ssi_close_remote_image);
 
 	app_state->command = command;
 	app_state->headless = command.headless;
@@ -322,6 +324,13 @@ static bool viewer_process_loaded_tile(app_state_t* app_state, image_t* image, t
 	}
 
 	if (action.should_upload && action.upload_pixels) {
+		if (image->backend == IMAGE_BACKEND_SSI &&
+		    atomic_compare_exchange(&image->ssi.first_tile_displayed_reported, 1, 0)) {
+			console_print_verbose(
+				"SSI first tile submitted for display: %d ms after viewer ready\n",
+				(i32)(get_seconds_elapsed(image->ssi.viewer_ready_clock, get_clock()) *
+				      1000.0f + 0.5f));
+		}
 		pixel_transfer_state_t* transfer_state =
 				renderer_submit_texture_upload(app_state, task->tile_width, task->tile_height,
 				                               4, action.upload_pixels, finalize_textures_immediately);
@@ -415,6 +424,10 @@ void viewer_process_completion_queue(app_state_t* app_state) {
 			task.is_empty = isyntax_task->is_empty;
 			task.failed = isyntax_task->failed;
             viewer_process_loaded_tile(app_state, image, &task);
+		} else if (entry.kind == SSI_COMPLETION_EVENT_OPTIONAL_DATA) {
+			void* result_pointer = NULL;
+			memcpy(&result_pointer, entry.userdata, sizeof(result_pointer));
+			ssi_commit_optional_data(app_state, result_pointer);
         }
 
 		float time_elapsed = get_seconds_elapsed(app_state->last_frame_start, get_clock());
@@ -709,8 +722,8 @@ void update_and_render_image(app_state_t* app_state, image_t* image) {
 
 				if (scene->is_cropped) {
 					bounds2i crop_tile_bounds = world_bounds_to_tile_bounds(&scene->crop_bounds,
-																			drawn_level->x_tile_side_in_um,
-																			drawn_level->y_tile_side_in_um, image->origin_offset);
+															drawn_level->x_tile_side_in_um,
+															drawn_level->y_tile_side_in_um, image->origin_offset);
 					visible_tiles = clip_bounds2i(visible_tiles, crop_tile_bounds);
 				}
 

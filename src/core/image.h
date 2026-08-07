@@ -31,6 +31,7 @@
 #include "dicom.h"
 #include "dicomweb.h"
 #include "slide_score.h"
+#include "ssi.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -109,6 +110,7 @@ typedef enum {
     IMAGE_BACKEND_MRXS,
     IMAGE_BACKEND_SLIDE_SCORE,
     IMAGE_BACKEND_DICOMWEB,
+    IMAGE_BACKEND_SSI,
 } image_backend_enum;
 
 typedef struct tile_t {
@@ -180,6 +182,7 @@ typedef struct image_t {
         mrxs_t mrxs;
         slide_score_remote_image_t slide_score;
         dicomweb_remote_image_t dicomweb;
+		ssi_remote_image_t ssi;
     };
     i32 level_count;
     u32 tile_width;
@@ -230,11 +233,13 @@ u8* decode_associated_image_from_isyntax(isyntax_t* isyntax, isyntax_image_t* im
 bool init_image_from_isyntax(image_t* image, isyntax_t* isyntax, bool is_overlay);
 bool init_image_from_dicom(image_t* image, dicom_series_t* dicom, bool is_overlay);
 bool init_image_from_dicomweb(image_t* image, const dicomweb_remote_image_t* remote, bool is_overlay);
+bool init_image_from_ssi(image_t* image, const ssi_remote_image_t* remote, bool is_overlay);
 bool init_image_from_mrxs(image_t* image, mrxs_t* mrxs, bool is_overlay);
 bool init_image_from_stbi(image_t* image, simple_image_t* simple, bool is_overlay);
 void init_image_from_openslide(image_t* image, wsi_t* wsi, bool is_overlay);
 void unload_openslide_wsi(wsi_t* wsi);
 bool image_initialize_runtime(image_t* image);
+void image_set_ssi_close_callback(void (*callback)(ssi_remote_image_t* remote));
 bool image_read_region(image_t* image, i32 level, i32 x, i32 y, i32 w, i32 h, void* dest, pixel_format_enum desired_pixel_format);
 void begin_level_image_indexing(image_t* image, level_image_t* level_image, i32 scale);
 void image_destroy(image_t* image);

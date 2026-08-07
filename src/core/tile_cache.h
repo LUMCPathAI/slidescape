@@ -75,6 +75,7 @@ typedef struct tile_cache_result_t {
 	bool8 want_cpu_residency;
 	bool8 is_empty;
 	bool8 failed;
+	bool8 retryable_failure;
 	bool8 stale;
 	bool8 upload_from_cached_pixels;
 } tile_cache_result_t;
@@ -110,6 +111,8 @@ bool tile_cache_tile_is_busy(image_t* image, i32 level, i32 tile_index);
 bool tile_cache_try_begin_decode(image_t* image, i32 level, i32 tile_index, u32 demand_flags, i32 priority, i32 generation);
 bool tile_cache_try_begin_upload(image_t* image, i32 level, i32 tile_index, u32 demand_flags, i32 priority, i32 generation);
 void tile_cache_cancel_decode(image_t* image, i32 level, i32 tile_index);
+void tile_cache_cancel_decode_batch(image_t* image, const i32* levels,
+		const i32* tile_indices, i32 tile_count);
 void tile_cache_cancel_upload(image_t* image, i32 level, i32 tile_index);
 void tile_cache_release_upload_cpu_pin(image_t* image, i32 level, i32 tile_index);
 renderer_texture_handle_t tile_cache_get_gpu_texture(image_t* image, i32 level, i32 tile_index);

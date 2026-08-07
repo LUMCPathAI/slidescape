@@ -20,6 +20,7 @@
 #include "common.h"
 #include "viewer.h"
 #include "http_response_parser.h"
+#include "http_request.h"
 
 typedef struct tls_connection_t tls_connection_t;
 
@@ -61,6 +62,11 @@ http_response_t* remote_connection_request_with_headers_and_options(
 	tls_connection_t* connection, const char* host, const char* path, const char* accept,
 	const char* extra_headers, bool close_after_request,
 	const remote_request_options_t* options);
+http_response_t* remote_connection_request_http(
+	tls_connection_t* connection, const char* host, remote_http_method_t method,
+	const char* path, const char* accept, const char* content_type,
+	const void* body, size_t body_size, const char* extra_headers,
+	bool close_after_request, const remote_request_options_t* options);
 void http_response_destroy(http_response_t* response);
 
 #if DO_DEBUG

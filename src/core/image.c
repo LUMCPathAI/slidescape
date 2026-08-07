@@ -29,6 +29,12 @@
 #include "tile_loader.h"
 #include "tile_cache.h"
 
+static void (*ssi_close_callback)(ssi_remote_image_t* remote);
+
+void image_set_ssi_close_callback(void (*callback)(ssi_remote_image_t* remote)) {
+	ssi_close_callback = callback;
+}
+
 const char* get_image_backend_name(image_t* image) {
     const char* result = "--";
     if (image->backend == IMAGE_BACKEND_TIFF) {
@@ -45,6 +51,8 @@ const char* get_image_backend_name(image_t* image) {
         result = "Slide Score";
     } else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
         result = "DICOMweb";
+    } else if (image->backend == IMAGE_BACKEND_SSI) {
+        result = "3DHISTECH SSI";
     } else if (image->backend == IMAGE_BACKEND_STBI) {
         result = "stb_image";
     }
@@ -68,6 +76,8 @@ const char* get_image_descriptive_type_name(image_t* image) {
             result = "WSI (Slide Score)";
         } else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
             result = "WSI (DICOMweb)";
+        } else if (image->backend == IMAGE_BACKEND_SSI) {
+            result = "WSI (3DHISTECH SSI)";
         } else if (image->backend == IMAGE_BACKEND_STBI) {
             result = "Simple image";
         }
@@ -384,6 +394,74 @@ bool init_image_from_slide_score(image_t* image, slide_score_remote_image_t* rem
 
     image->is_valid = true;
     return true;
+}
+
+bool init_image_from_ssi(image_t* image, const ssi_remote_image_t* remote, bool is_overlay) {
+	(void)is_overlay;
+	if (!image || !remote || remote->properties.width <= 0 || remote->properties.height <= 0) {
+		return false;
+	}
+	image->type = IMAGE_TYPE_WSI;
+	image->backend = IMAGE_BACKEND_SSI;
+	image->ssi = *remote;
+	image->is_local = false;
+	image->is_freshly_loaded = true;
+	image->is_background_black = !remote->properties.is_brightfield;
+	image->mpp_x = remote->properties.mpp_x > 0.0f ? remote->properties.mpp_x : 1.0f;
+	image->mpp_y = remote->properties.mpp_y > 0.0f ? remote->properties.mpp_y : 1.0f;
+	image->is_mpp_known = remote->properties.mpp_x > 0.0f && remote->properties.mpp_y > 0.0f;
+	image->tile_width = 256;
+	image->tile_height = 256;
+	image->width_in_pixels = remote->properties.width;
+	image->height_in_pixels = remote->properties.height;
+	image->width_in_um = image->width_in_pixels * image->mpp_x;
+	image->height_in_um = image->height_in_pixels * image->mpp_y;
+	image->clip_rects[0] = RECT2F(0.0f, 0.0f, image->width_in_um, image->height_in_um);
+	image->clip_rect_count = 1;
+	snprintf(image->name, sizeof(image->name), "%s",
+	         remote->display_name[0] ? remote->display_name :
+	         (remote->properties.original_name[0] ? remote->properties.original_name : "SSI slide"));
+	snprintf(image->directory, sizeof(image->directory), "%s://%s%s",
+	         remote->endpoint.use_tls ? "https" : "http", remote->endpoint.host_header,
+	         remote->endpoint.root);
+
+	image->level_count = ATMOST(remote->properties.magnification_level_max + 1,
+	                           IMAGE_PYRAMID_MAX_LEVELS);
+	for (i32 level_index = 0; level_index < image->level_count; ++level_index) {
+		i64 downsample = (i64)1 << level_index;
+		ssi_level_geometry_t geometry = {0};
+		if (!ssi_get_level_geometry(&remote->properties, level_index, &geometry)) return false;
+		level_image_t* level = image->level_images + level_index;
+		level->exists = true;
+		level->pyramid_image_index = level_index;
+		level->downsample_factor = (float)downsample;
+		level->width_in_pixels = ceil_div_i64(image->width_in_pixels, downsample);
+		level->height_in_pixels = ceil_div_i64(image->height_in_pixels, downsample);
+		level->tile_width = image->tile_width;
+		level->tile_height = image->tile_height;
+		level->width_in_tiles = (u32)geometry.width_in_tiles;
+		level->height_in_tiles = (u32)geometry.height_in_tiles;
+		level->tile_count = level->width_in_tiles * level->height_in_tiles;
+		level->um_per_pixel_x = image->mpp_x * level->downsample_factor;
+		level->um_per_pixel_y = image->mpp_y * level->downsample_factor;
+		level->x_tile_side_in_um = level->um_per_pixel_x * (float)level->tile_width;
+		level->y_tile_side_in_um = level->um_per_pixel_y * (float)level->tile_height;
+		level->tiles = (tile_t*)calloc(1, level->tile_count * sizeof(tile_t));
+		if (!level->tiles) return false;
+		for (i32 tile_index = 0; tile_index < level->tile_count; ++tile_index) {
+			level->tiles[tile_index].tile_index = tile_index;
+			level->tiles[tile_index].tile_x = tile_index % level->width_in_tiles;
+			level->tiles[tile_index].tile_y = tile_index / level->width_in_tiles;
+			if (level->tiles[tile_index].tile_x < geometry.tile_x_min ||
+			    level->tiles[tile_index].tile_x > geometry.tile_x_max ||
+			    level->tiles[tile_index].tile_y < geometry.tile_y_min ||
+			    level->tiles[tile_index].tile_y > geometry.tile_y_max) {
+				level->tiles[tile_index].is_empty = true;
+			}
+		}
+	}
+	image->is_valid = true;
+	return true;
 }
 
 u8* decode_associated_image_from_isyntax(isyntax_t* isyntax, isyntax_image_t* image) {
@@ -1241,7 +1319,8 @@ static bool image_read_region_impl(image_t* image, i32 level, i32 x, i32 y, i32 
         } break;
         case IMAGE_BACKEND_TIFF:
         case IMAGE_BACKEND_DICOM:
-        case IMAGE_BACKEND_DICOMWEB:
+		case IMAGE_BACKEND_DICOMWEB:
+		case IMAGE_BACKEND_SSI:
         case IMAGE_BACKEND_MRXS:
         case IMAGE_BACKEND_STBI: {
 			level_image_t* level_image = image->level_images + level;
@@ -1691,6 +1770,8 @@ void image_destroy(image_t* image) {
 				DUMMY_STATEMENT;
 			} else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
 				dicomweb_remote_image_destroy(&image->dicomweb);
+			} else if (image->backend == IMAGE_BACKEND_SSI) {
+				if (ssi_close_callback) ssi_close_callback(&image->ssi);
 			} else if (image->backend == IMAGE_BACKEND_STBI) {
 				if (image->simple.pixels) {
 					stbi_image_free(image->simple.pixels);

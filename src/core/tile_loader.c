@@ -26,6 +26,21 @@
 static work_queue_callback_t* remote_tiff_load_tile_batch_func;
 static work_queue_callback_t* slide_score_load_tile_batch_func;
 static work_queue_callback_t* dicomweb_load_tile_batch_func;
+static work_queue_callback_t* ssi_load_tile_batch_callback;
+
+#define SSI_PENDING_BATCH_MAX 128
+#define SSI_PENDING_WORKER_MAX 12
+
+typedef struct ssi_pending_batch_queue_t {
+	platform_mutex_t mutex;
+	load_tile_task_batch_t batches[SSI_PENDING_BATCH_MAX];
+	i32 batch_count;
+	i32 pump_count;
+} ssi_pending_batch_queue_t;
+
+static ssi_pending_batch_queue_t ssi_pending_queue = {
+	.mutex = PLATFORM_MUTEX_INITIALIZER,
+};
 
 void tile_loader_set_remote_tiff_batch_callback(work_queue_callback_t* callback) {
 	remote_tiff_load_tile_batch_func = callback;
@@ -37,6 +52,140 @@ void tile_loader_set_slide_score_batch_callback(work_queue_callback_t* callback)
 
 void tile_loader_set_dicomweb_batch_callback(work_queue_callback_t* callback) {
 	dicomweb_load_tile_batch_func = callback;
+}
+
+void tile_loader_set_ssi_batch_callback(work_queue_callback_t* callback) {
+	ssi_load_tile_batch_callback = callback;
+}
+
+static void ssi_pending_batch_release(load_tile_task_batch_t* batch, bool cancel_tiles) {
+	if (!batch || batch->task_count <= 0) return;
+	i32 refcount_decrement = 0;
+	i32 levels[TILE_LOAD_BATCH_MAX];
+	i32 tile_indices[TILE_LOAD_BATCH_MAX];
+	for (i32 i = 0; i < batch->task_count; ++i) {
+		load_tile_task_t* task = batch->tile_tasks + i;
+		refcount_decrement += task->refcount_to_decrement;
+		levels[i] = task->level;
+		tile_indices[i] = task->tile_index;
+	}
+	if (cancel_tiles) {
+		tile_cache_cancel_decode_batch(batch->tile_tasks[0].image,
+		                               levels, tile_indices, batch->task_count);
+	}
+	atomic_subtract(&batch->tile_tasks[0].image->refcount, refcount_decrement);
+	task_group_end(batch->tile_tasks[0].task_group);
+}
+
+void tile_loader_cancel_stale_ssi_pending(image_t* image, i32 viewer_generation) {
+	if (!image || image->backend != IMAGE_BACKEND_SSI) return;
+	load_tile_task_batch_t cancelled_batches[SSI_PENDING_BATCH_MAX];
+	i32 cancelled_batch_count = 0;
+	platform_mutex_lock(&ssi_pending_queue.mutex);
+	for (i32 i = 0; i < ssi_pending_queue.batch_count;) {
+		load_tile_task_batch_t* batch = ssi_pending_queue.batches + i;
+		if (batch->tile_tasks[0].image == image &&
+		    batch->tile_tasks[0].generation != viewer_generation) {
+			cancelled_batches[cancelled_batch_count++] = *batch;
+			ssi_pending_queue.batches[i] =
+				ssi_pending_queue.batches[--ssi_pending_queue.batch_count];
+			continue;
+		}
+		++i;
+	}
+	platform_mutex_unlock(&ssi_pending_queue.mutex);
+	if (cancelled_batch_count > 0) {
+		i32 levels[SSI_PENDING_BATCH_MAX * TILE_LOAD_BATCH_MAX];
+		i32 tile_indices[SSI_PENDING_BATCH_MAX * TILE_LOAD_BATCH_MAX];
+		i32 cancelled_tile_count = 0;
+		for (i32 batch_index = 0; batch_index < cancelled_batch_count; ++batch_index) {
+			load_tile_task_batch_t* batch = cancelled_batches + batch_index;
+			for (i32 tile_index = 0; tile_index < batch->task_count; ++tile_index) {
+				levels[cancelled_tile_count] = batch->tile_tasks[tile_index].level;
+				tile_indices[cancelled_tile_count] = batch->tile_tasks[tile_index].tile_index;
+				++cancelled_tile_count;
+			}
+		}
+		tile_cache_cancel_decode_batch(image, levels, tile_indices, cancelled_tile_count);
+		for (i32 batch_index = 0; batch_index < cancelled_batch_count; ++batch_index) {
+			ssi_pending_batch_release(cancelled_batches + batch_index, false);
+		}
+		console_print_verbose("SSI pending queue: discarded %d stale chunks (%d tiles) "
+		                      "for viewer generation %d\n",
+		                      cancelled_batch_count, cancelled_tile_count,
+		                      viewer_generation);
+	}
+}
+
+static void ssi_pending_pump(i32 logical_thread_index, void* userdata) {
+	for (;;) {
+		load_tile_task_batch_t batch = {0};
+		platform_mutex_lock(&ssi_pending_queue.mutex);
+		if (ssi_pending_queue.batch_count == 0) {
+			--ssi_pending_queue.pump_count;
+			platform_mutex_unlock(&ssi_pending_queue.mutex);
+			return;
+		}
+		i32 selected_index = 0;
+		for (i32 i = 1; i < ssi_pending_queue.batch_count; ++i) {
+			if (ssi_pending_queue.batches[i].tile_tasks[0].priority >
+			    ssi_pending_queue.batches[selected_index].tile_tasks[0].priority) {
+				selected_index = i;
+			}
+		}
+		batch = ssi_pending_queue.batches[selected_index];
+		ssi_pending_queue.batches[selected_index] =
+			ssi_pending_queue.batches[--ssi_pending_queue.batch_count];
+		platform_mutex_unlock(&ssi_pending_queue.mutex);
+
+		ssi_load_tile_batch_callback(logical_thread_index, &batch);
+		task_group_end(batch.tile_tasks[0].task_group);
+	}
+}
+
+static bool ssi_pending_enqueue(load_tile_task_batch_t* batch) {
+	if (!batch || batch->task_count <= 0 || !ssi_load_tile_batch_callback) return false;
+	platform_mutex_lock(&ssi_pending_queue.mutex);
+	if (ssi_pending_queue.batch_count >= SSI_PENDING_BATCH_MAX) {
+		platform_mutex_unlock(&ssi_pending_queue.mutex);
+		return false;
+	}
+	task_group_begin(batch->tile_tasks[0].task_group);
+	for (i32 i = 0; i < batch->task_count; ++i) {
+		atomic_add(&batch->tile_tasks[i].image->refcount,
+		           batch->tile_tasks[i].refcount_to_decrement);
+	}
+	ssi_pending_queue.batches[ssi_pending_queue.batch_count++] = *batch;
+	bool start_pump = ssi_pending_queue.pump_count < SSI_PENDING_WORKER_MAX;
+	if (start_pump) ++ssi_pending_queue.pump_count;
+	platform_mutex_unlock(&ssi_pending_queue.mutex);
+
+	if (start_pump && !thread_pool_submit_task(&global_thread_pool,
+	                                          ssi_pending_pump, NULL, 0)) {
+		load_tile_task_batch_t cancelled = {0};
+		platform_mutex_lock(&ssi_pending_queue.mutex);
+		--ssi_pending_queue.pump_count;
+		if (ssi_pending_queue.pump_count == 0) {
+			for (i32 i = 0; i < ssi_pending_queue.batch_count; ++i) {
+				load_tile_task_batch_t* candidate = ssi_pending_queue.batches + i;
+				if (candidate->tile_tasks[0].image == batch->tile_tasks[0].image &&
+				    candidate->tile_tasks[0].level == batch->tile_tasks[0].level &&
+				    candidate->tile_tasks[0].tile_index == batch->tile_tasks[0].tile_index &&
+				    candidate->tile_tasks[0].generation == batch->tile_tasks[0].generation) {
+					cancelled = *candidate;
+					* candidate = ssi_pending_queue.batches[--ssi_pending_queue.batch_count];
+					break;
+				}
+			}
+		}
+		platform_mutex_unlock(&ssi_pending_queue.mutex);
+		if (cancelled.task_count > 0) {
+			ssi_pending_batch_release(&cancelled, true);
+			return false;
+		}
+		/* Another active pump can still consume the queued batch. */
+	}
+	return true;
 }
 
 static void tile_loader_get_tile_xy(image_t* image, i32 level, i32 tile_index, i32* out_tile_x, i32* out_tile_y) {
@@ -51,13 +200,51 @@ static void tile_loader_post_stale_result(load_tile_task_t* task) {
 	}
 }
 
+static bool ssi_tasks_share_rectangle_block(image_t* image,
+		const load_tile_task_t* anchor, const load_tile_task_t* candidate) {
+	if (!image || !anchor || !candidate || anchor->level != candidate->level) return false;
+	i32 anchor_x = 0;
+	i32 anchor_y = 0;
+	i32 candidate_x = 0;
+	i32 candidate_y = 0;
+	tile_loader_get_tile_xy(image, anchor->level, anchor->tile_index, &anchor_x, &anchor_y);
+	tile_loader_get_tile_xy(image, candidate->level, candidate->tile_index,
+	                        &candidate_x, &candidate_y);
+	return anchor_x / 4 == candidate_x / 4 && anchor_y / 2 == candidate_y / 2;
+}
+
+static i32 ssi_group_rectangle_tasks(image_t* image, load_tile_task_t* wishlist,
+		i32 first_tile, i32 tiles_to_load, i32 max_batch_size) {
+	load_tile_task_t anchor = wishlist[first_tile];
+	i32 selected_count = 0;
+	while (selected_count < max_batch_size) {
+		i32 selected_index = -1;
+		for (i32 i = first_tile + selected_count; i < tiles_to_load; ++i) {
+			if (ssi_tasks_share_rectangle_block(image, &anchor, wishlist + i)) {
+				selected_index = i;
+				break;
+			}
+		}
+		if (selected_index < 0) break;
+		load_tile_task_t swap = wishlist[first_tile + selected_count];
+		wishlist[first_tile + selected_count] = wishlist[selected_index];
+		wishlist[selected_index] = swap;
+		++selected_count;
+	}
+	return selected_count;
+}
+
 i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 tiles_to_load) {
 	i32 tasks_waiting = thread_pool_get_task_count(&global_thread_pool);
 	i32 max_acceptable_tasks = thread_pool_get_task_capacity(&global_thread_pool);
 	i32 usable_slots = max_acceptable_tasks - tasks_waiting;
-	if (tiles_to_load > usable_slots) {
+	i32 tile_capacity = usable_slots;
+	if (image->backend == IMAGE_BACKEND_SSI) {
+		tile_capacity *= TILE_LOAD_BATCH_MAX;
+	}
+	if (tiles_to_load > tile_capacity) {
 		console_print_error("tile_loader_submit_requests(): requested %d tiles, but only %d tasks fit into the work queue", tiles_to_load, usable_slots);
-		tiles_to_load = usable_slots;
+		tiles_to_load = tile_capacity;
 	}
 
 	i32 tile_loads_submitted = 0;
@@ -65,7 +252,8 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 	if (tiles_to_load > 0) {
 		bool use_remote_batch = (image->backend == IMAGE_BACKEND_TIFF && image->tiff.is_remote) ||
 		                        image->backend == IMAGE_BACKEND_SLIDE_SCORE ||
-		                        image->backend == IMAGE_BACKEND_DICOMWEB;
+		                        image->backend == IMAGE_BACKEND_DICOMWEB ||
+		                        image->backend == IMAGE_BACKEND_SSI;
 		if (use_remote_batch) {
 			work_queue_callback_t* load_func = NULL;
 			u32 intermittent_interval = 1;
@@ -76,6 +264,8 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 				load_func = slide_score_load_tile_batch_func;
 			} else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
 				load_func = dicomweb_load_tile_batch_func;
+			} else if (image->backend == IMAGE_BACKEND_SSI) {
+				load_func = ssi_load_tile_batch_callback;
 			}
 
 			if (!load_func) {
@@ -88,15 +278,23 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 			static u32 intermittent = 0;
 			++intermittent;
 			if (intermittent % intermittent_interval == 0) {
+				i32 work_items_submitted = 0;
 				i32 policy_batch_size = TILE_LOAD_BATCH_MAX;
 				tile_cache_policy_t policy = tile_cache_get_policy(image);
 				if (policy.batch_size > 0) {
 					policy_batch_size = policy.batch_size;
 				}
 				policy_batch_size = CLAMP(policy_batch_size, 1, TILE_LOAD_BATCH_MAX);
-				for (i32 first_tile = 0; first_tile < tiles_to_load; first_tile += policy_batch_size) {
+				for (i32 first_tile = 0;
+				     first_tile < tiles_to_load && work_items_submitted < usable_slots;) {
+					i32 candidate_count = ATMOST(policy_batch_size, tiles_to_load - first_tile);
+					if (image->backend == IMAGE_BACKEND_SSI) {
+						candidate_count = ssi_group_rectangle_tasks(image, wishlist, first_tile,
+						                                            tiles_to_load, policy_batch_size);
+					}
+					ASSERT(candidate_count > 0);
 					load_tile_task_batch_t batch = {0};
-					for (i32 i = first_tile; i < tiles_to_load && batch.task_count < policy_batch_size; ++i) {
+					for (i32 i = first_tile; i < first_tile + candidate_count; ++i) {
 						load_tile_task_t* task = wishlist + i;
 						u32 demand_flags = task->need_gpu_residency ? TILE_CACHE_DEMAND_GPU_RESIDENCY : 0;
 						demand_flags |= task->need_cpu_residency ? TILE_CACHE_DEMAND_CPU_RESIDENCY : 0;
@@ -107,12 +305,21 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 						}
 					}
 					if (batch.task_count == 0) {
+						first_tile += candidate_count;
 						continue;
 					}
-					if (thread_pool_submit_task_to_group(&global_thread_pool, batch.tile_tasks[0].task_group, load_func, &batch, sizeof(batch))) {
+					bool submitted = image->backend == IMAGE_BACKEND_SSI
+						? ssi_pending_enqueue(&batch)
+						: thread_pool_submit_task_to_group(&global_thread_pool,
+						                                   batch.tile_tasks[0].task_group,
+						                                   load_func, &batch, sizeof(batch));
+					if (submitted) {
+						++work_items_submitted;
 						for (i32 i = 0; i < batch.task_count; ++i) {
 							load_tile_task_t* task = batch.tile_tasks + i;
-							atomic_add(&image->refcount, task->refcount_to_decrement);
+							if (image->backend != IMAGE_BACKEND_SSI) {
+								atomic_add(&image->refcount, task->refcount_to_decrement);
+							}
 							++tile_loads_submitted;
 						}
 					} else {
@@ -121,6 +328,7 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 							tile_cache_cancel_decode(image, task->level, task->tile_index);
 						}
 					}
+					first_tile += candidate_count;
 				}
 			}
 		} else {

@@ -698,42 +698,6 @@ static i32 remote_build_get_request(char* request, size_t request_size, const ch
                     close_after_request ? "close" : "keep-alive", host);
 }
 
-static i32 remote_build_get_request_with_headers(char* request, size_t request_size,
-                                                 const char* host, const char* path,
-                                                 const char* accept, const char* extra_headers,
-                                                 bool close_after_request) {
-	if (!host || !host[0] || !path || path[0] != '/') return -1;
-	for (const u8* p = (const u8*)host; *p; ++p) {
-		if (*p <= 0x20 || *p == 0x7f) return -1;
-	}
-	for (const u8* p = (const u8*)path; *p; ++p) {
-		if (*p <= 0x20 || *p == 0x7f) return -1;
-	}
-	if (accept) {
-		for (const u8* p = (const u8*)accept; *p; ++p) {
-			if (*p == '\r' || *p == '\n' || *p == 0x7f) return -1;
-		}
-	}
-	if (extra_headers) {
-		if (strstr(extra_headers, "\r\n\r\n")) return -1;
-		for (const u8* p = (const u8*)extra_headers; *p; ++p) {
-			if (*p == 0x7f || (*p < 0x20 && *p != '\r' && *p != '\n' && *p != '\t')) {
-				return -1;
-			}
-			if (*p == '\r' && p[1] != '\n') return -1;
-			if (*p == '\n' && (p == (const u8*)extra_headers || p[-1] != '\r')) return -1;
-		}
-	}
-    return snprintf(request, request_size,
-                    "GET %s HTTP/1.1\r\n"
-                    "Accept: %s\r\n"
-                    "%s"
-                    "Connection: %s\r\n"
-                    "Host: %s\r\n\r\n",
-                    path, accept ? accept : "*/*", extra_headers ? extra_headers : "",
-                    close_after_request ? "close" : "keep-alive", host);
-}
-
 static tls_connection_t* remote_connection_open_plain(const char* hostname, i32 portno) {
     tls_connection_t* connection = (tls_connection_t*)calloc(1, sizeof(tls_connection_t));
     if (!connection) return NULL;
@@ -817,12 +781,17 @@ static int remote_net_recv_timeout(mbedtls_net_context* context, u8* buffer,
 #endif
 }
 
-http_response_t* remote_connection_request_with_headers_and_options(
-	tls_connection_t* connection, const char* host, const char* path, const char* accept,
-	const char* extra_headers, bool close_after_request,
-	const remote_request_options_t* options) {
+http_response_t* remote_connection_request_http(
+	tls_connection_t* connection, const char* host, remote_http_method_t method,
+	const char* path, const char* accept, const char* content_type,
+	const void* body, size_t body_size, const char* extra_headers,
+	bool close_after_request, const remote_request_options_t* options) {
     ASSERT(connection);
 	remote_request_set_error(options, HTTP_RESPONSE_ERROR_NONE);
+	if (body_size > 0 && !body) {
+		remote_request_set_error(options, HTTP_RESPONSE_ERROR_INVALID_REQUEST);
+		return NULL;
+	}
 
 	u32 read_poll_timeout_ms = options && options->read_poll_timeout_ms
 	                               ? options->read_poll_timeout_ms : 250;
@@ -833,18 +802,20 @@ http_response_t* remote_connection_request_with_headers_and_options(
 	float total_timeout_seconds = options && options->total_timeout_seconds > 0.0f
 	                                  ? options->total_timeout_seconds : 30.0f;
 	i64 request_start_clock = get_clock();
-    char request[4096];
-    i32 request_len = remote_build_get_request_with_headers(request, sizeof(request), host, path,
-                                                            accept, extra_headers, close_after_request);
-    if (request_len <= 0 || request_len >= sizeof(request)) {
+	char request[4096];
+	i32 request_len = remote_build_http_request_headers(request, sizeof(request), method, host, path,
+	                                                   accept, content_type, body_size, extra_headers,
+	                                                   close_after_request);
+	if (request_len <= 0 || request_len >= sizeof(request)) {
 		remote_request_set_error(options, HTTP_RESPONSE_ERROR_INVALID_REQUEST);
         return NULL;
     }
 
 	i32 ret = 1;
-	i32 bytes_written = 0;
+	size_t bytes_written = 0;
+	size_t total_write_size = (size_t)request_len + body_size;
 	i64 write_start_clock = get_clock();
-	while (bytes_written < request_len) {
+	while (bytes_written < total_write_size) {
 		if (remote_request_was_cancelled(options)) {
 			remote_request_set_error(options, HTTP_RESPONSE_ERROR_CANCELLED);
 			return NULL;
@@ -857,11 +828,15 @@ http_response_t* remote_connection_request_with_headers_and_options(
 			remote_request_set_error(options, HTTP_RESPONSE_ERROR_WRITE_TIMEOUT);
 			return NULL;
         }
-        ret = connection->use_tls
-              ? mbedtls_ssl_write(&connection->ssl, (const u8*)request + bytes_written,
-                                  request_len - bytes_written)
-              : mbedtls_net_send(&connection->server_fd, (const u8*)request + bytes_written,
-                                 request_len - bytes_written);
+		const u8* write_data = bytes_written < (size_t)request_len
+		                       ? (const u8*)request + bytes_written
+		                       : (const u8*)body + (bytes_written - (size_t)request_len);
+		size_t write_size = bytes_written < (size_t)request_len
+		                    ? (size_t)request_len - bytes_written
+		                    : total_write_size - bytes_written;
+		ret = connection->use_tls
+		      ? mbedtls_ssl_write(&connection->ssl, write_data, write_size)
+		      : mbedtls_net_send(&connection->server_fd, write_data, write_size);
         if (ret > 0) {
             bytes_written += ret;
         } else if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
@@ -930,7 +905,15 @@ http_response_t* remote_connection_request_with_headers_and_options(
 	}
 	http_response_t* response = http_response_parser_take_response(&parser);
 	http_response_parser_destroy(&parser);
-    return response;
+	return response;
+}
+
+http_response_t* remote_connection_request_with_headers_and_options(
+	tls_connection_t* connection, const char* host, const char* path, const char* accept,
+	const char* extra_headers, bool close_after_request,
+	const remote_request_options_t* options) {
+	return remote_connection_request_http(connection, host, REMOTE_HTTP_GET, path, accept, NULL,
+	                                      NULL, 0, extra_headers, close_after_request, options);
 }
 
 http_response_t* remote_connection_request_with_headers(tls_connection_t* connection, const char* host,

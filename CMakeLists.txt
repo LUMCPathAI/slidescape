@@ -325,7 +325,9 @@ set(SLIDESCAPE_NONGUI_BASE_FILES
         src/core/image_loader.c
         src/core/tile_cache.c
         src/core/tile_loader.c
+        src/core/http_request.c
         src/core/http_response_parser.c
+        src/core/ssi_protocol.c
         src/utils/phasecorrelate.c
         src/third_party/lz4.c
         src/third_party/yxml.c
@@ -385,6 +387,7 @@ set(VIEWER_SOURCE_FILES
         core/remote.c
         core/dicomweb_client.c
         core/slide_score.c
+        core/ssi_client.c
         core/image_registration.c
         imgui/imgui.cpp
         imgui/imgui_demo.cpp

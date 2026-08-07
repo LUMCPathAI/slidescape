@@ -93,7 +93,7 @@ Then select **Connect**. The browser queries studies, series,
 and logical slide series asynchronously through QIDO-RS. Double-clicking a slide
 opens all supported WSI pyramid instances in that series. Raw SOP Instance UIDs
 are kept under the selected slide's **Technical details** panel. Other slide
-series in the same study are also exposed through **View → DICOM slides**.
+series in the same study are also exposed through **View → Slide tray**.
 
 For command-line development, credentials can be supplied without putting them
 in the URL:

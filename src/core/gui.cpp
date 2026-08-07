@@ -32,6 +32,7 @@
 #include "image_registration.h"
 #include "dicom.h"
 #include "slide_score.h"
+#include "ssi.h"
 #include "profiler.h"
 
 
@@ -100,11 +101,21 @@ static bool open_uri_api_token_dirty;
 static char open_uri_dicomweb_username[256];
 static char open_uri_dicomweb_password[256];
 static bool open_uri_dicomweb_credentials_initialized;
+static char open_uri_ssi_username[256];
+static char open_uri_ssi_password[256];
+static bool open_uri_ssi_credentials_initialized;
+static ssi_uri_config_t open_uri_ssi_retry_config;
+static bool open_uri_ssi_retry_config_valid;
+static bool open_uri_ssi_prompt_pending;
+static char open_uri_ssi_pending_status[512];
 static bool open_uri_show_api_token_modal;
 static bool open_uri_show_dicomweb_credentials_modal;
+static bool open_uri_show_ssi_credentials_modal;
 static bool open_uri_dicomweb_retry_direct;
 static dicomweb_async_query_kind_t open_uri_dicomweb_retry_browser_kind;
 static char open_uri_slide_score_retry_uri[1024];
+
+static void open_uri_set_ssi_retry_config(const ssi_uri_config_t* config);
 
 static bool ascii_contains_case_insensitive(const char* text, const char* pattern) {
 	if (!pattern || !pattern[0]) return true;
@@ -517,29 +528,34 @@ static void gui_draw_dicomweb_archive_window(app_state_t* app_state) {
 	ImGui::End();
 }
 
-static void draw_dicom_slides_window(app_state_t* app_state) {
-	if (!show_dicom_slides_window || arrlen(app_state->loaded_images) == 0) return;
+static void draw_slide_tray_window(app_state_t* app_state) {
+	if (!show_slide_tray_window || arrlen(app_state->loaded_images) == 0) return;
 	image_t* image = app_state->loaded_images[0];
 	bool is_local_dicom = image->backend == IMAGE_BACKEND_DICOM;
 	bool is_dicomweb = image->backend == IMAGE_BACKEND_DICOMWEB;
+	bool is_ssi = image->backend == IMAGE_BACKEND_SSI;
 	i32 slide_count = is_local_dicom ? arrlen(image->dicom.slides)
-	                                : is_dicomweb ? image->dicomweb.available_series_count : 0;
+	                                : is_dicomweb ? image->dicomweb.available_series_count
+	                                : is_ssi ? image->ssi.folder_slide_count : 0;
 	if (slide_count <= 1) {
-		show_dicom_slides_window = false;
+		show_slide_tray_window = false;
 		return;
 	}
 
 	ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_FirstUseEver);
-	if (ImGui::Begin("DICOM slides", &show_dicom_slides_window, ImGuiWindowFlags_AlwaysAutoResize)) {
-		ImGui::TextUnformatted(is_dicomweb ? "Select a slide series from this study:"
-		                                  : "Select a slide from this directory:");
+	if (ImGui::Begin("Slide tray", &show_slide_tray_window, ImGuiWindowFlags_AlwaysAutoResize)) {
+		ImGui::TextUnformatted(is_ssi ? "Select a slide from this folder:"
+		                       : is_dicomweb ? "Select a slide series from this study:"
+		                                     : "Select a slide from this directory:");
 		ImGui::Separator();
 		for (i32 i = 0; i < slide_count; ++i) {
 			dicom_slide_t* slide = is_local_dicom ? image->dicom.slides + i : NULL;
 			dicomweb_series_ref_t* remote_series =
 				is_dicomweb ? image->dicomweb.available_series + i : NULL;
+			ssi_slide_ref_t* ssi_slide = is_ssi ? image->ssi.folder_slides + i : NULL;
 			char remote_label[256];
 			char local_label[640];
+			char ssi_label[640];
 			const char* label = NULL;
 			if (is_local_dicom) {
 				const char* filename = one_past_last_slash(
@@ -548,7 +564,7 @@ static void draw_dicom_slides_window(app_state_t* app_state) {
 				snprintf(local_label, sizeof(local_label), "%s##local_slide_%d",
 				         description[0] ? description : filename, i);
 				label = local_label;
-			} else {
+			} else if (is_dicomweb) {
 				const char* primary = remote_series->series_number[0]
 				                      ? remote_series->series_number
 				                      : remote_series->description[0]
@@ -561,9 +577,15 @@ static void draw_dicom_slides_window(app_state_t* app_state) {
 				         strcmp(primary, remote_series->description) != 0
 				         ? remote_series->description : "", i);
 				label = remote_label;
+			} else {
+				snprintf(ssi_label, sizeof(ssi_label), "%s##ssi_slide_%d",
+				         ssi_slide->name, i);
+				label = ssi_label;
 			}
 			bool selected = is_local_dicom ? i == image->dicom.selected_slide_index
-			                              : i == image->dicomweb.selected_series_index;
+			                              : is_dicomweb ? i == image->dicomweb.selected_series_index
+			                                            : strcmp(ssi_slide->id,
+			                                                     image->ssi.slide_guid) == 0;
 			if (ImGui::Selectable(label, selected) && !selected) {
 				if (is_local_dicom) {
 					char filename[512];
@@ -573,14 +595,30 @@ static void draw_dicom_slides_window(app_state_t* app_state) {
 					             sizeof(source_directory));
 					load_dicom_file_from_directory(app_state, filename, source_directory,
 					                               FILETYPE_HINT_BASE_IMAGE);
-				} else {
+				} else if (is_dicomweb) {
 					dicomweb_open_related_series(app_state, image, i);
+				} else if (!ssi_open_folder_slide(app_state, image, i)) {
+					ssi_uri_config_t retry_config = {0};
+					copy_cstring(retry_config.api_url, image->ssi.api_url,
+					             sizeof(retry_config.api_url));
+					copy_cstring(retry_config.slide_center_url,
+					             image->ssi.slide_center_url,
+					             sizeof(retry_config.slide_center_url));
+					copy_cstring(retry_config.slide_guid, ssi_slide->id,
+					             sizeof(retry_config.slide_guid));
+					copy_cstring(retry_config.caption, ssi_slide->name,
+					             sizeof(retry_config.caption));
+					open_uri_set_ssi_retry_config(&retry_config);
+					copy_cstring(open_uri_status, ssi_get_last_status(),
+					             sizeof(open_uri_status));
+					open_uri_show_ssi_credentials_modal = true;
 				}
 				break;
 			}
 			if (ImGui::IsItemHovered()) {
 				ImGui::SetTooltip("%s", is_local_dicom ? slide->series_instance_uid.value
-				                                      : remote_series->series_instance_uid);
+				                                      : is_dicomweb ? remote_series->series_instance_uid
+				                                                    : ssi_slide->id);
 			}
 		}
 	}
@@ -1141,12 +1179,15 @@ static void gui_draw_main_menu_bar(app_state_t* app_state) {
 			bool has_macro_image = gui_find_associated_image(app_state, false) != NULL;
 			if (ImGui::MenuItem("Label image", "L", &show_label_image_window, has_label_image)) {}
 			if (ImGui::MenuItem("Macro image", "O", &show_macro_image_window, has_macro_image)) {}
-			bool has_dicom_slides = has_image_loaded &&
+			bool has_related_slides = has_image_loaded &&
 			                        ((app_state->loaded_images[0]->backend == IMAGE_BACKEND_DICOM &&
 			                          arrlen(app_state->loaded_images[0]->dicom.slides) > 1) ||
 			                         (app_state->loaded_images[0]->backend == IMAGE_BACKEND_DICOMWEB &&
-			                          app_state->loaded_images[0]->dicomweb.available_series_count > 1));
-			if (ImGui::MenuItem("DICOM slides...", NULL, &show_dicom_slides_window, has_dicom_slides)) {}
+			                          app_state->loaded_images[0]->dicomweb.available_series_count > 1) ||
+			                         (app_state->loaded_images[0]->backend == IMAGE_BACKEND_SSI &&
+			                          app_state->loaded_images[0]->ssi.folder_slide_count > 1));
+			if (ImGui::MenuItem("Slide tray...", NULL, &show_slide_tray_window,
+			                    has_related_slides)) {}
 			ImGui::Separator();
 			bool* show_scale_bar = has_image_loaded ? &scene->scale_bar.enabled : NULL;
 			if (ImGui::MenuItem("Show scale bar", "Ctrl+B", show_scale_bar, (show_scale_bar != NULL))) {}
@@ -1850,6 +1891,23 @@ static void open_uri_initialize_credentials(app_state_t* app_state) {
 		}
 		open_uri_dicomweb_credentials_initialized = true;
 	}
+	if (!open_uri_ssi_credentials_initialized) {
+		const char* username = getenv("SLIDESCAPE_SSI_USERNAME");
+		const char* password = getenv("SLIDESCAPE_SSI_PASSWORD");
+		if (username) copy_cstring(open_uri_ssi_username, username,
+		                           sizeof(open_uri_ssi_username));
+		if (password) copy_cstring(open_uri_ssi_password, password,
+		                           sizeof(open_uri_ssi_password));
+		open_uri_ssi_credentials_initialized = true;
+	}
+}
+
+void gui_prompt_for_ssi_credentials(const char* uri, const char* status) {
+	copy_cstring(remote_uri, uri ? uri : "", sizeof(remote_uri));
+	copy_cstring(open_uri_ssi_pending_status, status ? status : "SSI credentials are required.",
+	             sizeof(open_uri_ssi_pending_status));
+	open_uri_ssi_prompt_pending = true;
+	show_open_uri_window = true;
 }
 
 static bool open_uri_is_slide_score_qupath_link(const char* uri) {
@@ -1888,11 +1946,90 @@ static void open_uri_try_slide_score(app_state_t* app_state, const char* uri) {
 	}
 }
 
+static void open_uri_set_ssi_retry_config(const ssi_uri_config_t* config) {
+	open_uri_ssi_retry_config = *config;
+	open_uri_ssi_retry_config_valid = true;
+}
+
+static bool open_uri_try_ssi_config(app_state_t* app_state,
+		const ssi_uri_config_t* config) {
+	open_uri_set_ssi_retry_config(config);
+	if (!config->session_id[0] &&
+	    (!open_uri_ssi_username[0] || !open_uri_ssi_password[0])) {
+		copy_cstring(open_uri_status, "SlideCenter credentials are required.",
+		             sizeof(open_uri_status));
+		open_uri_show_ssi_credentials_modal = true;
+		return false;
+	}
+	bool opened = ssi_open_remote_image(app_state, config->api_url,
+	                                    config->slide_center_url,
+	                                    open_uri_ssi_username,
+	                                    open_uri_ssi_password,
+	                                    config->session_id,
+	                                    config->slide_guid,
+	                                    config->caption);
+	copy_cstring(open_uri_status, ssi_get_last_status(), sizeof(open_uri_status));
+	if (opened) {
+		open_uri_finish_success();
+	} else {
+		if (config->session_id[0]) {
+			ssi_uri_config_t credential_retry = *config;
+			credential_retry.session_id[0] = '\0';
+			open_uri_set_ssi_retry_config(&credential_retry);
+		}
+		open_uri_show_ssi_credentials_modal = true;
+	}
+	return opened;
+}
+
+static void open_uri_try_ssi(app_state_t* app_state, const char* uri) {
+	ssi_uri_config_t config;
+	if (!ssi_resolve_uri(uri, &config)) {
+		copy_cstring(open_uri_status,
+		             "Could not resolve this SSI or mview link. Plain ssi: links require "
+		             "the two SLIDESCAPE_SSI_* URL variables.",
+		             sizeof(open_uri_status));
+		return;
+	}
+	open_uri_try_ssi_config(app_state, &config);
+}
+
+static void open_uri_poll_ssi_reauthentication(app_state_t* app_state) {
+	if (open_uri_ssi_prompt_pending) {
+		ssi_uri_config_t config;
+		if (ssi_resolve_uri(remote_uri, &config)) {
+			open_uri_set_ssi_retry_config(&config);
+			copy_cstring(open_uri_status, open_uri_ssi_pending_status,
+			             sizeof(open_uri_status));
+			open_uri_show_ssi_credentials_modal = true;
+		}
+		open_uri_ssi_prompt_pending = false;
+	}
+	for (i32 i = 0; i < arrlen(app_state->loaded_images); ++i) {
+		image_t* image = app_state->loaded_images[i];
+		if (image->backend != IMAGE_BACKEND_SSI ||
+		    !atomic_compare_exchange(&image->ssi.reauthentication_state, 2, 1)) continue;
+		ssi_uri_config_t config = {0};
+		copy_cstring(config.api_url, image->ssi.api_url, sizeof(config.api_url));
+		copy_cstring(config.slide_center_url, image->ssi.slide_center_url,
+		             sizeof(config.slide_center_url));
+		copy_cstring(config.slide_guid, image->ssi.slide_guid, sizeof(config.slide_guid));
+		open_uri_set_ssi_retry_config(&config);
+		copy_cstring(open_uri_status,
+		             "The SSI slide session expired or requires authentication.",
+		             sizeof(open_uri_status));
+		open_uri_show_ssi_credentials_modal = true;
+		break;
+	}
+}
+
 static void open_uri_connect(app_state_t* app_state) {
 	open_uri_connect_requested = true;
 	bool is_dicomweb_series_url = strstr(remote_uri, "/studies/") &&
 	                              strstr(remote_uri, "/series/");
-	if (is_dicomweb_series_url) {
+	if (ssi_uri_is_supported(remote_uri)) {
+		open_uri_try_ssi(app_state, remote_uri);
+	} else if (is_dicomweb_series_url) {
 		dicomweb_direct_open_series_url(remote_uri, open_uri_dicomweb_username,
 		                                open_uri_dicomweb_password);
 	} else if (slide_score_uri_is_supported(remote_uri)) {
@@ -1976,6 +2113,40 @@ static void gui_draw_open_uri_credential_modals(app_state_t* app_state) {
 		}
 		ImGui::EndPopup();
 	}
+
+	if (open_uri_show_ssi_credentials_modal) {
+		ImGui::OpenPopup("SlideCenter credentials");
+		open_uri_show_ssi_credentials_modal = false;
+	}
+	if (ImGui::IsPopupOpen("SlideCenter credentials")) {
+		gui_make_next_window_appear_in_center_of_screen();
+	}
+	if (ImGui::BeginPopupModal("SlideCenter credentials", NULL,
+	                           ImGuiWindowFlags_AlwaysAutoResize)) {
+		ImGui::TextWrapped("Enter credentials for the SlideCenter SSI connection. "
+		                   "They are kept only in this running Slidescape process.");
+		ImGui::SetNextItemWidth(360.0f);
+		bool username_entered = ImGui::InputTextWithHint(
+			"##ssi_username_modal", "Username", open_uri_ssi_username,
+			sizeof(open_uri_ssi_username), ImGuiInputTextFlags_EnterReturnsTrue);
+		ImGui::SetNextItemWidth(360.0f);
+		bool password_entered = ImGui::InputTextWithHint(
+			"##ssi_password_modal", "Password", open_uri_ssi_password,
+			sizeof(open_uri_ssi_password),
+			ImGuiInputTextFlags_Password | ImGuiInputTextFlags_EnterReturnsTrue);
+		if (open_uri_status[0]) ImGui::TextWrapped("%s", open_uri_status);
+		bool retry = ImGui::Button("Retry", ImVec2(120, 0)) ||
+		             username_entered || password_entered;
+		ImGui::SameLine();
+		if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+			ImGui::CloseCurrentPopup();
+		}
+		if (retry && open_uri_ssi_retry_config_valid &&
+		    open_uri_try_ssi_config(app_state, &open_uri_ssi_retry_config)) {
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::EndPopup();
+	}
 }
 
 void gui_draw_open_uri_window(app_state_t* app_state) {
@@ -1994,7 +2165,7 @@ void gui_draw_open_uri_window(app_state_t* app_state) {
 	                       ImGui::GetStyle().ItemSpacing.x * 2.0f;
 	ImGui::SetNextItemWidth(MAX(480.0f, 720.0f - reserved_width));
 	bool entered = ImGui::InputTextWithHint(
-		"##URI", "Enter a Slide Score URL, DICOMweb series URL, or archive root",
+		"##URI", "Enter an SSI/mview, Slide Score, or DICOMweb URI",
 		remote_uri, sizeof(remote_uri), ImGuiInputTextFlags_EnterReturnsTrue);
 	ImGui::SameLine();
 	ImGui::TextDisabled("(?)");
@@ -2004,11 +2175,13 @@ void gui_draw_open_uri_window(app_state_t* app_state) {
 		ImGui::TextUnformatted("Supported links");
 		ImGui::Separator();
 		ImGui::BulletText("Slide Score image and QuPath metadata links");
+		ImGui::BulletText("3DHISTECH ssi: slide IDs and mview: SlideViewer links");
 		ImGui::BulletText("DICOMweb series URLs ending in /studies/{uid}/series/{uid}");
 		ImGui::BulletText("DICOMweb archive roots for browsing and search");
 		ImGui::Separator();
 		ImGui::TextUnformatted("Slide Score API tokens are not needed for QuPath metadata links.");
 		ImGui::TextUnformatted("Unencrypted DICOMweb HTTP is accepted only for localhost.");
+		ImGui::TextUnformatted("SlideCenter credentials are retained only for this process.");
 		ImGui::PopTextWrapPos();
 		ImGui::EndTooltip();
 	}
@@ -2037,6 +2210,15 @@ void gui_draw_open_uri_window(app_state_t* app_state) {
 		ImGui::InputTextWithHint("##dicomweb_password", "Password",
 		                         open_uri_dicomweb_password,
 		                         sizeof(open_uri_dicomweb_password),
+		                         ImGuiInputTextFlags_Password);
+		ImGui::Separator();
+		ImGui::TextDisabled("3DHISTECH SlideCenter SSI authentication");
+		ImGui::SetNextItemWidth(300.0f);
+		ImGui::InputTextWithHint("##ssi_username", "Username",
+		                         open_uri_ssi_username, sizeof(open_uri_ssi_username));
+		ImGui::SetNextItemWidth(300.0f);
+		ImGui::InputTextWithHint("##ssi_password", "Password",
+		                         open_uri_ssi_password, sizeof(open_uri_ssi_password),
 		                         ImGuiInputTextFlags_Password);
 		ImGui::TreePop();
 	}
@@ -2212,9 +2394,12 @@ void gui_draw(app_state_t* app_state, input_t* input, i32 client_width, i32 clie
 	}
 
 	if (show_menu_bar) gui_draw_main_menu_bar(app_state);
+	open_uri_initialize_credentials(app_state);
 	dicomweb_direct_open_poll(app_state);
 	dicomweb_browser_poll(app_state);
-    if (show_open_uri_window) gui_draw_open_uri_window(app_state);
+	ssi_poll_keepalive(app_state);
+	open_uri_poll_ssi_reauthentication(app_state);
+	if (show_open_uri_window) gui_draw_open_uri_window(app_state);
 	gui_draw_open_uri_credential_modals(app_state);
     if (show_dicomweb_archive_window) gui_draw_dicomweb_archive_window(app_state);
 
@@ -2513,7 +2698,7 @@ void gui_draw(app_state_t* app_state, input_t* input, i32 client_width, i32 clie
 									 true, 50.0f, 260.0f);
 	gui_draw_associated_image_window(app_state, "Macro image###macro_image_window", &show_macro_image_window,
 									 false, 350.0f, 340.0f);
-	draw_dicom_slides_window(app_state);
+	draw_slide_tray_window(app_state);
 
 	if (show_about_window) {
 		ImGui::Begin("About " APP_TITLE, &show_about_window, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse);
