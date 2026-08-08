@@ -547,9 +547,11 @@ static void draw_slide_tray_window(app_state_t* app_state) {
 
 	ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_FirstUseEver);
 	if (ImGui::Begin("Slide tray", &show_slide_tray_window, ImGuiWindowFlags_AlwaysAutoResize)) {
-		ImGui::TextUnformatted(is_ssi ? "Select a slide from this folder:"
-		                       : is_dicomweb ? "Select a slide series from this study:"
-		                                     : "Select a slide from this directory:");
+		if (is_ssi && image->ssi.folder_slides_compact) {
+			ImGui::TextUnformatted(image->ssi.folder_name);
+		} else {
+			ImGui::TextUnformatted("Select a slide:");
+		}
 		ImGui::Separator();
 		for (i32 i = 0; i < slide_count; ++i) {
 			dicom_slide_t* slide = is_local_dicom ? image->dicom.slides + i : NULL;
@@ -582,7 +584,8 @@ static void draw_slide_tray_window(app_state_t* app_state) {
 				label = remote_label;
 			} else {
 				snprintf(ssi_label, sizeof(ssi_label), "%s##ssi_slide_%d",
-				         ssi_slide->name, i);
+				         image->ssi.folder_slides_compact ? ssi_slide->compact_name
+				                                          : ssi_slide->name, i);
 				label = ssi_label;
 			}
 			bool selected = is_local_dicom ? i == image->dicom.selected_slide_index
@@ -619,9 +622,16 @@ static void draw_slide_tray_window(app_state_t* app_state) {
 				break;
 			}
 			if (ImGui::IsItemHovered()) {
-				ImGui::SetTooltip("%s", is_local_dicom ? slide->series_instance_uid.value
-				                                      : is_dicomweb ? remote_series->series_instance_uid
-				                                                    : ssi_slide->id);
+				if (is_ssi) {
+					ImGui::BeginTooltip();
+					ImGui::Text("Name: %s", ssi_slide->name);
+					if (ssi_slide->barcode[0]) ImGui::Text("Barcode: %s", ssi_slide->barcode);
+					ImGui::Text("Slide ID: %s", ssi_slide->id);
+					ImGui::EndTooltip();
+				} else {
+					ImGui::SetTooltip("%s", is_local_dicom ? slide->series_instance_uid.value
+					                                      : remote_series->series_instance_uid);
+				}
 			}
 		}
 	}

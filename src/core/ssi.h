@@ -49,6 +49,8 @@ typedef struct ssi_slide_properties_t {
 typedef struct ssi_slide_ref_t {
 	char id[64];
 	char name[512];
+	char compact_name[512];
+	char barcode[256];
 } ssi_slide_ref_t;
 
 typedef struct ssi_remote_image_t {
@@ -60,12 +62,14 @@ typedef struct ssi_remote_image_t {
 	char session_id[128];
 	char slide_token[128];
 	char slide_guid[64];
+	char folder_name[512];
 	char* slide_attributes_json;
 	size_t slide_attributes_json_size;
 	char* all_properties_json;
 	size_t all_properties_json_size;
 	ssi_slide_ref_t* folder_slides;
 	i32 folder_slide_count;
+	bool folder_slides_compact;
 	i32 initial_request_count;
 	i32 initial_request_time_ms;
 	u64 initial_response_bytes;
@@ -103,7 +107,8 @@ bool ssi_parse_slide_properties(const char* json, size_t json_size,
 bool ssi_parse_slide_attribute_name(const char* json, size_t json_size,
 		char* name, size_t name_size);
 bool ssi_parse_folder_content(const char* json, size_t json_size,
-		ssi_slide_ref_t** slides, i32* slide_count);
+		ssi_slide_ref_t** slides, i32* slide_count, char* folder_name,
+		size_t folder_name_size, bool* compact_names);
 bool ssi_get_level_geometry(const ssi_slide_properties_t* properties, i32 level,
 		ssi_level_geometry_t* geometry);
 bool ssi_build_tile_path(char* dest, size_t dest_size, const ssi_remote_image_t* remote,

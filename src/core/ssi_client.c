@@ -462,13 +462,18 @@ static bool ssi_get_folder_content(ssi_remote_image_t* remote) {
 	                                                NULL, NULL, 0, "application/json");
 	ssi_slide_ref_t* slides = NULL;
 	i32 slide_count = 0;
+	char folder_name[512] = {0};
+	bool compact_names = false;
 	bool loaded = false;
 	if (ssi_response_succeeded(response) &&
 	    ssi_parse_folder_content((const char*)response->buffer.data,
-	                             response->content_length, &slides, &slide_count)) {
+	                             response->content_length, &slides, &slide_count,
+	                             folder_name, sizeof(folder_name), &compact_names)) {
 		free(remote->folder_slides);
 		remote->folder_slides = slides;
 		remote->folder_slide_count = slide_count;
+		copy_cstring(remote->folder_name, folder_name, sizeof(remote->folder_name));
+		remote->folder_slides_compact = compact_names;
 		loaded = true;
 		console_print_verbose("SSI folder content: %d slide(s)\n", slide_count);
 	} else {
@@ -493,6 +498,8 @@ typedef struct ssi_optional_result_t {
 	simple_image_t label_image;
 	ssi_slide_ref_t* folder_slides;
 	i32 folder_slide_count;
+	char folder_name[512];
+	bool folder_slides_compact;
 	bool folder_content_loaded;
 	i32 request_count;
 	i32 request_time_ms;
@@ -541,6 +548,9 @@ static ssi_optional_result_t* ssi_load_optional_data(ssi_remote_image_t* remote,
 	if (result->folder_content_loaded) {
 		result->folder_slides = remote->folder_slides;
 		result->folder_slide_count = remote->folder_slide_count;
+		copy_cstring(result->folder_name, remote->folder_name,
+		             sizeof(result->folder_name));
+		result->folder_slides_compact = remote->folder_slides_compact;
 		remote->folder_slides = NULL;
 		remote->folder_slide_count = 0;
 	}
@@ -750,6 +760,9 @@ void ssi_commit_optional_data(app_state_t* app_state, void* result_pointer) {
 		free(image->ssi.folder_slides);
 		image->ssi.folder_slides = result->folder_slides;
 		image->ssi.folder_slide_count = result->folder_slide_count;
+		copy_cstring(image->ssi.folder_name, result->folder_name,
+		             sizeof(image->ssi.folder_name));
+		image->ssi.folder_slides_compact = result->folder_slides_compact;
 		result->folder_slides = NULL;
 		result->folder_slide_count = 0;
 	}
@@ -955,6 +968,9 @@ bool ssi_open_folder_slide(app_state_t* app_state, image_t* current_image,
 			memcpy(remote.folder_slides, current_image->ssi.folder_slides,
 			       folder_slides_size);
 			remote.folder_slide_count = current_image->ssi.folder_slide_count;
+			copy_cstring(remote.folder_name, current_image->ssi.folder_name,
+			             sizeof(remote.folder_name));
+			remote.folder_slides_compact = current_image->ssi.folder_slides_compact;
 		}
 	}
 	image_t* image = ssi_create_initialized_image(&remote, true);

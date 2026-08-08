@@ -260,6 +260,17 @@ background `folder_content` refresh obtains any changes. A failed refresh keeps
 the existing list. Deliberately closing the final SSI image still closes the
 session.
 
+The SSI tray recognizes a conservative diagnostic naming convention of three
+fields separated by double spaces: folder name, slide description, and barcode.
+Compact display is enabled only when every slide follows that structure and the
+first field exactly matches `CurrentFolder.Name`. The folder name is then shown
+once as the case/study title, rows use only the middle field, and the full name,
+barcode, and SSI slide ID remain available in the tooltip. Rows are sorted by
+the parsed subdivision and block counters, with inference for decimal, canonical
+Roman, and base-26 alphabetic counters and support for `/`, `-`, or space
+separators. Barcode and full name provide deterministic tie-breakers. Folders
+that do not consistently match retain their original names and server order.
+
 ### Associated images
 
 `slide/{slide_token}/single_image` supports:

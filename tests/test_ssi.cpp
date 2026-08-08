@@ -161,8 +161,13 @@ TEST_CASE("SSI parses bounded immediate folder slides") {
 	})";
 	ssi_slide_ref_t* slides = NULL;
 	i32 slide_count = 0;
-	REQUIRE(ssi_parse_folder_content(json, strlen(json), &slides, &slide_count));
+	char folder_name[64];
+	bool compact_names = true;
+	REQUIRE(ssi_parse_folder_content(json, strlen(json), &slides, &slide_count,
+	                                 folder_name, sizeof(folder_name), &compact_names));
 	REQUIRE(slide_count == 2);
+	CHECK(strcmp(folder_name, "Current") == 0);
+	CHECK_FALSE(compact_names);
 	CHECK(strcmp(slides[0].id, "fe2a3b0ec0f18b9b3981094ba2e3c2df") == 0);
 	CHECK(strcmp(slides[0].name, "T25-231") == 0);
 	CHECK(strcmp(slides[1].name, slides[1].id) == 0);
@@ -172,9 +177,60 @@ TEST_CASE("SSI parses bounded immediate folder slides") {
 	slide_count = -1;
 	REQUIRE(ssi_parse_folder_content("{\"Slides\":null}",
 	                                 strlen("{\"Slides\":null}"),
-	                                 &slides, &slide_count));
+	                                 &slides, &slide_count, folder_name,
+	                                 sizeof(folder_name), &compact_names));
 	CHECK(slides == NULL);
 	CHECK(slide_count == 0);
+}
+
+TEST_CASE("SSI compacts and naturally sorts structured diagnostic slide names") {
+	const char* json = R"({
+		"CurrentFolder":{"Id":"0000000000000000000000000000000f","Name":"26/H01234"},
+		"Slides":[
+			{"Id":"00000000000000000000000000000010","Name":"26/H01234  10/A HE  BC;10/A","BarCode":"BC;10/A"},
+			{"Id":"00000000000000000000000000000009","Name":"26/H01234  9/A HE  BC;9/A","BarCode":"BC;9/A"},
+			{"Id":"00000000000000000000000000000002","Name":"26/H01234  1/AA HE  BC;1/AA","BarCode":"BC;1/AA"},
+			{"Id":"00000000000000000000000000000001","Name":"26/H01234  1/Z HE  BC;1/Z","BarCode":"BC;1/Z"}
+		]
+	})";
+	ssi_slide_ref_t* slides = NULL;
+	i32 slide_count = 0;
+	char folder_name[64];
+	bool compact_names = false;
+	REQUIRE(ssi_parse_folder_content(json, strlen(json), &slides, &slide_count,
+	                                 folder_name, sizeof(folder_name), &compact_names));
+	REQUIRE(slide_count == 4);
+	CHECK(compact_names);
+	CHECK(strcmp(folder_name, "26/H01234") == 0);
+	CHECK(strcmp(slides[0].compact_name, "1/Z HE") == 0);
+	CHECK(strcmp(slides[1].compact_name, "1/AA HE") == 0);
+	CHECK(strcmp(slides[2].compact_name, "9/A HE") == 0);
+	CHECK(strcmp(slides[3].compact_name, "10/A HE") == 0);
+	CHECK(strcmp(slides[0].barcode, "BC;1/Z") == 0);
+	free(slides);
+}
+
+TEST_CASE("SSI recognizes Roman counters and space-delimited counters") {
+	const char* json = R"({
+		"CurrentFolder":{"Name":"Case"},
+		"Slides":[
+			{"Id":"00000000000000000000000000000010","Name":"Case  X A HE  X-A"},
+			{"Id":"00000000000000000000000000000009","Name":"Case  IX A HE  IX-A"},
+			{"Id":"00000000000000000000000000000004","Name":"Case  IV A HE  IV-A"}
+		]
+	})";
+	ssi_slide_ref_t* slides = NULL;
+	i32 slide_count = 0;
+	char folder_name[64];
+	bool compact_names = false;
+	REQUIRE(ssi_parse_folder_content(json, strlen(json), &slides, &slide_count,
+	                                 folder_name, sizeof(folder_name), &compact_names));
+	REQUIRE(slide_count == 3);
+	CHECK(compact_names);
+	CHECK(strcmp(slides[0].compact_name, "IV A HE") == 0);
+	CHECK(strcmp(slides[1].compact_name, "IX A HE") == 0);
+	CHECK(strcmp(slides[2].compact_name, "X A HE") == 0);
+	free(slides);
 }
 
 TEST_CASE("SSI direct URI contains only a slide identifier") {

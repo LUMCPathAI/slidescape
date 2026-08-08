@@ -276,19 +276,251 @@ bool ssi_parse_slide_attribute_name(const char* json, size_t json_size,
 	return name[0] != '\0';
 }
 
+typedef enum ssi_counter_style_t {
+	SSI_COUNTER_TEXT = 0,
+	SSI_COUNTER_DECIMAL,
+	SSI_COUNTER_ROMAN,
+	SSI_COUNTER_ALPHA,
+} ssi_counter_style_t;
+
+typedef struct ssi_folder_sort_entry_t {
+	ssi_slide_ref_t slide;
+	char subdivision[64];
+	char block[64];
+	char stain[128];
+	ssi_counter_style_t subdivision_style;
+	ssi_counter_style_t block_style;
+} ssi_folder_sort_entry_t;
+
+static bool ssi_copy_trimmed_span(char* dest, size_t dest_size,
+		const char* start, const char* end) {
+	while (start < end && isspace((u8)*start)) ++start;
+	while (end > start && isspace((u8)end[-1])) --end;
+	size_t length = (size_t)(end - start);
+	if (length == 0 || length >= dest_size) return false;
+	memcpy(dest, start, length);
+	dest[length] = '\0';
+	return true;
+}
+
+static bool ssi_parse_compact_middle(ssi_folder_sort_entry_t* entry) {
+	const char* middle = entry->slide.compact_name;
+	const char* end = middle + strlen(middle);
+	const char* first_space = strchr(middle, ' ');
+	if (!first_space) return false;
+	const char* slash = strchr(middle, '/');
+	const char* dash = strchr(middle, '-');
+	const char* separator = NULL;
+	if (slash && slash < first_space) separator = slash;
+	if (dash && dash < first_space && (!separator || dash < separator)) separator = dash;
+	if (separator) {
+		return ssi_copy_trimmed_span(entry->subdivision, sizeof(entry->subdivision),
+		                             middle, separator) &&
+		       ssi_copy_trimmed_span(entry->block, sizeof(entry->block),
+		                             separator + 1, first_space) &&
+		       ssi_copy_trimmed_span(entry->stain, sizeof(entry->stain),
+		                             first_space + 1, end);
+	}
+
+	const char* second_space = strchr(first_space + 1, ' ');
+	if (!second_space) return false;
+	return ssi_copy_trimmed_span(entry->subdivision, sizeof(entry->subdivision),
+	                             middle, first_space) &&
+	       ssi_copy_trimmed_span(entry->block, sizeof(entry->block),
+	                             first_space + 1, second_space) &&
+	       ssi_copy_trimmed_span(entry->stain, sizeof(entry->stain),
+	                             second_space + 1, end);
+}
+
+static bool ssi_parse_compact_slide_name(ssi_folder_sort_entry_t* entry,
+		const char* folder_name) {
+	const char* first_end = strstr(entry->slide.name, "  ");
+	if (!first_end) return false;
+	const char* middle = first_end + 2;
+	const char* middle_end = strstr(middle, "  ");
+	if (!middle_end || strstr(middle_end + 2, "  ")) return false;
+	char parsed_folder[512];
+	char parsed_barcode[256];
+	if (!ssi_copy_trimmed_span(parsed_folder, sizeof(parsed_folder),
+	                           entry->slide.name, first_end) ||
+	    strcmp(parsed_folder, folder_name) != 0 ||
+	    !ssi_copy_trimmed_span(entry->slide.compact_name,
+	                           sizeof(entry->slide.compact_name), middle, middle_end) ||
+	    !ssi_copy_trimmed_span(parsed_barcode, sizeof(parsed_barcode),
+	                           middle_end + 2, entry->slide.name + strlen(entry->slide.name))) {
+		return false;
+	}
+	if (entry->slide.barcode[0] && strcmp(entry->slide.barcode, parsed_barcode) != 0) {
+		return false;
+	}
+	if (!entry->slide.barcode[0]) {
+		snprintf(entry->slide.barcode, sizeof(entry->slide.barcode), "%s", parsed_barcode);
+	}
+	return ssi_parse_compact_middle(entry);
+}
+
+static bool ssi_counter_is_decimal(const char* text) {
+	if (!text[0]) return false;
+	for (const u8* p = (const u8*)text; *p; ++p) if (!isdigit(*p)) return false;
+	return true;
+}
+
+static bool ssi_counter_is_alpha(const char* text) {
+	if (!text[0]) return false;
+	for (const u8* p = (const u8*)text; *p; ++p) if (!isalpha(*p)) return false;
+	return true;
+}
+
+static i32 ssi_roman_digit(char c) {
+	switch (toupper((u8)c)) {
+		case 'I': return 1;
+		case 'V': return 5;
+		case 'X': return 10;
+		case 'L': return 50;
+		case 'C': return 100;
+		case 'D': return 500;
+		case 'M': return 1000;
+		default: return 0;
+	}
+}
+
+static bool ssi_counter_roman_value(const char* text, i32* value_out) {
+	if (!text[0]) return false;
+	i32 value = 0;
+	for (size_t i = 0; text[i]; ++i) {
+		i32 digit = ssi_roman_digit(text[i]);
+		if (!digit) return false;
+		i32 next = text[i + 1] ? ssi_roman_digit(text[i + 1]) : 0;
+		value += digit < next ? -digit : digit;
+	}
+	if (value <= 0 || value > 3999) return false;
+	static const i32 values[] = {1000, 900, 500, 400, 100, 90, 50, 40,
+	                             10, 9, 5, 4, 1};
+	static const char* numerals[] = {"M", "CM", "D", "CD", "C", "XC", "L",
+	                                 "XL", "X", "IX", "V", "IV", "I"};
+	char canonical[32] = {0};
+	size_t used = 0;
+	i32 remainder = value;
+	for (i32 i = 0; i < COUNT(values); ++i) {
+		while (remainder >= values[i]) {
+			size_t length = strlen(numerals[i]);
+			memcpy(canonical + used, numerals[i], length);
+			used += length;
+			remainder -= values[i];
+		}
+	}
+	canonical[used] = '\0';
+	if (strcasecmp(canonical, text) != 0) return false;
+	if (value_out) *value_out = value;
+	return true;
+}
+
+static ssi_counter_style_t ssi_infer_counter_style(
+		const ssi_folder_sort_entry_t* entries, i32 count, bool subdivision) {
+	bool all_decimal = true;
+	bool all_alpha = true;
+	bool all_roman = true;
+	for (i32 i = 0; i < count; ++i) {
+		const char* text = subdivision ? entries[i].subdivision : entries[i].block;
+		all_decimal &= ssi_counter_is_decimal(text);
+		all_alpha &= ssi_counter_is_alpha(text);
+		all_roman &= ssi_counter_roman_value(text, NULL);
+	}
+	if (all_decimal) return SSI_COUNTER_DECIMAL;
+	if (all_roman) return SSI_COUNTER_ROMAN;
+	if (all_alpha) return SSI_COUNTER_ALPHA;
+	return SSI_COUNTER_TEXT;
+}
+
+static i32 ssi_compare_decimal(const char* a, const char* b) {
+	while (a[0] == '0' && a[1]) ++a;
+	while (b[0] == '0' && b[1]) ++b;
+	size_t a_size = strlen(a);
+	size_t b_size = strlen(b);
+	if (a_size != b_size) return a_size < b_size ? -1 : 1;
+	return strcmp(a, b);
+}
+
+static i32 ssi_compare_natural(const char* a, const char* b) {
+	while (*a && *b) {
+		if (isdigit((u8)*a) && isdigit((u8)*b)) {
+			const char* a_end = a;
+			const char* b_end = b;
+			while (isdigit((u8)*a_end)) ++a_end;
+			while (isdigit((u8)*b_end)) ++b_end;
+			while (a < a_end - 1 && *a == '0') ++a;
+			while (b < b_end - 1 && *b == '0') ++b;
+			size_t a_size = (size_t)(a_end - a);
+			size_t b_size = (size_t)(b_end - b);
+			if (a_size != b_size) return a_size < b_size ? -1 : 1;
+			i32 comparison = strncmp(a, b, a_size);
+			if (comparison) return comparison;
+			a = a_end;
+			b = b_end;
+			continue;
+		}
+		i32 a_char = tolower((u8)*a++);
+		i32 b_char = tolower((u8)*b++);
+		if (a_char != b_char) return a_char < b_char ? -1 : 1;
+	}
+	return *a ? 1 : *b ? -1 : 0;
+}
+
+static i32 ssi_compare_counter(const char* a, const char* b,
+		ssi_counter_style_t style) {
+	if (style == SSI_COUNTER_DECIMAL) return ssi_compare_decimal(a, b);
+	if (style == SSI_COUNTER_ROMAN) {
+		i32 a_value = 0;
+		i32 b_value = 0;
+		ssi_counter_roman_value(a, &a_value);
+		ssi_counter_roman_value(b, &b_value);
+		return a_value < b_value ? -1 : a_value > b_value ? 1 : 0;
+	}
+	if (style == SSI_COUNTER_ALPHA) {
+		size_t a_size = strlen(a);
+		size_t b_size = strlen(b);
+		if (a_size != b_size) return a_size < b_size ? -1 : 1;
+		return strcasecmp(a, b);
+	}
+	return ssi_compare_natural(a, b);
+}
+
+static int ssi_compare_folder_slides(const void* left, const void* right) {
+	const ssi_folder_sort_entry_t* a = (const ssi_folder_sort_entry_t*)left;
+	const ssi_folder_sort_entry_t* b = (const ssi_folder_sort_entry_t*)right;
+	i32 comparison = ssi_compare_counter(a->subdivision, b->subdivision,
+	                                     a->subdivision_style);
+	if (!comparison) comparison = ssi_compare_counter(a->block, b->block, a->block_style);
+	if (!comparison) comparison = ssi_compare_natural(a->stain, b->stain);
+	if (!comparison) comparison = ssi_compare_natural(a->slide.barcode, b->slide.barcode);
+	if (!comparison) comparison = ssi_compare_natural(a->slide.name, b->slide.name);
+	if (!comparison) comparison = strcmp(a->slide.id, b->slide.id);
+	return comparison;
+}
+
 bool ssi_parse_folder_content(const char* json, size_t json_size,
-		ssi_slide_ref_t** slides, i32* slide_count) {
-	if (!json || !json_size || !slides || !slide_count) return false;
+		ssi_slide_ref_t** slides, i32* slide_count, char* folder_name,
+		size_t folder_name_size, bool* compact_names) {
+	if (!json || !json_size || !slides || !slide_count || !folder_name ||
+	    folder_name_size == 0 || !compact_names) return false;
 	*slides = NULL;
 	*slide_count = 0;
+	folder_name[0] = '\0';
+	*compact_names = false;
 	struct json_value_s* root = json_parse_ex(json, json_size, json_parse_flags_default,
 	                                         ssi_json_alloc, NULL, NULL);
 	if (!root || root->type != json_type_object) {
 		free(root);
 		return false;
 	}
+	struct json_object_s* root_object = (struct json_object_s*)root->payload;
+	struct json_value_s* current_folder_value = ssi_object_get(root_object, "CurrentFolder");
+	if (current_folder_value && current_folder_value->type == json_type_object) {
+		ssi_copy_json_string((struct json_object_s*)current_folder_value->payload, "Name",
+		                     folder_name, folder_name_size);
+	}
 	struct json_value_s* slides_value = ssi_object_get(
-		(struct json_object_s*)root->payload, "Slides");
+		root_object, "Slides");
 	if (!slides_value || slides_value->type == json_type_null) {
 		free(root);
 		return true;
@@ -302,10 +534,10 @@ bool ssi_parse_folder_content(const char* json, size_t json_size,
 		free(root);
 		return false;
 	}
-	ssi_slide_ref_t* parsed = array->length
-	                          ? (ssi_slide_ref_t*)calloc(array->length, sizeof(*parsed))
+	ssi_folder_sort_entry_t* entries = array->length
+	                          ? (ssi_folder_sort_entry_t*)calloc(array->length, sizeof(*entries))
 	                          : NULL;
-	if (array->length && !parsed) {
+	if (array->length && !entries) {
 		free(root);
 		return false;
 	}
@@ -313,22 +545,46 @@ bool ssi_parse_folder_content(const char* json, size_t json_size,
 	for (struct json_array_element_s* element = array->start;
 	     element; element = element->next) {
 		if (!element->value || element->value->type != json_type_object) continue;
-		ssi_slide_ref_t candidate = {0};
+		ssi_folder_sort_entry_t candidate = {0};
 		struct json_object_s* object = (struct json_object_s*)element->value->payload;
-		ssi_copy_json_string(object, "Id", candidate.id, sizeof(candidate.id));
-		ssi_copy_json_string(object, "Name", candidate.name, sizeof(candidate.name));
-		if (!ssi_slide_id_is_valid(candidate.id)) continue;
-		if (!candidate.name[0]) snprintf(candidate.name, sizeof(candidate.name),
-		                                 "%s", candidate.id);
-		parsed[count++] = candidate;
+		ssi_copy_json_string(object, "Id", candidate.slide.id, sizeof(candidate.slide.id));
+		ssi_copy_json_string(object, "Name", candidate.slide.name, sizeof(candidate.slide.name));
+		ssi_copy_json_string(object, "BarCode", candidate.slide.barcode,
+		                     sizeof(candidate.slide.barcode));
+		if (!ssi_slide_id_is_valid(candidate.slide.id)) continue;
+		if (!candidate.slide.name[0]) snprintf(candidate.slide.name, sizeof(candidate.slide.name),
+		                                       "%s", candidate.slide.id);
+		entries[count++] = candidate;
 	}
 	free(root);
+	bool compact = count > 0 && folder_name[0];
+	for (i32 i = 0; compact && i < count; ++i) {
+		compact = ssi_parse_compact_slide_name(entries + i, folder_name);
+	}
+	if (compact) {
+		ssi_counter_style_t subdivision_style = ssi_infer_counter_style(entries, count, true);
+		ssi_counter_style_t block_style = ssi_infer_counter_style(entries, count, false);
+		for (i32 i = 0; i < count; ++i) {
+			entries[i].subdivision_style = subdivision_style;
+			entries[i].block_style = block_style;
+		}
+		qsort(entries, (size_t)count, sizeof(*entries), ssi_compare_folder_slides);
+	} else {
+		for (i32 i = 0; i < count; ++i) entries[i].slide.compact_name[0] = '\0';
+	}
+	ssi_slide_ref_t* parsed = count ? (ssi_slide_ref_t*)calloc((size_t)count, sizeof(*parsed)) : NULL;
+	if (count && !parsed) {
+		free(entries);
+		return false;
+	}
+	for (i32 i = 0; i < count; ++i) parsed[i] = entries[i].slide;
+	free(entries);
 	if (count == 0) {
 		free(parsed);
-		parsed = NULL;
 	}
 	*slides = parsed;
 	*slide_count = count;
+	*compact_names = compact;
 	return true;
 }
 
