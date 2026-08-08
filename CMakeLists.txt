@@ -328,6 +328,7 @@ set(SLIDESCAPE_NONGUI_BASE_FILES
         src/core/http_request.c
         src/core/http_response_parser.c
         src/core/ssi_protocol.c
+        src/core/ssi_transport.c
         src/utils/phasecorrelate.c
         src/third_party/lz4.c
         src/third_party/yxml.c

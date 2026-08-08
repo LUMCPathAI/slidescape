@@ -35,6 +35,9 @@
 #include "ssi.h"
 #include "profiler.h"
 
+#if WINDOWS
+#include "win32_gui.h"
+#endif
 
 #define GUI_IMPL
 #include "gui.h"
@@ -2672,6 +2675,35 @@ void gui_draw(app_state_t* app_state, input_t* input, i32 client_width, i32 clie
 				general_options_changed |= (prev_is_vsync_enabled != is_vsync_enabled);
 				ImGui::EndTabItem();
 			}
+
+#if WINDOWS
+			if (ImGui::BeginTabItem("Integration")) {
+				static bool mview_status_initialized;
+				static win32_mview_handler_state_t mview_state;
+				static char mview_status[512];
+				if (!mview_status_initialized) {
+					mview_state = win32_query_mview_handler(mview_status, sizeof(mview_status));
+					mview_status_initialized = true;
+				}
+
+				ImGui::TextUnformatted("3DHISTECH SlideCenter links");
+				bool handles_mview = mview_state == WIN32_MVIEW_HANDLER_ENABLED;
+				if (mview_state == WIN32_MVIEW_HANDLER_CONFLICT) ImGui::BeginDisabled();
+				if (ImGui::Checkbox("Handle mview: links with Slidescape", &handles_mview)) {
+					char operation_status[512];
+					bool success = win32_set_mview_handler(handles_mview,
+						operation_status, sizeof(operation_status));
+					mview_state = win32_query_mview_handler(mview_status, sizeof(mview_status));
+					if (!success) copy_cstring(mview_status, operation_status, sizeof(mview_status));
+				}
+				if (mview_state == WIN32_MVIEW_HANDLER_CONFLICT) ImGui::EndDisabled();
+				ImGui::TextWrapped("%s", mview_status);
+				// if (ImGui::Button("Refresh handler status")) {
+				// 	mview_state = win32_query_mview_handler(mview_status, sizeof(mview_status));
+				// }
+				ImGui::EndTabItem();
+			}
+#endif
 
 
 			ImGui::EndTabBar();

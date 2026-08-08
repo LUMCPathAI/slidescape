@@ -29,6 +29,15 @@ void win32_gui_new_frame(app_state_t* app_state);
 void win32_init_gui(app_state_t* app_state);
 void win32_update_gui_dpi(app_state_t* app_state, bool force);
 
+typedef enum win32_mview_handler_state_t {
+	WIN32_MVIEW_HANDLER_DISABLED = 0,
+	WIN32_MVIEW_HANDLER_ENABLED,
+	WIN32_MVIEW_HANDLER_CONFLICT,
+} win32_mview_handler_state_t;
+
+win32_mview_handler_state_t win32_query_mview_handler(char* status, size_t status_size);
+bool win32_set_mview_handler(bool enable, char* status, size_t status_size);
+
 #ifdef __cplusplus
 }
 #endif

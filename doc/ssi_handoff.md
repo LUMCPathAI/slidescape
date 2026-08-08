@@ -45,6 +45,17 @@ GUI falls back to its credential prompt. `page` is ignored. Plain `ssi:` input
 obtains the two server URLs from the environment. Both forms work through Open
 URI and the command line.
 
+On Windows, **Edit > General options > Integration** can make Slidescape the
+per-user handler for `mview:` links. The toggle creates only
+`HKEY_CURRENT_USER\Software\Classes\mview`; it does not alter a machine-wide
+SlideViewer registration. Any pre-existing per-user registration is copied to
+Slidescape-owned recovery data before the override is installed. Disabling the
+toggle verifies Slidescape's ownership marker and installed command before
+removing it, then restores the saved registration or reveals the untouched
+machine-wide handler. Slidescape refuses automatic changes when the handler or
+recovery data has been modified, or when Windows has a protected per-user
+Default Apps choice for `mview:`.
+
 The GUI prompts for a username and password if they are absent or rejected. It
 also prompts again when tile responses indicate that the slide/session has
 expired. Credentials are held in process memory, password-bearing temporary

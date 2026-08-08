@@ -68,12 +68,13 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 
 
 #define WIN32_COPYDATA_MAX_ARGS 32
+#define WIN32_COPYDATA_MAX_ARG_SIZE 4096
 
 struct win32_copydata_message_t {
 	i32 argc;
 	bool need_open;
-	char filename[512];
-	char argv[WIN32_COPYDATA_MAX_ARGS][512];
+	char filename[WIN32_COPYDATA_MAX_ARG_SIZE];
+	char argv[WIN32_COPYDATA_MAX_ARGS][WIN32_COPYDATA_MAX_ARG_SIZE];
 };
 
 #define SV_COPYDATA_TYPE 0x511d3
@@ -116,6 +117,217 @@ bool win32_registry_set_value(HKEY hkey, const char* key, DWORD type, const char
 		win32_diagnostic("RegSetValueExA");
 		return false;
 	}
+	return true;
+}
+
+#define WIN32_MVIEW_KEY "Software\\Classes\\mview"
+#define WIN32_MVIEW_COMMAND_KEY WIN32_MVIEW_KEY "\\shell\\open\\command"
+#define WIN32_MVIEW_BACKUP_KEY "Software\\Slidescape\\ProtocolBackups\\mview"
+#define WIN32_MVIEW_BACKUP_ORIGINAL_KEY WIN32_MVIEW_BACKUP_KEY "\\Original"
+#define WIN32_MVIEW_OWNER_VALUE "SlidescapeOwner"
+#define WIN32_MVIEW_OWNER_MARKER "Slidescape mview handler v1"
+
+static void win32_mview_set_status(char* status, size_t status_size, const char* message) {
+	if (status && status_size > 0) copy_cstring(status, message, status_size);
+}
+
+static bool win32_registry_key_exists(const char* path) {
+	HKEY key = NULL;
+	LSTATUS result = RegOpenKeyExA(HKEY_CURRENT_USER, path, 0, KEY_READ, &key);
+	if (key) RegCloseKey(key);
+	return result == ERROR_SUCCESS;
+}
+
+static bool win32_registry_read_string(const char* path, const char* name,
+									   char* value, DWORD value_size) {
+	HKEY key = NULL;
+	if (RegOpenKeyExA(HKEY_CURRENT_USER, path, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) return false;
+	DWORD type = 0;
+	DWORD size = value_size;
+	LSTATUS result = RegQueryValueExA(key, name, NULL, &type, (BYTE*)value, &size);
+	RegCloseKey(key);
+	if (result != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ) || size == 0) return false;
+	value[value_size - 1] = '\0';
+	return true;
+}
+
+static bool win32_registry_read_dword(const char* path, const char* name, DWORD* value) {
+	HKEY key = NULL;
+	if (RegOpenKeyExA(HKEY_CURRENT_USER, path, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) return false;
+	DWORD type = 0;
+	DWORD size = sizeof(*value);
+	LSTATUS result = RegQueryValueExA(key, name, NULL, &type, (BYTE*)value, &size);
+	RegCloseKey(key);
+	return result == ERROR_SUCCESS && type == REG_DWORD && size == sizeof(*value);
+}
+
+static bool win32_registry_copy_tree(const char* source_path, const char* destination_path) {
+	HKEY source = NULL;
+	HKEY destination = NULL;
+	if (RegOpenKeyExA(HKEY_CURRENT_USER, source_path, 0, KEY_READ, &source) != ERROR_SUCCESS) return false;
+	LSTATUS result = RegCreateKeyExA(HKEY_CURRENT_USER, destination_path, 0, NULL,
+									 REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &destination, NULL);
+	if (result == ERROR_SUCCESS) result = RegCopyTreeA(source, NULL, destination);
+	if (destination) RegCloseKey(destination);
+	RegCloseKey(source);
+	return result == ERROR_SUCCESS;
+}
+
+static bool win32_mview_is_owned(void) {
+	char owner[64];
+	return win32_registry_read_string(WIN32_MVIEW_KEY, WIN32_MVIEW_OWNER_VALUE,
+									 owner, sizeof(owner)) && strcmp(owner, WIN32_MVIEW_OWNER_MARKER) == 0;
+}
+
+static bool win32_mview_restore_original(void) {
+	DWORD had_original = 0;
+	if (!win32_registry_read_dword(WIN32_MVIEW_BACKUP_KEY, "HadOriginal", &had_original)) return false;
+	LSTATUS delete_result = RegDeleteTreeA(HKEY_CURRENT_USER, WIN32_MVIEW_KEY);
+	if (delete_result != ERROR_SUCCESS && delete_result != ERROR_FILE_NOT_FOUND) return false;
+	if (had_original && !win32_registry_copy_tree(WIN32_MVIEW_BACKUP_ORIGINAL_KEY, WIN32_MVIEW_KEY)) return false;
+	return true;
+}
+
+win32_mview_handler_state_t win32_query_mview_handler(char* status, size_t status_size) {
+	bool handler_exists = win32_registry_key_exists(WIN32_MVIEW_KEY);
+	bool backup_exists = win32_registry_key_exists(WIN32_MVIEW_BACKUP_KEY);
+	bool user_choice_exists = win32_registry_key_exists(
+		"Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\mview\\UserChoice");
+
+	if (handler_exists && win32_mview_is_owned()) {
+		char current_command[1024];
+		char installed_command[1024];
+		if (!backup_exists ||
+			!win32_registry_read_string(WIN32_MVIEW_COMMAND_KEY, NULL, current_command, sizeof(current_command)) ||
+			!win32_registry_read_string(WIN32_MVIEW_BACKUP_KEY, "InstalledCommand",
+									 installed_command, sizeof(installed_command)) ||
+			strcmp(current_command, installed_command) != 0) {
+			win32_mview_set_status(status, status_size,
+				"Slidescape's mview registration or recovery data was changed. No automatic registry changes will be made.");
+			return WIN32_MVIEW_HANDLER_CONFLICT;
+		}
+		win32_mview_set_status(status, status_size, user_choice_exists ?
+			"Slidescape's per-user handler is installed, but Windows has a separate default-app choice that may override it." :
+			"Slidescape handles mview links for this user. Disabling this restores the previous handler.");
+		return WIN32_MVIEW_HANDLER_ENABLED;
+	}
+
+	if (backup_exists) {
+		win32_mview_set_status(status, status_size,
+			"An incomplete mview handler operation needs manual recovery. The saved registry backup was left untouched.");
+		return WIN32_MVIEW_HANDLER_CONFLICT;
+	}
+	if (user_choice_exists) {
+		win32_mview_set_status(status, status_size,
+			"Windows has a protected default-app choice for mview links. Change it through Windows Default Apps.");
+		return WIN32_MVIEW_HANDLER_CONFLICT;
+	}
+	if (handler_exists) {
+		win32_mview_set_status(status, status_size,
+			"Another per-user mview handler is registered. Enabling Slidescape will preserve it in a registry backup for restoration.");
+		return WIN32_MVIEW_HANDLER_DISABLED;
+	}
+
+	win32_mview_set_status(status, status_size,
+		"The existing system-wide mview handler remains untouched. Enabling this creates a reversible per-user override.");
+	return WIN32_MVIEW_HANDLER_DISABLED;
+}
+
+bool win32_set_mview_handler(bool enable, char* status, size_t status_size) {
+	win32_mview_handler_state_t state = win32_query_mview_handler(status, status_size);
+	if ((enable && state == WIN32_MVIEW_HANDLER_ENABLED) ||
+		(!enable && state == WIN32_MVIEW_HANDLER_DISABLED)) return true;
+	if (state == WIN32_MVIEW_HANDLER_CONFLICT) return false;
+
+	if (!enable) {
+		char current_command[1024];
+		char installed_command[1024];
+		if (!win32_registry_read_string(WIN32_MVIEW_COMMAND_KEY, NULL, current_command, sizeof(current_command)) ||
+			!win32_registry_read_string(WIN32_MVIEW_BACKUP_KEY, "InstalledCommand",
+									 installed_command, sizeof(installed_command)) ||
+			strcmp(current_command, installed_command) != 0 || !win32_mview_restore_original()) {
+			win32_mview_set_status(status, status_size,
+				"Could not safely restore the previous mview handler. The registry backup was retained.");
+			return false;
+		}
+		RegDeleteTreeA(HKEY_CURRENT_USER, WIN32_MVIEW_BACKUP_KEY);
+		SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_DWORD | SHCNF_FLUSH, NULL, NULL);
+		win32_mview_set_status(status, status_size, "The previous mview handler has been restored.");
+		return true;
+	}
+
+	char executable[MAX_PATH];
+	if (!GetModuleFileNameA(NULL, executable, sizeof(executable)) ||
+		GetDriveTypeA(g_root_dir) != DRIVE_FIXED) {
+		win32_mview_set_status(status, status_size,
+			"Slidescape must be located on a fixed drive before it can handle mview links.");
+		return false;
+	}
+	executable[sizeof(executable) - 1] = '\0';
+	char open_command[1024];
+	snprintf(open_command, sizeof(open_command), "\"%s\" \"%%1\"", executable);
+	open_command[sizeof(open_command) - 1] = '\0';
+
+	HKEY backup = NULL;
+	if (RegCreateKeyExA(HKEY_CURRENT_USER, WIN32_MVIEW_BACKUP_KEY, 0, NULL,
+						REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &backup, NULL) != ERROR_SUCCESS) {
+		win32_mview_set_status(status, status_size, "Could not create recovery data for the mview handler.");
+		return false;
+	}
+	DWORD had_original = win32_registry_key_exists(WIN32_MVIEW_KEY) ? 1 : 0;
+	bool backup_ok = RegSetValueExA(backup, "HadOriginal", 0, REG_DWORD,
+									(BYTE*)&had_original, sizeof(had_original)) == ERROR_SUCCESS &&
+		RegSetValueExA(backup, "InstalledCommand", 0, REG_SZ, (BYTE*)open_command,
+						(DWORD)strlen(open_command) + 1) == ERROR_SUCCESS;
+	RegCloseKey(backup);
+	if (backup_ok && had_original) {
+		backup_ok = win32_registry_copy_tree(WIN32_MVIEW_KEY, WIN32_MVIEW_BACKUP_ORIGINAL_KEY);
+	}
+	if (!backup_ok) {
+		RegDeleteTreeA(HKEY_CURRENT_USER, WIN32_MVIEW_BACKUP_KEY);
+		win32_mview_set_status(status, status_size, "Could not back up the existing per-user mview handler.");
+		return false;
+	}
+
+	LSTATUS delete_result = RegDeleteTreeA(HKEY_CURRENT_USER, WIN32_MVIEW_KEY);
+	if (delete_result != ERROR_SUCCESS && delete_result != ERROR_FILE_NOT_FOUND) {
+		RegDeleteTreeA(HKEY_CURRENT_USER, WIN32_MVIEW_BACKUP_KEY);
+		win32_mview_set_status(status, status_size,
+			"Could not replace the existing per-user mview handler. It was left unchanged.");
+		return false;
+	}
+	HKEY handler = win32_registry_create_empty_key(WIN32_MVIEW_KEY);
+	bool install_ok = handler &&
+		win32_registry_set_value(handler, NULL, REG_SZ, "URL:MVIEW Protocol", sizeof("URL:MVIEW Protocol")) &&
+		win32_registry_set_value(handler, "URL Protocol", REG_SZ, "", sizeof("")) &&
+		win32_registry_set_value(handler, WIN32_MVIEW_OWNER_VALUE, REG_SZ,
+								 WIN32_MVIEW_OWNER_MARKER, sizeof(WIN32_MVIEW_OWNER_MARKER));
+	if (handler) RegCloseKey(handler);
+	HKEY icon = install_ok ? win32_registry_create_empty_key(WIN32_MVIEW_KEY "\\DefaultIcon") : NULL;
+	char icon_command[1024];
+	snprintf(icon_command, sizeof(icon_command), "\"%s\",0", executable);
+	if (icon) install_ok = win32_registry_set_value(icon, NULL, REG_SZ, icon_command,
+													  (DWORD)strlen(icon_command) + 1);
+	else install_ok = false;
+	if (icon) RegCloseKey(icon);
+	HKEY command = install_ok ? win32_registry_create_empty_key(WIN32_MVIEW_COMMAND_KEY) : NULL;
+	if (command) install_ok = win32_registry_set_value(command, NULL, REG_SZ, open_command,
+														 (DWORD)strlen(open_command) + 1);
+	else install_ok = false;
+	if (command) RegCloseKey(command);
+
+	if (!install_ok) {
+		bool restored = win32_mview_restore_original();
+		if (restored) RegDeleteTreeA(HKEY_CURRENT_USER, WIN32_MVIEW_BACKUP_KEY);
+		win32_mview_set_status(status, status_size, restored ?
+			"Could not install the Slidescape mview handler; the previous handler was restored." :
+			"Could not install or restore the mview handler. The registry backup was retained.");
+		return false;
+	}
+
+	SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_DWORD | SHCNF_FLUSH, NULL, NULL);
+	win32_mview_set_status(status, status_size,
+		"Slidescape now handles mview links for this user. The previous handler is preserved for restoration.");
 	return true;
 }
 
