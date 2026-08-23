@@ -120,6 +120,29 @@ bool win32_registry_set_value(HKEY hkey, const char* key, DWORD type, const char
 	return true;
 }
 
+static bool win32_registry_set_value_if_changed(HKEY hkey, const char* key, DWORD type,
+											 const char* value, DWORD size, bool* changed) {
+	DWORD existing_type = 0;
+	DWORD existing_size = 0;
+	LSTATUS query_result = RegQueryValueExA(hkey, key, NULL, &existing_type, NULL, &existing_size);
+	if (query_result == ERROR_SUCCESS && existing_type == type && existing_size == size) {
+		if (size == 0) return true;
+
+		BYTE* existing_value = (BYTE*)malloc(size);
+		if (existing_value) {
+			query_result = RegQueryValueExA(hkey, key, NULL, &existing_type, existing_value, &existing_size);
+			bool matches = query_result == ERROR_SUCCESS && existing_type == type && existing_size == size &&
+				memcmp(existing_value, value, size) == 0;
+			free(existing_value);
+			if (matches) return true;
+		}
+	}
+
+	if (!win32_registry_set_value(hkey, key, type, value, size)) return false;
+	*changed = true;
+	return true;
+}
+
 #define WIN32_MVIEW_KEY "Software\\Classes\\mview"
 #define WIN32_MVIEW_COMMAND_KEY WIN32_MVIEW_KEY "\\shell\\open\\command"
 #define WIN32_MVIEW_BACKUP_KEY "Software\\Slidescape\\ProtocolBackups\\mview"
@@ -331,15 +354,14 @@ bool win32_set_mview_handler(bool enable, char* status, size_t status_size) {
 	return true;
 }
 
-bool win32_registry_add_to_open_with_list(const char* ext) {
+bool win32_registry_add_to_open_with_list(const char* ext, bool* changed) {
 	char key_string[256];
 	snprintf(key_string, sizeof(key_string)-1, "Software\\Classes\\.%s\\OpenWithProgids", ext);
 	key_string[sizeof(key_string)-1] = '\0';
 	{
 		HKEY hkey = win32_registry_create_empty_key(key_string);
 		if (hkey) {
-			if (RegSetValueExA(hkey, "Slidescape.Image", 0, REG_SZ, NULL, 0) != ERROR_SUCCESS) {
-				win32_diagnostic("RegSetValueExA");
+			if (!win32_registry_set_value_if_changed(hkey, "Slidescape.Image", REG_SZ, NULL, 0, changed)) {
 				RegCloseKey(hkey);
 				return false;
 			}
@@ -361,6 +383,7 @@ void win32_set_file_type_associations() {
 //	console_print("g_root_dir = %s, drive_type = %d\n", g_root_dir, drive_type);
 
 	if (drive_type == DRIVE_FIXED || drive_type == DRIVE_REMOTE) {
+		bool associations_changed = false;
 		// "C:\path\to\slidescape.exe" "%1"
 		BYTE open_command[512];
 		snprintf((char*)open_command, sizeof(open_command) - 1, "\"%s\" \"%%1\"", g_exe_name);
@@ -389,8 +412,8 @@ void win32_set_file_type_associations() {
 				char friendly_app_name[512];
 				snprintf((char*)friendly_app_name, sizeof(friendly_app_name) - 1, "@\"%s\",-201", g_exe_name);
 				friendly_app_name[sizeof(friendly_app_name) - 1] = '\0';
-				if (RegSetValueExA(key, "FriendlyAppName", 0, REG_SZ, (BYTE*)friendly_app_name, strlen(friendly_app_name) + 1) != ERROR_SUCCESS) {
-					win32_diagnostic("RegSetValueExA");
+				if (!win32_registry_set_value_if_changed(key, "FriendlyAppName", REG_SZ, friendly_app_name,
+													 (DWORD)strlen(friendly_app_name) + 1, &associations_changed)) {
 					RegCloseKey(key);
 					return;
 				}
@@ -403,8 +426,8 @@ void win32_set_file_type_associations() {
 			HKEY key = win32_registry_create_empty_key("Software\\Classes\\Applications\\slidescape.exe\\DefaultIcon");
 			if (key) {
 				static const BYTE value[] = "%SystemRoot%\\System32\\imageres.dll,-122";
-				if (RegSetValueExA(key, NULL, 0, REG_SZ, value, COUNT(value)) != ERROR_SUCCESS) {
-					win32_diagnostic("RegSetValueExA");
+				if (!win32_registry_set_value_if_changed(key, NULL, REG_SZ, (const char*)value,
+													 COUNT(value), &associations_changed)) {
 					RegCloseKey(key);
 					return;
 				}
@@ -416,7 +439,8 @@ void win32_set_file_type_associations() {
 		{
 			HKEY hkey = win32_registry_create_empty_key("Software\\Classes\\Applications\\slidescape.exe\\shell\\open\\command");
 			if (hkey) {
-				if (!win32_registry_set_value(hkey, NULL, REG_SZ, (char*)open_command, open_command_length)) {
+				if (!win32_registry_set_value_if_changed(hkey, NULL, REG_SZ, (char*)open_command,
+													 (DWORD)open_command_length, &associations_changed)) {
 					RegCloseKey(hkey);
 					return;
 				}
@@ -428,16 +452,16 @@ void win32_set_file_type_associations() {
 		{
 			HKEY hkey = win32_registry_create_empty_key("Software\\Classes\\Applications\\slidescape.exe\\SupportedTypes");
 			if (hkey) {
-				if (!win32_registry_set_value(hkey, ".isyntax", REG_SZ, NULL, 0)) goto fail_SupportedTypes;
-				if (!win32_registry_set_value(hkey, ".i2syntax", REG_SZ, NULL, 0)) goto fail_SupportedTypes;
-				if (!win32_registry_set_value(hkey, ".tif", REG_SZ, NULL, 0)) goto fail_SupportedTypes;
-				if (!win32_registry_set_value(hkey, ".tiff", REG_SZ, NULL, 0)) goto fail_SupportedTypes;
-				if (!win32_registry_set_value(hkey, ".svs", REG_SZ, NULL, 0)) goto fail_SupportedTypes;
-				if (!win32_registry_set_value(hkey, ".ndpi", REG_SZ, NULL, 0)) goto fail_SupportedTypes;
-				if (!win32_registry_set_value(hkey, ".vms", REG_SZ, NULL, 0)) goto fail_SupportedTypes;
-				if (!win32_registry_set_value(hkey, ".scn", REG_SZ, NULL, 0)) goto fail_SupportedTypes;
-				if (!win32_registry_set_value(hkey, ".mrxs", REG_SZ, NULL, 0)) goto fail_SupportedTypes;
-				if (!win32_registry_set_value(hkey, ".bif", REG_SZ, NULL, 0)) goto fail_SupportedTypes;
+				if (!win32_registry_set_value_if_changed(hkey, ".isyntax", REG_SZ, NULL, 0, &associations_changed)) goto fail_SupportedTypes;
+				if (!win32_registry_set_value_if_changed(hkey, ".i2syntax", REG_SZ, NULL, 0, &associations_changed)) goto fail_SupportedTypes;
+				if (!win32_registry_set_value_if_changed(hkey, ".tif", REG_SZ, NULL, 0, &associations_changed)) goto fail_SupportedTypes;
+				if (!win32_registry_set_value_if_changed(hkey, ".tiff", REG_SZ, NULL, 0, &associations_changed)) goto fail_SupportedTypes;
+				if (!win32_registry_set_value_if_changed(hkey, ".svs", REG_SZ, NULL, 0, &associations_changed)) goto fail_SupportedTypes;
+				if (!win32_registry_set_value_if_changed(hkey, ".ndpi", REG_SZ, NULL, 0, &associations_changed)) goto fail_SupportedTypes;
+				if (!win32_registry_set_value_if_changed(hkey, ".vms", REG_SZ, NULL, 0, &associations_changed)) goto fail_SupportedTypes;
+				if (!win32_registry_set_value_if_changed(hkey, ".scn", REG_SZ, NULL, 0, &associations_changed)) goto fail_SupportedTypes;
+				if (!win32_registry_set_value_if_changed(hkey, ".mrxs", REG_SZ, NULL, 0, &associations_changed)) goto fail_SupportedTypes;
+				if (!win32_registry_set_value_if_changed(hkey, ".bif", REG_SZ, NULL, 0, &associations_changed)) goto fail_SupportedTypes;
 				RegCloseKey(hkey);
 			} else {
 				fail_SupportedTypes:
@@ -452,13 +476,13 @@ void win32_set_file_type_associations() {
 			if (hkey) {
 				static const BYTE value[] = "URL:Slide Score Protocol";
 				static const BYTE url_protocol[] = "";
-				if (RegSetValueExA(hkey, NULL, 0, REG_SZ, value, COUNT(value)) != ERROR_SUCCESS) {
-					win32_diagnostic("RegSetValueExA");
+				if (!win32_registry_set_value_if_changed(hkey, NULL, REG_SZ, (const char*)value,
+													 COUNT(value), &associations_changed)) {
 					RegCloseKey(hkey);
 					return;
 				}
-				if (RegSetValueExA(hkey, "URL Protocol", 0, REG_SZ, url_protocol, COUNT(url_protocol)) != ERROR_SUCCESS) {
-					win32_diagnostic("RegSetValueExA");
+				if (!win32_registry_set_value_if_changed(hkey, "URL Protocol", REG_SZ,
+													 (const char*)url_protocol, COUNT(url_protocol), &associations_changed)) {
 					RegCloseKey(hkey);
 					return;
 				}
@@ -473,7 +497,8 @@ void win32_set_file_type_associations() {
 				char icon_command[512];
 				snprintf(icon_command, sizeof(icon_command) - 1, "\"%s\",0", g_exe_name);
 				icon_command[sizeof(icon_command) - 1] = '\0';
-				if (!win32_registry_set_value(hkey, NULL, REG_SZ, icon_command, (DWORD)strlen(icon_command) + 1)) {
+				if (!win32_registry_set_value_if_changed(hkey, NULL, REG_SZ, icon_command,
+													 (DWORD)strlen(icon_command) + 1, &associations_changed)) {
 					RegCloseKey(hkey);
 					return;
 				}
@@ -485,7 +510,8 @@ void win32_set_file_type_associations() {
 		{
 			HKEY hkey = win32_registry_create_empty_key("Software\\Classes\\slidescore\\shell\\open\\command");
 			if (hkey) {
-				if (!win32_registry_set_value(hkey, NULL, REG_SZ, (char*)open_command, open_command_length)) {
+				if (!win32_registry_set_value_if_changed(hkey, NULL, REG_SZ, (char*)open_command,
+													 (DWORD)open_command_length, &associations_changed)) {
 					RegCloseKey(hkey);
 					return;
 				}
@@ -501,8 +527,8 @@ void win32_set_file_type_associations() {
 			HKEY hkey = win32_registry_create_empty_key("Software\\Classes\\Slidescape.Image");
 			if (hkey) {
 				static const BYTE value[] = "Slidescape";
-				if (RegSetValueExA(hkey, NULL, 0, REG_SZ, value, COUNT(value)) != ERROR_SUCCESS) {
-					win32_diagnostic("RegSetValueExA");
+				if (!win32_registry_set_value_if_changed(hkey, NULL, REG_SZ, (const char*)value,
+													 COUNT(value), &associations_changed)) {
 					RegCloseKey(hkey);
 					return;
 				}
@@ -510,8 +536,8 @@ void win32_set_file_type_associations() {
 				char friendly_type_name[512];
 				snprintf((char*)friendly_type_name, sizeof(friendly_type_name)-1, "@\"%s\",-202", g_exe_name);
 				friendly_type_name[sizeof(friendly_type_name)-1] = '\0';
-				if (RegSetValueExA(hkey, "FriendlyTypeName", 0, REG_SZ, (BYTE*)friendly_type_name, strlen(friendly_type_name) + 1) != ERROR_SUCCESS) {
-					win32_diagnostic("RegSetValueExA");
+				if (!win32_registry_set_value_if_changed(hkey, "FriendlyTypeName", REG_SZ, friendly_type_name,
+													 (DWORD)strlen(friendly_type_name) + 1, &associations_changed)) {
 					RegCloseKey(hkey);
 					return;
 				}
@@ -526,8 +552,8 @@ void win32_set_file_type_associations() {
 			HKEY hkey = win32_registry_create_empty_key("Software\\Classes\\Slidescape.Image\\DefaultIcon");
 			if (hkey) {
 				static const BYTE value[] = "%SystemRoot%\\System32\\imageres.dll,-122";
-				if (RegSetValueExA(hkey, NULL, 0, REG_SZ, value, COUNT(value)) != ERROR_SUCCESS) {
-					win32_diagnostic("RegSetValueExA");
+				if (!win32_registry_set_value_if_changed(hkey, NULL, REG_SZ, (const char*)value,
+													 COUNT(value), &associations_changed)) {
 					RegCloseKey(hkey);
 					return;
 				}
@@ -539,8 +565,8 @@ void win32_set_file_type_associations() {
 		{
 			HKEY hkey = win32_registry_create_empty_key("Software\\Classes\\Slidescape.Image\\shell\\open\\command");
 			if (hkey) {
-				if (RegSetValueExA(hkey, NULL, 0, REG_SZ, open_command, open_command_length) != ERROR_SUCCESS) {
-					win32_diagnostic("RegSetValueExA");
+				if (!win32_registry_set_value_if_changed(hkey, NULL, REG_SZ, (char*)open_command,
+													 (DWORD)open_command_length, &associations_changed)) {
 					RegCloseKey(hkey);
 					return;
 				}
@@ -551,30 +577,31 @@ void win32_set_file_type_associations() {
 		}
 
 		// Create the filetype associations
-		if (!win32_registry_add_to_open_with_list("isyntax")) return;
-		if (!win32_registry_add_to_open_with_list("i2syntax")) return;
-		if (!win32_registry_add_to_open_with_list("tiff")) return;
-		if (!win32_registry_add_to_open_with_list("tif")) return;
-		if (!win32_registry_add_to_open_with_list("ptif")) return;
+		if (!win32_registry_add_to_open_with_list("isyntax", &associations_changed)) return;
+		if (!win32_registry_add_to_open_with_list("i2syntax", &associations_changed)) return;
+		if (!win32_registry_add_to_open_with_list("tiff", &associations_changed)) return;
+		if (!win32_registry_add_to_open_with_list("tif", &associations_changed)) return;
+		if (!win32_registry_add_to_open_with_list("ptif", &associations_changed)) return;
 
 		// Let the system know that file associations have been changed
-		SHChangeNotify(SHCNE_ASSOCCHANGED, 0, 0, 0);
+		if (associations_changed) SHChangeNotify(SHCNE_ASSOCCHANGED, 0, 0, 0);
 	}
 }
 
 void load_openslide_task(int logical_thread_index, void* userdata) {
 	is_openslide_available = init_openslide();
 	if (is_openslide_available) {
+		bool associations_changed = false;
 		// Add the OpenSlide formats to the "Open With..." window
-		if (!win32_registry_add_to_open_with_list("svs")) return;
-		if (!win32_registry_add_to_open_with_list("ndpi")) return;
-		if (!win32_registry_add_to_open_with_list("vms")) return;
-		if (!win32_registry_add_to_open_with_list("scn")) return;
-		if (!win32_registry_add_to_open_with_list("mrxs")) return;
-		if (!win32_registry_add_to_open_with_list("bif")) return;
+		if (!win32_registry_add_to_open_with_list("svs", &associations_changed)) return;
+		if (!win32_registry_add_to_open_with_list("ndpi", &associations_changed)) return;
+		if (!win32_registry_add_to_open_with_list("vms", &associations_changed)) return;
+		if (!win32_registry_add_to_open_with_list("scn", &associations_changed)) return;
+		if (!win32_registry_add_to_open_with_list("mrxs", &associations_changed)) return;
+		if (!win32_registry_add_to_open_with_list("bif", &associations_changed)) return;
 
 		// Let the system know that file associations have been changed
-		SHChangeNotify(SHCNE_ASSOCCHANGED, 0, 0, 0);
+		if (associations_changed) SHChangeNotify(SHCNE_ASSOCCHANGED, 0, 0, 0);
 	}
 	is_openslide_loading_done = true;
 }
