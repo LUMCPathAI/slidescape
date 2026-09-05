@@ -223,12 +223,20 @@ TEST_CASE("retryable tile failure releases its reservation without marking empty
 	REQUIRE(tile_cache_apply_result(&fixture.image, &result, true, &action));
 	CHECK_FALSE(action.mark_empty);
 	CHECK_FALSE(tile_cache_tile_is_busy(&fixture.image, 0, 0));
-	CHECK(tile_cache_try_begin_decode(&fixture.image, 0, 0,
-	                                  TILE_CACHE_DEMAND_VIEWER_VISIBLE |
-	                                  TILE_CACHE_DEMAND_GPU_RESIDENCY,
-	                                  10, 0));
-	tile_cache_cancel_decode(&fixture.image, 0, 0);
+	CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	                                        TILE_CACHE_DEMAND_VIEWER_VISIBLE |
+	                                        TILE_CACHE_DEMAND_GPU_RESIDENCY,
+	                                        10, 0));
 	tile_cache_test_image_destroy(&fixture);
+}
+
+TEST_CASE("retryable tile failure cooldown grows exponentially and is capped") {
+	CHECK(tile_cache_retry_delay_seconds(0) == doctest::Approx(0.0f));
+	CHECK(tile_cache_retry_delay_seconds(1) == doctest::Approx(0.5f));
+	CHECK(tile_cache_retry_delay_seconds(2) == doctest::Approx(1.0f));
+	CHECK(tile_cache_retry_delay_seconds(6) == doctest::Approx(16.0f));
+	CHECK(tile_cache_retry_delay_seconds(7) == doctest::Approx(30.0f));
+	CHECK(tile_cache_retry_delay_seconds(100) == doctest::Approx(30.0f));
 }
 
 TEST_CASE("CPU tile pixels live until the final pin is released") {

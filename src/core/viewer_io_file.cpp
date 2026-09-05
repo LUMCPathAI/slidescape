@@ -298,8 +298,7 @@ static bool ssi_response_body_contains(const http_response_t* response, const ch
 
 static bool ssi_response_requires_reauthentication(const http_response_t* response) {
 	if (!response) return false;
-	if (response->status_code == 401 || response->status_code == 403 ||
-	    response->status_code == 404) return true;
+	if (response->status_code == 401 || response->status_code == 403) return true;
 	return response->status_code == 400 &&
 	       (ssi_response_body_contains(response, "token") ||
 	        ssi_response_body_contains(response, "session"));

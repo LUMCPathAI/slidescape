@@ -125,7 +125,10 @@ bool app_write_slide_score_api_key(const char* api_key) {
 bool app_load_input(app_state_t* app_state, const char* input, u32 filetype_hint) {
 	if (filetype_hint == 0 && ssi_uri_is_supported(input)) {
 		if (ssi_try_open_uri(app_state, input)) return true;
-		if (!app_state->headless) {
+		ssi_failure_kind_t failure_kind = ssi_get_last_failure_kind();
+		if (!app_state->headless &&
+		    (failure_kind == SSI_FAILURE_SESSION_EXPIRED ||
+		     ssi_failure_requires_credentials(failure_kind))) {
 			gui_prompt_for_ssi_credentials(input, ssi_get_last_status());
 			return true;
 		}

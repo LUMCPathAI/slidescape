@@ -20,6 +20,7 @@
 extern bool show_slide_tray_window;
 
 static char ssi_last_status[512];
+static ssi_failure_kind_t ssi_last_failure_kind;
 
 static void ssi_set_status(const char* format, ...) {
 	va_list args;
@@ -31,6 +32,19 @@ static void ssi_set_status(const char* format, ...) {
 
 const char* ssi_get_last_status(void) {
 	return ssi_last_status;
+}
+
+ssi_failure_kind_t ssi_get_last_failure_kind(void) {
+	return ssi_last_failure_kind;
+}
+
+static void ssi_set_http_failure(ssi_remote_image_t* remote,
+		const http_response_t* response, bool credential_request,
+		bool expiring_handle_request) {
+	if (!remote) return;
+	remote->failure_kind = ssi_classify_http_failure(
+		response ? response->status_code : 0, credential_request,
+		expiring_handle_request);
 }
 
 static void ssi_secure_zero(void* memory, size_t size) {
@@ -180,6 +194,7 @@ static bool ssi_create_session(ssi_remote_image_t* remote,
 	                                                (size_t)body_length, "application/json");
 	ssi_secure_zero(body, sizeof(body));
 	if (!ssi_response_succeeded(response)) {
+		ssi_set_http_failure(remote, response, true, false);
 		ssi_set_status("SSI session creation failed (HTTP %d).",
 		               response ? response->status_code : 0);
 		console_print_error("%s\n", ssi_last_status);
@@ -191,7 +206,10 @@ static bool ssi_create_session(ssi_remote_image_t* remote,
 	                                    sizeof(remote->session_id));
 	http_response_destroy(response);
 	remote->session_open = parsed && ssi_identifier_is_safe(remote->session_id);
-	if (!remote->session_open) ssi_set_status("SSI returned an invalid session handle.");
+	if (!remote->session_open) {
+		remote->failure_kind = SSI_FAILURE_OTHER;
+		ssi_set_status("SSI returned an invalid session handle.");
+	}
 	return remote->session_open;
 }
 
@@ -215,6 +233,7 @@ static bool ssi_connect_session(ssi_remote_image_t* remote,
 	                                                REMOTE_HTTP_POST, path,
 	                                                NULL, NULL, 0, "application/json");
 	if (!ssi_response_succeeded(response)) {
+		ssi_set_http_failure(remote, response, false, true);
 		ssi_set_status("SSI could not connect to the mview session (HTTP %d).",
 		               response ? response->status_code : 0);
 		console_print_error("%s\n", ssi_last_status);
@@ -226,7 +245,10 @@ static bool ssi_connect_session(ssi_remote_image_t* remote,
 	                                    sizeof(remote->session_id));
 	http_response_destroy(response);
 	remote->session_open = parsed && ssi_identifier_is_safe(remote->session_id);
-	if (!remote->session_open) ssi_set_status("SSI returned an invalid session handle.");
+	if (!remote->session_open) {
+		remote->failure_kind = SSI_FAILURE_OTHER;
+		ssi_set_status("SSI returned an invalid session handle.");
+	}
 	return remote->session_open;
 }
 
@@ -241,6 +263,7 @@ static bool ssi_open_slide(ssi_remote_image_t* remote) {
 	                                                REMOTE_HTTP_POST, path,
 	                                                NULL, NULL, 0, "application/json");
 	if (!ssi_response_succeeded(response)) {
+		ssi_set_http_failure(remote, response, false, true);
 		ssi_set_status("SSI could not open the requested slide (HTTP %d).",
 		               response ? response->status_code : 0);
 		console_print_error("%s\n", ssi_last_status);
@@ -252,7 +275,10 @@ static bool ssi_open_slide(ssi_remote_image_t* remote) {
 	                                    sizeof(remote->slide_token));
 	http_response_destroy(response);
 	remote->slide_open = parsed && ssi_identifier_is_safe(remote->slide_token);
-	if (!remote->slide_open) ssi_set_status("SSI returned an invalid slide handle.");
+	if (!remote->slide_open) {
+		remote->failure_kind = SSI_FAILURE_OTHER;
+		ssi_set_status("SSI returned an invalid slide handle.");
+	}
 	return remote->slide_open;
 }
 
@@ -266,6 +292,7 @@ static bool ssi_get_slide_properties(ssi_remote_image_t* remote) {
 	                                                REMOTE_HTTP_GET, path,
 	                                                NULL, NULL, 0, "application/json");
 	if (!ssi_response_succeeded(response)) {
+		ssi_set_http_failure(remote, response, false, true);
 		ssi_set_status("SSI base-properties request failed (HTTP %d).",
 		               response ? response->status_code : 0);
 		console_print_error("%s\n", ssi_last_status);
@@ -275,7 +302,10 @@ static bool ssi_get_slide_properties(ssi_remote_image_t* remote) {
 	bool parsed = ssi_parse_slide_properties((const char*)response->buffer.data,
 	                                         response->content_length, &remote->properties);
 	http_response_destroy(response);
-	if (!parsed) ssi_set_status("SSI returned invalid or unsupported slide properties.");
+	if (!parsed) {
+		remote->failure_kind = SSI_FAILURE_OTHER;
+		ssi_set_status("SSI returned invalid or unsupported slide properties.");
+	}
 	return parsed;
 }
 
@@ -329,10 +359,16 @@ static bool ssi_get_slide_attributes(ssi_remote_image_t* remote) {
 		                      (i32)remote->slide_attributes_json_size,
 		                      remote->slide_attributes_json);
 	} else {
+		ssi_set_http_failure(remote, response, false, true);
 		console_print_verbose("SSI slide attributes are unavailable.\n");
 	}
 	if (response) http_response_destroy(response);
-	if (!stored) ssi_set_status("SSI returned invalid or unavailable slide attributes.");
+	if (!stored) {
+		if (remote->failure_kind == SSI_FAILURE_NONE) {
+			remote->failure_kind = SSI_FAILURE_OTHER;
+		}
+		ssi_set_status("SSI returned invalid or unavailable slide attributes.");
+	}
 	return stored;
 }
 
@@ -389,6 +425,7 @@ static bool ssi_get_required_slide_data(ssi_remote_image_t* remote) {
 		ssi_required_attributes_task_func(0, &attributes_pointer);
 	}
 	if (!properties_ok || !attributes.succeeded) {
+		if (properties_ok) remote->failure_kind = attributes.remote.failure_kind;
 		free(attributes.remote.slide_attributes_json);
 		return false;
 	}
@@ -785,7 +822,9 @@ void ssi_commit_optional_data(app_state_t* app_state, void* result_pointer) {
 void ssi_close_remote_image(ssi_remote_image_t* remote) {
 	if (!remote) return;
 	char path[1024];
-	if (remote->slide_open && ssi_identifier_is_safe(remote->slide_token)) {
+	bool handles_may_be_valid = remote->reauthentication_state == 0;
+	if (handles_may_be_valid && remote->slide_open &&
+	    ssi_identifier_is_safe(remote->slide_token)) {
 		i32 length = snprintf(path, sizeof(path),
 		                      "%s/api/simpleslideinterface/v1/slide/%s/close",
 		                      remote->endpoint.root, remote->slide_token);
@@ -797,7 +836,8 @@ void ssi_close_remote_image(ssi_remote_image_t* remote) {
 	}
 	remote->slide_open = false;
 	remote->slide_token[0] = '\0';
-	if (remote->session_open && ssi_identifier_is_safe(remote->session_id)) {
+	if (handles_may_be_valid && remote->session_open &&
+	    ssi_identifier_is_safe(remote->session_id)) {
 		i32 length = snprintf(path, sizeof(path),
 		                      "%s/api/simpleslideinterface/v1/session/%s/close",
 		                      remote->endpoint.root, remote->session_id);
@@ -879,18 +919,27 @@ bool ssi_open_remote_image(app_state_t* app_state, const char* api_url,
 		const char* existing_session_id, const char* slide_guid, const char* caption) {
 	i64 total_start_clock = get_clock();
 	ssi_last_status[0] = '\0';
-	if (!app_state || !api_url || !slide_center_url || !slide_guid ||
-	    ((!existing_session_id || !existing_session_id[0]) && (!username || !password))) {
+	ssi_last_failure_kind = SSI_FAILURE_NONE;
+	if (!app_state || !api_url || !slide_center_url || !slide_guid) {
 		ssi_set_status("SSI configuration or credentials are missing.");
+		ssi_last_failure_kind = SSI_FAILURE_OTHER;
+		return false;
+	}
+	if ((!existing_session_id || !existing_session_id[0]) &&
+	    (!username || !username[0] || !password || !password[0])) {
+		ssi_set_status("SlideCenter credentials are required.");
+		ssi_last_failure_kind = SSI_FAILURE_CREDENTIALS_REQUIRED;
 		return false;
 	}
 	ssi_remote_image_t remote = {0};
 	if (!ssi_parse_endpoint(api_url, &remote.endpoint)) {
 		ssi_set_status("Expected a secure SSI API URL ending in /SSI.");
+		ssi_last_failure_kind = SSI_FAILURE_OTHER;
 		return false;
 	}
 	if (strlen(slide_guid) != 32) {
 		ssi_set_status("SSI slide identifiers must contain 32 hexadecimal characters.");
+		ssi_last_failure_kind = SSI_FAILURE_OTHER;
 		return false;
 	}
 	for (i32 i = 0; i < 32; ++i) {
@@ -898,6 +947,7 @@ bool ssi_open_remote_image(app_state_t* app_state, const char* api_url,
 		if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
 		      (c >= 'A' && c <= 'F'))) {
 			ssi_set_status("SSI slide identifiers must contain 32 hexadecimal characters.");
+			ssi_last_failure_kind = SSI_FAILURE_OTHER;
 			return false;
 		}
 	}
@@ -906,24 +956,42 @@ bool ssi_open_remote_image(app_state_t* app_state, const char* api_url,
 	copy_cstring(remote.api_url, api_url, sizeof(remote.api_url));
 	copy_cstring(remote.slide_center_url, slide_center_url, sizeof(remote.slide_center_url));
 
-	bool opened = (existing_session_id && existing_session_id[0]
-	               ? ssi_connect_session(&remote,
-	                                     slide_center_url, existing_session_id)
-	               : ssi_create_session(&remote, slide_center_url,
-	                                    username, password)) &&
+	bool session_opened = false;
+	if (existing_session_id && existing_session_id[0]) {
+		session_opened = ssi_connect_session(&remote, slide_center_url,
+		                                     existing_session_id);
+		if (!session_opened && remote.failure_kind == SSI_FAILURE_SESSION_EXPIRED &&
+		    username && username[0] && password && password[0]) {
+			console_print_verbose(
+				"SSI mview session is unavailable; creating a replacement session "
+				"with the cached credentials.\n");
+			remote.failure_kind = SSI_FAILURE_NONE;
+			remote.session_id[0] = '\0';
+			session_opened = ssi_create_session(&remote, slide_center_url,
+			                                    username, password);
+		}
+	} else {
+		session_opened = ssi_create_session(&remote, slide_center_url,
+		                                    username, password);
+	}
+	bool opened = session_opened &&
 	              ssi_open_slide(&remote) &&
 	              ssi_get_required_slide_data(&remote);
 	if (!opened) {
+		ssi_last_failure_kind = remote.failure_kind != SSI_FAILURE_NONE
+		                        ? remote.failure_kind : SSI_FAILURE_OTHER;
 		ssi_close_remote_image(&remote);
 		return false;
 	}
 
 	image_t* image = ssi_create_initialized_image(&remote, false);
 	if (!image) {
+		ssi_last_failure_kind = SSI_FAILURE_OTHER;
 		if (remote.session_open) ssi_close_remote_image(&remote);
 		return false;
 	}
 	ssi_install_image(app_state, image, total_start_clock);
+	ssi_last_failure_kind = SSI_FAILURE_NONE;
 	ssi_set_status("Opened SSI slide '%s'.", image->name);
 	console_print("%s\n", ssi_last_status);
 	return true;
@@ -932,9 +1000,11 @@ bool ssi_open_remote_image(app_state_t* app_state, const char* api_url,
 bool ssi_open_folder_slide(app_state_t* app_state, image_t* current_image,
 		i32 slide_index) {
 	i64 total_start_clock = get_clock();
+	ssi_last_failure_kind = SSI_FAILURE_NONE;
 	if (!app_state || !current_image || current_image->backend != IMAGE_BACKEND_SSI ||
 	    slide_index < 0 || slide_index >= current_image->ssi.folder_slide_count) {
 		ssi_set_status("The selected SSI folder slide is unavailable.");
+		ssi_last_failure_kind = SSI_FAILURE_OTHER;
 		return false;
 	}
 	ssi_slide_ref_t selected = current_image->ssi.folder_slides[slide_index];
@@ -951,11 +1021,14 @@ bool ssi_open_folder_slide(app_state_t* app_state, image_t* current_image,
 	remote.session_open = current_image->ssi.session_open;
 	if (!remote.session_open) {
 		ssi_set_status("The SSI session is no longer available.");
+		ssi_last_failure_kind = SSI_FAILURE_SESSION_EXPIRED;
 		return false;
 	}
 	bool opened = ssi_open_slide(&remote) &&
 	              ssi_get_required_slide_data(&remote);
 	if (!opened) {
+		ssi_last_failure_kind = remote.failure_kind != SSI_FAILURE_NONE
+		                        ? remote.failure_kind : SSI_FAILURE_OTHER;
 		remote.session_open = false;
 		ssi_close_remote_image(&remote);
 		return false;
@@ -975,6 +1048,7 @@ bool ssi_open_folder_slide(app_state_t* app_state, image_t* current_image,
 	}
 	image_t* image = ssi_create_initialized_image(&remote, true);
 	if (!image) {
+		ssi_last_failure_kind = SSI_FAILURE_OTHER;
 		remote.session_open = false;
 		ssi_close_remote_image(&remote);
 		return false;
@@ -982,6 +1056,7 @@ bool ssi_open_folder_slide(app_state_t* app_state, image_t* current_image,
 	/* Transfer session ownership before destroying the previous slide image. */
 	current_image->ssi.session_open = false;
 	ssi_install_image(app_state, image, total_start_clock);
+	ssi_last_failure_kind = SSI_FAILURE_NONE;
 	ssi_set_status("Opened SSI slide '%s'.", image->name);
 	console_print("%s\n", ssi_last_status);
 	return true;
@@ -1006,6 +1081,7 @@ bool ssi_open_uri_with_credentials(app_state_t* app_state, const char* uri,
 		const char* username, const char* password) {
 	ssi_uri_config_t config;
 	if (!ssi_resolve_uri(uri, &config)) {
+		ssi_last_failure_kind = SSI_FAILURE_OTHER;
 		ssi_set_status("Could not resolve the SSI or mview URI. Plain ssi: links also require "
 		               "SLIDESCAPE_SSI_API_URL and SLIDESCAPE_SSI_SLIDECENTER_URL.");
 		return false;
@@ -1019,9 +1095,15 @@ bool ssi_try_open_uri(app_state_t* app_state, const char* uri) {
 	const char* username = getenv("SLIDESCAPE_SSI_USERNAME");
 	const char* password = getenv("SLIDESCAPE_SSI_PASSWORD");
 	ssi_uri_config_t config;
-	if (!ssi_resolve_uri(uri, &config)) return false;
-	if (!config.session_id[0] && (!username || !password)) {
+	if (!ssi_resolve_uri(uri, &config)) {
+		ssi_last_failure_kind = SSI_FAILURE_OTHER;
+		ssi_set_status("Could not resolve the SSI or mview URI.");
+		return false;
+	}
+	if (!config.session_id[0] &&
+	    (!username || !username[0] || !password || !password[0])) {
 		ssi_set_status("SSI credentials are required.");
+		ssi_last_failure_kind = SSI_FAILURE_CREDENTIALS_REQUIRED;
 		console_print_error("%s\n", ssi_last_status);
 		return false;
 	}

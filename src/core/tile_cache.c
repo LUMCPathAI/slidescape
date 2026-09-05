@@ -47,8 +47,10 @@ typedef struct tile_cache_tile_t {
 	renderer_texture_handle_t texture;
 	i32 generation;
 	i32 priority;
+	u16 retryable_failure_count;
 	i64 last_cpu_access_time;
 	i64 last_gpu_access_time;
+	i64 last_retryable_failure_time;
 } tile_cache_tile_t;
 
 struct tile_cache_t {
@@ -118,6 +120,19 @@ static bool tile_cache_bounds2f_equal(bounds2f a, bounds2f b) {
 
 static bool tile_cache_v2f_equal(v2f a, v2f b) {
 	return a.x == b.x && a.y == b.y;
+}
+
+float tile_cache_retry_delay_seconds(i32 consecutive_failure_count) {
+	if (consecutive_failure_count <= 0) return 0.0f;
+	i32 shift = ATMOST(consecutive_failure_count - 1, 6);
+	return ATMOST(0.5f * (float)(1 << shift), 30.0f);
+}
+
+/* cache->lock must be held. */
+static bool tile_cache_retry_is_due_locked(tile_cache_tile_t* tile, i64 now) {
+	if (!tile || tile->retryable_failure_count == 0) return true;
+	float delay = tile_cache_retry_delay_seconds(tile->retryable_failure_count);
+	return get_seconds_elapsed(tile->last_retryable_failure_time, now) >= delay;
 }
 
 static tile_cache_policy_t tile_cache_make_policy(image_t* image) {
@@ -506,6 +521,15 @@ bool tile_cache_apply_result(image_t* image, tile_cache_result_t* result,
 
 	if (!result->pixel_memory) {
 		tile_cache_unmark_viewer_inflight_locked(cache, tile);
+		if (result->retryable_failure) {
+			if (tile->retryable_failure_count < UINT16_MAX) {
+				++tile->retryable_failure_count;
+			}
+			tile->last_retryable_failure_time = get_clock();
+		} else if (!result->failed) {
+			tile->retryable_failure_count = 0;
+			tile->last_retryable_failure_time = 0;
+		}
 		tile->request_state = result->retryable_failure ? TILE_CACHE_UNREQUESTED
 		                    : result->failed ? TILE_CACHE_FAILED : TILE_CACHE_READY;
 		out_action->mark_empty = result->is_empty ||
@@ -515,6 +539,8 @@ bool tile_cache_apply_result(image_t* image, tile_cache_result_t* result,
 	}
 
 	tile->request_state = TILE_CACHE_READY;
+	tile->retryable_failure_count = 0;
+	tile->last_retryable_failure_time = 0;
 	bool retain_cpu_pixels = tile->cpu_pin_count > 0 || (!renderer_available &&
 	                         (result->want_cpu_residency || result->want_gpu_residency));
 	bool cache_owns_result_pixels = false;
@@ -644,7 +670,10 @@ bool tile_cache_try_begin_decode(image_t* image, i32 level, i32 tile_index, u32 
 	platform_mutex_lock(&cache->lock);
 	tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, level, tile_index);
 	if (!tile_cache_accepts_work_locked(cache) || !tile ||
-	    tile->decode_in_flight || tile->upload_pending) {
+	    tile->decode_in_flight || tile->upload_pending ||
+	    (image->backend == IMAGE_BACKEND_SSI &&
+	     image->ssi.reauthentication_state != 0) ||
+	    !tile_cache_retry_is_due_locked(tile, get_clock())) {
 		platform_mutex_unlock(&cache->lock);
 		return false;
 	}
@@ -914,6 +943,10 @@ static i32 tile_cache_count_inflight_viewer_tiles_locked(image_t* image) {
 }
 
 i32 tile_cache_request_viewer_tiles(image_t* image, tile_cache_viewer_request_t* request) {
+	if (image && image->backend == IMAGE_BACKEND_SSI &&
+	    image->ssi.reauthentication_state != 0) {
+		return 0;
+	}
 	tile_cache_t* cache = tile_cache_get_or_create(image);
 	if (!cache || !request) {
 		return 0;
@@ -944,6 +977,7 @@ i32 tile_cache_request_viewer_tiles(image_t* image, tile_cache_viewer_request_t*
 	load_tile_task_t wishlist[TILE_CACHE_VIEWER_WISHLIST_MAX];
 	i32 wishlist_count = 0;
 	tile_cache_policy_t policy = {0};
+	i64 now = get_clock();
 	float screen_radius = ATLEAST(1.0f, sqrtf(SQUARE(request->client_width / 2) + SQUARE(request->client_height / 2)));
 
 	i32 highest_visible_scale = ATLEAST(image->level_count - 1, 0);
@@ -989,7 +1023,8 @@ i32 tile_cache_request_viewer_tiles(image_t* image, tile_cache_viewer_request_t*
 				tile_t* geometry = get_tile(level_image, tile_x, tile_y);
 				i32 tile_index = geometry->tile_index;
 				tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, level, tile_index);
-				if (!tile || (tile->gpu_resident && tile->texture != 0) || geometry->is_empty) {
+				if (!tile || (tile->gpu_resident && tile->texture != 0) || geometry->is_empty ||
+				    !tile_cache_retry_is_due_locked(tile, now)) {
 					continue;
 				}
 

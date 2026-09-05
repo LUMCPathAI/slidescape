@@ -110,6 +110,7 @@ static bool open_uri_ssi_credentials_initialized;
 static ssi_uri_config_t open_uri_ssi_retry_config;
 static bool open_uri_ssi_retry_config_valid;
 static bool open_uri_ssi_prompt_pending;
+static ssi_failure_kind_t open_uri_ssi_pending_failure_kind;
 static char open_uri_ssi_pending_status[512];
 static bool open_uri_show_api_token_modal;
 static bool open_uri_show_dicomweb_credentials_modal;
@@ -119,6 +120,8 @@ static dicomweb_async_query_kind_t open_uri_dicomweb_retry_browser_kind;
 static char open_uri_slide_score_retry_uri[1024];
 
 static void open_uri_set_ssi_retry_config(const ssi_uri_config_t* config);
+static bool open_uri_try_ssi_config(app_state_t* app_state,
+		const ssi_uri_config_t* config);
 
 static bool ascii_contains_case_insensitive(const char* text, const char* pattern) {
 	if (!pattern || !pattern[0]) return true;
@@ -614,10 +617,16 @@ static void draw_slide_tray_window(app_state_t* app_state) {
 					             sizeof(retry_config.slide_guid));
 					copy_cstring(retry_config.caption, ssi_slide->name,
 					             sizeof(retry_config.caption));
-					open_uri_set_ssi_retry_config(&retry_config);
-					copy_cstring(open_uri_status, ssi_get_last_status(),
-					             sizeof(open_uri_status));
-					open_uri_show_ssi_credentials_modal = true;
+					ssi_failure_kind_t failure_kind = ssi_get_last_failure_kind();
+					if (failure_kind == SSI_FAILURE_SESSION_EXPIRED) {
+						open_uri_try_ssi_config(app_state, &retry_config);
+					} else {
+						open_uri_set_ssi_retry_config(&retry_config);
+						copy_cstring(open_uri_status, ssi_get_last_status(),
+						             sizeof(open_uri_status));
+						open_uri_show_ssi_credentials_modal =
+							ssi_failure_requires_credentials(failure_kind);
+					}
 				}
 				break;
 			}
@@ -1919,6 +1928,7 @@ void gui_prompt_for_ssi_credentials(const char* uri, const char* status) {
 	copy_cstring(remote_uri, uri ? uri : "", sizeof(remote_uri));
 	copy_cstring(open_uri_ssi_pending_status, status ? status : "SSI credentials are required.",
 	             sizeof(open_uri_ssi_pending_status));
+	open_uri_ssi_pending_failure_kind = ssi_get_last_failure_kind();
 	open_uri_ssi_prompt_pending = true;
 	show_open_uri_window = true;
 }
@@ -1985,12 +1995,16 @@ static bool open_uri_try_ssi_config(app_state_t* app_state,
 	if (opened) {
 		open_uri_finish_success();
 	} else {
+		ssi_failure_kind_t failure_kind = ssi_get_last_failure_kind();
 		if (config->session_id[0]) {
 			ssi_uri_config_t credential_retry = *config;
 			credential_retry.session_id[0] = '\0';
 			open_uri_set_ssi_retry_config(&credential_retry);
 		}
-		open_uri_show_ssi_credentials_modal = true;
+		open_uri_show_ssi_credentials_modal =
+			ssi_failure_requires_credentials(failure_kind) ||
+			(failure_kind == SSI_FAILURE_SESSION_EXPIRED &&
+			 (!open_uri_ssi_username[0] || !open_uri_ssi_password[0]));
 	}
 	return opened;
 }
@@ -2011,27 +2025,69 @@ static void open_uri_poll_ssi_reauthentication(app_state_t* app_state) {
 	if (open_uri_ssi_prompt_pending) {
 		ssi_uri_config_t config;
 		if (ssi_resolve_uri(remote_uri, &config)) {
-			open_uri_set_ssi_retry_config(&config);
-			copy_cstring(open_uri_status, open_uri_ssi_pending_status,
-			             sizeof(open_uri_status));
-			open_uri_show_ssi_credentials_modal = true;
+			if (open_uri_ssi_pending_failure_kind == SSI_FAILURE_SESSION_EXPIRED) {
+				config.session_id[0] = '\0';
+				open_uri_try_ssi_config(app_state, &config);
+			} else {
+				open_uri_set_ssi_retry_config(&config);
+				copy_cstring(open_uri_status, open_uri_ssi_pending_status,
+				             sizeof(open_uri_status));
+				open_uri_show_ssi_credentials_modal =
+					ssi_failure_requires_credentials(open_uri_ssi_pending_failure_kind);
+			}
 		}
 		open_uri_ssi_prompt_pending = false;
 	}
+	const float reconnect_delay_max_seconds = 30.0f;
 	for (i32 i = 0; i < arrlen(app_state->loaded_images); ++i) {
 		image_t* image = app_state->loaded_images[i];
 		if (image->backend != IMAGE_BACKEND_SSI ||
-		    !atomic_compare_exchange(&image->ssi.reauthentication_state, 2, 1)) continue;
+		    image->ssi.reauthentication_state != 1) continue;
+		ssi_remote_image_t* remote = &image->ssi;
+		float reconnect_delay_seconds = 0.0f;
+		if (remote->reauthentication_attempt_count > 0) {
+			i32 shift = ATMOST(remote->reauthentication_attempt_count - 1, 4);
+			reconnect_delay_seconds = (float)(1 << shift) * 2.0f;
+			reconnect_delay_seconds = ATMOST(reconnect_delay_seconds,
+			                                    reconnect_delay_max_seconds);
+		}
+		if (reconnect_delay_seconds > 0.0f &&
+		    get_seconds_elapsed(remote->reauthentication_last_attempt_clock,
+		                        get_clock()) < reconnect_delay_seconds) continue;
+		if (!atomic_compare_exchange(&remote->reauthentication_state, 2, 1)) continue;
 		ssi_uri_config_t config = {0};
-		copy_cstring(config.api_url, image->ssi.api_url, sizeof(config.api_url));
-		copy_cstring(config.slide_center_url, image->ssi.slide_center_url,
+		copy_cstring(config.api_url, remote->api_url, sizeof(config.api_url));
+		copy_cstring(config.slide_center_url, remote->slide_center_url,
 		             sizeof(config.slide_center_url));
-		copy_cstring(config.slide_guid, image->ssi.slide_guid, sizeof(config.slide_guid));
+		copy_cstring(config.slide_guid, remote->slide_guid, sizeof(config.slide_guid));
+		copy_cstring(config.caption, image->name, sizeof(config.caption));
 		open_uri_set_ssi_retry_config(&config);
-		copy_cstring(open_uri_status,
-		             "The SSI slide session expired or requires authentication.",
-		             sizeof(open_uri_status));
-		open_uri_show_ssi_credentials_modal = true;
+		if (!open_uri_ssi_username[0] || !open_uri_ssi_password[0]) {
+			copy_cstring(open_uri_status,
+			             "The SSI session expired. SlideCenter credentials are required "
+			             "to reconnect.", sizeof(open_uri_status));
+			open_uri_show_ssi_credentials_modal = true;
+			break;
+		}
+		remote->reauthentication_last_attempt_clock = get_clock();
+		++remote->reauthentication_attempt_count;
+		if (ssi_open_remote_image(app_state, config.api_url,
+		                          config.slide_center_url,
+		                          open_uri_ssi_username,
+		                          open_uri_ssi_password, NULL,
+		                          config.slide_guid, config.caption)) {
+			console_print("SSI connection reinstated with cached credentials.\n");
+			break;
+		}
+		copy_cstring(open_uri_status, ssi_get_last_status(), sizeof(open_uri_status));
+		if (ssi_failure_requires_credentials(ssi_get_last_failure_kind())) {
+			open_uri_show_ssi_credentials_modal = true;
+		} else {
+			console_print_verbose(
+				"SSI automatic reconnection failed without a credential rejection; "
+				"will retry with backoff: %s\n", open_uri_status);
+			atomic_compare_exchange(&remote->reauthentication_state, 1, 2);
+		}
 		break;
 	}
 }
@@ -2410,7 +2466,6 @@ void gui_draw(app_state_t* app_state, input_t* input, i32 client_width, i32 clie
 	open_uri_initialize_credentials(app_state);
 	dicomweb_direct_open_poll(app_state);
 	dicomweb_browser_poll(app_state);
-	ssi_poll_keepalive(app_state);
 	open_uri_poll_ssi_reauthentication(app_state);
 	if (show_open_uri_window) gui_draw_open_uri_window(app_state);
 	gui_draw_open_uri_credential_modals(app_state);

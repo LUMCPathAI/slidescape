@@ -98,6 +98,7 @@ void tile_cache_end_read(image_t* image);
 i32 tile_cache_get_active_read_count(image_t* image);
 void tile_cache_destroy(tile_cache_t* cache);
 tile_cache_policy_t tile_cache_get_policy(image_t* image);
+float tile_cache_retry_delay_seconds(i32 consecutive_failure_count);
 bool tile_cache_post_load_result(image_t* image, tile_cache_result_t* task);
 bool tile_cache_post_stale_result(image_t* image, i32 resource_id, i32 level, i32 tile_index);
 bool tile_cache_poll_load_result(image_t* image, tile_cache_result_t* out_task);

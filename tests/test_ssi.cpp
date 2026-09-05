@@ -19,6 +19,20 @@ TEST_CASE("SSI tile-cache policy keeps a bounded rectangle pipeline") {
 	image.tile_cache = nullptr;
 }
 
+TEST_CASE("SSI distinguishes credential rejection from transient and expired-handle failures") {
+	CHECK(ssi_classify_http_failure(0, true, false) == SSI_FAILURE_TRANSIENT);
+	CHECK(ssi_classify_http_failure(429, true, false) == SSI_FAILURE_TRANSIENT);
+	CHECK(ssi_classify_http_failure(503, true, false) == SSI_FAILURE_TRANSIENT);
+	CHECK(ssi_classify_http_failure(401, true, false) == SSI_FAILURE_AUTHENTICATION);
+	CHECK(ssi_classify_http_failure(400, false, true) == SSI_FAILURE_SESSION_EXPIRED);
+	CHECK(ssi_classify_http_failure(404, false, true) == SSI_FAILURE_SESSION_EXPIRED);
+	CHECK(ssi_classify_http_failure(404, false, false) == SSI_FAILURE_OTHER);
+	CHECK(ssi_failure_requires_credentials(SSI_FAILURE_CREDENTIALS_REQUIRED));
+	CHECK(ssi_failure_requires_credentials(SSI_FAILURE_AUTHENTICATION));
+	CHECK_FALSE(ssi_failure_requires_credentials(SSI_FAILURE_TRANSIENT));
+	CHECK_FALSE(ssi_failure_requires_credentials(SSI_FAILURE_SESSION_EXPIRED));
+}
+
 TEST_CASE("SSI parses its API endpoint without permitting cleartext remote credentials") {
 	ssi_endpoint_t endpoint = {};
 	REQUIRE(ssi_parse_endpoint("https://slidecenter.example.test:8443/SSI/", &endpoint));

@@ -998,11 +998,20 @@ bool win32_process_pending_messages(input_t* input, HWND window, bool allow_idli
 			return false; // don't idle waiting for messages if there e.g. animations on screen
 		} else {
 			did_idle = true;
-			BOOL ret = GetMessageA(&message, NULL, 0, 0); // blocks until there is a message
-			if (ret == -1) {
-				win32_diagnostic("GetMessageA");
+			// TODO: don't wake if no need (only if SSI keepalive needed?)
+			/*
+			 * Wake occasionally even without input so background maintenance such as
+			 * remote-session keepalives is not suspended while the window is idle.
+			 */
+			DWORD wait_result = MsgWaitForMultipleObjectsEx(
+				0, NULL, 10000, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+			if (wait_result == WAIT_FAILED) {
+				win32_diagnostic("MsgWaitForMultipleObjectsEx");
 				fatal_error();
 			}
+			if (wait_result == WAIT_TIMEOUT) return true;
+			has_message = PeekMessageA(&message, NULL, 0, 0, PM_REMOVE);
+			if (!has_message) return true;
 		}
 	}
 
@@ -1973,6 +1982,7 @@ int main() {
 			last_clock = get_clock();
 		}
 
+		ssi_poll_keepalive(app_state);
 		win32_render_frame(app_state, curr_input, delta_t);
 		if (!is_program_running) break;
 

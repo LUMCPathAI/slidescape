@@ -19,6 +19,15 @@ extern "C" {
 typedef struct app_state_t app_state_t;
 typedef struct image_t image_t;
 
+typedef enum ssi_failure_kind_t {
+	SSI_FAILURE_NONE = 0,
+	SSI_FAILURE_CREDENTIALS_REQUIRED,
+	SSI_FAILURE_AUTHENTICATION,
+	SSI_FAILURE_SESSION_EXPIRED,
+	SSI_FAILURE_TRANSIENT,
+	SSI_FAILURE_OTHER,
+} ssi_failure_kind_t;
+
 typedef struct ssi_endpoint_t {
 	char hostname[256];
 	char host_header[320];
@@ -79,6 +88,9 @@ typedef struct ssi_remote_image_t {
 	volatile i32 reauthentication_state;
 	volatile i32 keepalive_in_flight;
 	i64 keepalive_last_scheduled_clock;
+	i64 reauthentication_last_attempt_clock;
+	i32 reauthentication_attempt_count;
+	ssi_failure_kind_t failure_kind;
 	bool session_open;
 	bool slide_open;
 } ssi_remote_image_t;
@@ -130,6 +142,10 @@ bool ssi_open_uri_with_credentials(app_state_t* app_state, const char* uri,
 		const char* username, const char* password);
 bool ssi_try_open_uri(app_state_t* app_state, const char* uri);
 const char* ssi_get_last_status(void);
+ssi_failure_kind_t ssi_get_last_failure_kind(void);
+ssi_failure_kind_t ssi_classify_http_failure(i32 status_code,
+		bool credential_request, bool expiring_handle_request);
+bool ssi_failure_requires_credentials(ssi_failure_kind_t failure_kind);
 void ssi_poll_keepalive(app_state_t* app_state);
 void ssi_close_remote_image(ssi_remote_image_t* remote);
 void ssi_commit_optional_data(app_state_t* app_state, void* result_pointer);

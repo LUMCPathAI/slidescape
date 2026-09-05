@@ -702,3 +702,26 @@ bool ssi_parse_mview_uri(const char* uri, ssi_uri_config_t* config) {
 	       center_length > 0 && center_length < sizeof(config->slide_center_url) &&
 	       ssi_parse_endpoint(config->api_url, &endpoint);
 }
+
+ssi_failure_kind_t ssi_classify_http_failure(i32 status_code,
+		bool credential_request, bool expiring_handle_request) {
+	if (status_code <= 0 || status_code == 408 || status_code == 425 ||
+	    status_code == 429 || status_code >= 500) {
+		return SSI_FAILURE_TRANSIENT;
+	}
+	if (credential_request &&
+	    (status_code == 400 || status_code == 401 || status_code == 403)) {
+		return SSI_FAILURE_AUTHENTICATION;
+	}
+	if (expiring_handle_request &&
+	    (status_code == 400 || status_code == 401 || status_code == 403 ||
+	     status_code == 404)) {
+		return SSI_FAILURE_SESSION_EXPIRED;
+	}
+	return SSI_FAILURE_OTHER;
+}
+
+bool ssi_failure_requires_credentials(ssi_failure_kind_t failure_kind) {
+	return failure_kind == SSI_FAILURE_CREDENTIALS_REQUIRED ||
+	       failure_kind == SSI_FAILURE_AUTHENTICATION;
+}

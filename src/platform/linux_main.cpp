@@ -1057,6 +1057,7 @@ int main(int argc, const char** argv)
 	        }
         }
 
+		ssi_poll_keepalive(app_state);
 		linux_render_frame(app_state, curr_input, window, delta_t);
 
 	    profiler_end(PROFILER_SECTION_FRAME);
