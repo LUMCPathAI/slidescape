@@ -132,68 +132,135 @@ bool jpeg_decode_tile(uint8_t *table_ptr, uint32_t table_length, uint8_t *input_
 	return true;
 }
 
-static u8* jpeg_decode_image_internal(u8* input_ptr, u32 input_length, i32* width, i32* height,
-                                     i32 *channels_in_file, J_COLOR_SPACE input_color_space) {
-	struct jpeg_decompress_struct cinfo = {};
-	struct jpeg_error_mgr jerr = {};
+/* Heap-owned state survives libjpeg's longjmp, including any output allocation. */
+typedef struct jpeg_image_decode_state_t {
+	struct jpeg_decompress_struct decoder;
+	struct jpeg_error_mgr error;
+	jmp_buf jump;
+	u8* output;
+} jpeg_image_decode_state_t;
 
-	// Setup error handling
-	cinfo.err = jpeg_std_error(&jerr);
-	jerr.error_exit = on_error;
-
-	jmp_buf on_err_jmp_buffer = {};
-	cinfo.client_data = (void*)on_err_jmp_buffer;
-	int r = setjmp(on_err_jmp_buffer);
-	if (r != 0) {
-		// We arrived via longjmp and encountered an error -> handle the failure gracefully
-		jpeg_destroy_decompress(&cinfo);
+bool jpeg_validate_baseline_ycbcr_header(u8* input, u32 input_size, u32 width, u32 height) {
+	if (!input || input_size < 4 || input[0] != 0xff || input[1] != 0xd8) return false;
+	/* libjpeg v6 API does not expose the SOF coding process. Inspect marker
+	 * framing through SOS so truncated prefixes cannot use its synthetic EOI. */
+	bool baseline = false, scan = false;
+	size_t offset = 2;
+	while (offset < input_size) {
+		if (input[offset++] != 0xff) return false;
+		while (offset < input_size && input[offset] == 0xff) ++offset;
+		if (offset >= input_size) return false;
+		u8 marker = input[offset++];
+		if (marker == 0 || marker == 0xd8 || marker == 0xd9 ||
+		    marker == 0x01 || (marker >= 0xd0 && marker <= 0xd7) ||
+		    input_size - offset < 2) return false;
+		u32 length = ((u32)input[offset] << 8) | input[offset + 1];
+		if (length < 2 || length > input_size - offset) return false;
+		if (marker >= 0xc0 && marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc) {
+			if (marker != 0xc0 || baseline) return false;
+			baseline = true;
+		}
+		offset += length;
+		if (marker == 0xda) { scan = true; break; }
+	}
+	if (!baseline || !scan) return false;
+	jpeg_image_decode_state_t* state = calloc(1, sizeof(*state));
+	if (!state) return false;
+	j_decompress_ptr decoder = &state->decoder;
+	decoder->err = jpeg_std_error(&state->error);
+	state->error.error_exit = on_error;
+	decoder->client_data = state->jump;
+	if (setjmp(state->jump)) {
+		jpeg_destroy_decompress(decoder);
+		free(state);
 		return false;
 	}
-
-	jpeg_create_decompress(&cinfo);
-
-	// Read tile data
-	setup_jpeg_source(&cinfo, input_ptr, input_length);
-	if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
-		printf("Failed to read header\n");
-		jpeg_destroy_decompress(&cinfo);
-		return NULL;
+	jpeg_create_decompress(decoder);
+	setup_jpeg_source(decoder, input, input_size);
+	bool valid = jpeg_read_header(decoder, TRUE) == JPEG_HEADER_OK &&
+		decoder->image_width == width && decoder->image_height == height &&
+		decoder->data_precision == 8 && decoder->num_components == 3 &&
+		decoder->jpeg_color_space == JCS_YCbCr && !decoder->progressive_mode && !decoder->arith_code;
+	for (i32 i = 0; i < decoder->num_components && valid; ++i) {
+		const jpeg_component_info* component = decoder->comp_info + i;
+		valid = component->h_samp_factor >= 1 && component->h_samp_factor <= (i == 0 ? 2 : 1) &&
+			component->v_samp_factor >= 1 && component->v_samp_factor <= (i == 0 ? 2 : 1) &&
+			component->quant_tbl_no < NUM_QUANT_TBLS && decoder->quant_tbl_ptrs[component->quant_tbl_no] &&
+			component->dc_tbl_no < NUM_HUFF_TBLS && decoder->dc_huff_tbl_ptrs[component->dc_tbl_no] &&
+			component->ac_tbl_no < NUM_HUFF_TBLS && decoder->ac_huff_tbl_ptrs[component->ac_tbl_no];
 	}
-
-	if (input_color_space != JCS_UNKNOWN) {
-		cinfo.jpeg_color_space = input_color_space;
-	}
-	cinfo.out_color_space = JCS_EXT_BGRA;
-
-	jpeg_start_decompress(&cinfo);
-
-	int row_width = cinfo.output_width;
-	int target_row_stride = row_width * cinfo.output_components;
-	size_t output_size = target_row_stride * cinfo.output_height;
-	u8* output_buffer = malloc(output_size);
-
-	while (cinfo.output_scanline < cinfo.output_height) {
-		u8* output_pos = output_buffer + (cinfo.output_scanline) * target_row_stride;
-		u8* buffer_array[1] = { output_pos };
-		i32 ret = jpeg_read_scanlines(&cinfo, buffer_array, 1);
-	}
-
-	if (width) *width = cinfo.output_width;
-	if (height) *height = cinfo.output_height;
-	if (channels_in_file) *channels_in_file = cinfo.output_components;
-
-	(void) jpeg_finish_decompress(&cinfo);
-	jpeg_destroy_decompress(&cinfo);
-
-	return output_buffer;
+	jpeg_destroy_decompress(decoder);
+	free(state);
+	return valid;
 }
 
-u8* jpeg_decode_image(u8* input_ptr, u32 input_length, i32* width, i32* height, i32 *channels_in_file) {
-	return jpeg_decode_image_internal(input_ptr, input_length, width, height, channels_in_file, JCS_UNKNOWN);
+static u8* jpeg_decode_image_internal(u8* input, u32 input_size,
+		i32* width, i32* height, i32* channels, J_COLOR_SPACE input_color_space,
+		i32 expected_width, i32 expected_height, size_t maximum_output_size) {
+	if (width) *width = 0;
+	if (height) *height = 0;
+	if (channels) *channels = 0;
+	if (!input || !input_size) return NULL;
+	jpeg_image_decode_state_t* state = calloc(1, sizeof(*state));
+	if (!state) return NULL;
+	j_decompress_ptr decoder = &state->decoder;
+	decoder->err = jpeg_std_error(&state->error);
+	state->error.error_exit = on_error;
+	decoder->client_data = state->jump;
+	if (setjmp(state->jump)) goto failed;
+	jpeg_create_decompress(decoder);
+	setup_jpeg_source(decoder, input, input_size);
+	if (jpeg_read_header(decoder, TRUE) != JPEG_HEADER_OK) goto failed;
+	/* Check dimensions before start_decompress can allocate image-sized buffers. */
+	if (!decoder->image_width || !decoder->image_height ||
+	    decoder->image_width > INT32_MAX || decoder->image_height > INT32_MAX ||
+	    (expected_width > 0 && decoder->image_width != (u32)expected_width) ||
+	    (expected_height > 0 && decoder->image_height != (u32)expected_height) ||
+	    (u64)decoder->image_width * decoder->image_height > maximum_output_size / 4)
+		goto failed;
+	if (input_color_space != JCS_UNKNOWN) decoder->jpeg_color_space = input_color_space;
+	decoder->out_color_space = JCS_EXT_BGRA;
+	if (!jpeg_start_decompress(decoder) || decoder->output_components != 4)
+		goto failed;
+	size_t stride = (size_t)decoder->output_width * 4;
+	state->output = malloc(stride * decoder->output_height);
+	if (!state->output) goto failed;
+	while (decoder->output_scanline < decoder->output_height) {
+		u8* row = state->output + (size_t)decoder->output_scanline * stride;
+		if (jpeg_read_scanlines(decoder, &row, 1) != 1) goto failed;
+	}
+	if (!jpeg_finish_decompress(decoder)) goto failed;
+	if (width) *width = (i32)decoder->output_width;
+	if (height) *height = (i32)decoder->output_height;
+	if (channels) *channels = 4;
+	u8* result = state->output;
+	jpeg_destroy_decompress(decoder);
+	free(state);
+	return result;
+
+failed:
+	jpeg_destroy_decompress(decoder);
+	free(state->output);
+	free(state);
+	return NULL;
 }
 
-u8* jpeg_decode_rgb_image(u8* input_ptr, u32 input_length, i32* width, i32* height, i32 *channels_in_file) {
-	return jpeg_decode_image_internal(input_ptr, input_length, width, height, channels_in_file, JCS_RGB);
+u8* jpeg_decode_image_bounded(u8* input, u32 input_size,
+		i32 expected_width, i32 expected_height, size_t maximum_output_size,
+		i32* width, i32* height, i32* channels) {
+	if (expected_width <= 0 || expected_height <= 0) return NULL;
+	return jpeg_decode_image_internal(input, input_size, width, height, channels,
+		JCS_UNKNOWN, expected_width, expected_height, maximum_output_size);
+}
+
+u8* jpeg_decode_image(u8* input, u32 input_size, i32* width, i32* height, i32* channels) {
+	return jpeg_decode_image_internal(input, input_size, width, height, channels,
+		JCS_UNKNOWN, 0, 0, SIZE_MAX);
+}
+
+u8* jpeg_decode_rgb_image(u8* input, u32 input_size, i32* width, i32* height, i32* channels) {
+	return jpeg_decode_image_internal(input, input_size, width, height, channels,
+		JCS_RGB, 0, 0, SIZE_MAX);
 }
 
 u8* jpeg_decode_ndpi_image(u8* input_ptr, u32 input_length, i32 width, i32 height, i32 *channels_in_file) {

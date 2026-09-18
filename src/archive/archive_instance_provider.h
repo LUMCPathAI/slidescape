@@ -29,7 +29,7 @@ extern "C" {
  * MRXS/iSyntax paths or tile rules.
  *
  * The Part 10 adapter keeps a bounded process-lifetime LRU of validated shell buffers,
- * source file handles, and serialized metadata. Request-time providers perform only
+ * source file handles, and delta-offset directories. Metadata is serialized on demand. Request-time providers perform only
  * shell lookup, bounded source reads, and optional frame generation.
  */
 typedef struct archive_instance_frame_t {
@@ -45,6 +45,8 @@ typedef struct archive_instance_provider_cache_stats_t {
 	u64 evictions;
 	i32 resident_count;
 	i32 capacity;
+	u64 shell_bytes;
+	u64 payload_bytes;
 	u64 shell_hits;
 	u64 shell_misses;
 	u64 shell_evictions;

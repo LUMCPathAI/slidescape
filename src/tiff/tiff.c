@@ -1339,8 +1339,8 @@ bool32 tiff_deserialize(tiff_t* tiff, u8* buffer, u64 buffer_size) {
 					goto failed;
 				}
 				referenced_ifd->jpeg_tables = (u8*) malloc(block->length);
+				if (!referenced_ifd->jpeg_tables) goto failed;
 				memcpy(referenced_ifd->jpeg_tables, block_content, block->length);
-				referenced_ifd->jpeg_tables[block->length] = 0;
 				referenced_ifd->jpeg_tables_length = block->length;
 			} break;
 			case SERIAL_BLOCK_TERMINATOR: {

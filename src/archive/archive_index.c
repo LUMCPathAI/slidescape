@@ -142,9 +142,6 @@ static bool archive_instance_record_is_valid(const archive_instance_record_t* re
 }
 
 static bool archive_index_append(archive_index_t* index, const archive_study_record_t* record) {
-	for (i32 i = 0; i < index->study_count; ++i) {
-		if (strcmp(index->studies[i].study_instance_uid, record->study_instance_uid) == 0) return false;
-	}
 	if (index->study_count == index->study_capacity) {
 		i32 capacity = index->study_capacity ? index->study_capacity * 2 : 64;
 		if (capacity > ARCHIVE_INDEX_MAX_STUDIES) capacity = ARCHIVE_INDEX_MAX_STUDIES;
@@ -160,9 +157,6 @@ static bool archive_index_append(archive_index_t* index, const archive_study_rec
 }
 
 static bool archive_index_append_series(archive_index_t* index, const archive_series_record_t* record) {
-	for (i32 i = 0; i < index->series_count; ++i) {
-		if (strcmp(index->series[i].series_instance_uid, record->series_instance_uid) == 0) return false;
-	}
 	if (index->series_count == index->series_capacity) {
 		i32 capacity = index->series_capacity ? index->series_capacity * 2 : 128;
 		if (capacity > ARCHIVE_INDEX_MAX_SERIES) capacity = ARCHIVE_INDEX_MAX_SERIES;
@@ -178,9 +172,6 @@ static bool archive_index_append_series(archive_index_t* index, const archive_se
 }
 
 static bool archive_index_append_instance(archive_index_t* index, const archive_instance_record_t* record) {
-	for (i32 i = 0; i < index->instance_count; ++i) {
-		if (strcmp(index->instances[i].sop_instance_uid, record->sop_instance_uid) == 0) return false;
-	}
 	if (index->instance_count == index->instance_capacity) {
 		i32 capacity = index->instance_capacity ? index->instance_capacity * 2 : 256;
 		if (capacity > ARCHIVE_INDEX_MAX_INSTANCES) capacity = ARCHIVE_INDEX_MAX_INSTANCES;
@@ -201,19 +192,69 @@ static bool archive_index_copy_string(char* dest, size_t capacity, const char* s
 }
 
 static bool archive_index_has_study(const archive_index_t* index, const char* study_uid) {
-	for (i32 i = 0; i < index->study_count; ++i) {
-		if (strcmp(index->studies[i].study_instance_uid, study_uid) == 0) return true;
+	i32 low = 0, high = index->study_count;
+	while (low < high) {
+		i32 mid = low + (high - low) / 2;
+		i32 order = strcmp(index->studies[mid].study_instance_uid, study_uid);
+		if (!order) return true;
+		if (order < 0) low = mid + 1; else high = mid;
 	}
 	return false;
 }
 
+static i32 archive_index_compare_series_key(const char* study, const char* series,
+		const char* requested_study, const char* requested_series) {
+	i32 order = strcmp(study, requested_study);
+	return order ? order : strcmp(series, requested_series);
+}
+
 static bool archive_index_has_series(const archive_index_t* index, const char* study_uid,
 		const char* series_uid) {
-	for (i32 i = 0; i < index->series_count; ++i) {
-		if (strcmp(index->series[i].study_instance_uid, study_uid) == 0 &&
-		    strcmp(index->series[i].series_instance_uid, series_uid) == 0) return true;
+	i32 low = 0, high = index->series_count;
+	while (low < high) {
+		i32 mid = low + (high - low) / 2;
+		const archive_series_record_t* series = index->series + mid;
+		i32 order = archive_index_compare_series_key(series->study_instance_uid,
+			series->series_instance_uid, study_uid, series_uid);
+		if (!order) return true;
+		if (order < 0) low = mid + 1; else high = mid;
 	}
 	return false;
+}
+
+static int archive_index_compare_uid(const void* lhs, const void* rhs) {
+	return strcmp(*(const char* const*)lhs, *(const char* const*)rhs);
+}
+
+static int archive_index_compare_instance_uid(const void* lhs, const void* rhs) {
+	const archive_instance_record_t* a = *(const archive_instance_record_t* const*)lhs;
+	const archive_instance_record_t* b = *(const archive_instance_record_t* const*)rhs;
+	return strcmp(a->sop_instance_uid, b->sop_instance_uid);
+}
+
+static bool archive_index_build_uid_directory(archive_index_t* index) {
+	/* Detect global UID reuse once, without a quadratic scan during every append. */
+	if (index->series_count) {
+		const char** uids = malloc((size_t)index->series_count * sizeof(*uids));
+		if (!uids) return false;
+		for (i32 i = 0; i < index->series_count; ++i) uids[i] = index->series[i].series_instance_uid;
+		qsort(uids, index->series_count, sizeof(*uids), archive_index_compare_uid);
+		bool unique = true;
+		for (i32 i = 1; i < index->series_count; ++i)
+			if (!strcmp(uids[i - 1], uids[i])) unique = false;
+		free(uids);
+		if (!unique) return false;
+	}
+	if (!index->instance_count) return true;
+	index->instances_by_uid = malloc((size_t)index->instance_count * sizeof(*index->instances_by_uid));
+	if (!index->instances_by_uid) return false;
+	for (i32 i = 0; i < index->instance_count; ++i) index->instances_by_uid[i] = index->instances + i;
+	qsort(index->instances_by_uid, index->instance_count, sizeof(*index->instances_by_uid),
+		archive_index_compare_instance_uid);
+	for (i32 i = 1; i < index->instance_count; ++i)
+		if (!strcmp(index->instances_by_uid[i - 1]->sop_instance_uid,
+		            index->instances_by_uid[i]->sop_instance_uid)) return false;
+	return true;
 }
 
 static bool archive_index_copy_column(char* dest, size_t capacity,
@@ -257,6 +298,9 @@ bool archive_index_open(archive_index_t* index, const archive_repository_t* repo
 		sqlite3_close(database);
 		return false;
 	}
+	if (sqlite3_busy_timeout(database, 5000) != SQLITE_OK ||
+	    sqlite3_exec(database, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK) goto sql_failure;
+	/* Studies, series, and instances must come from the same publication snapshot. */
 	int step_result = SQLITE_OK;
 	const char* study_sql =
 		"SELECT s.study_instance_uid, MIN(COALESCE(s.study_date,''))"
@@ -320,7 +364,10 @@ bool archive_index_open(archive_index_t* index, const archive_repository_t* repo
 		" JOIN object shell ON shell.id=r.shell_object_id"
 		" JOIN object recipe ON recipe.id=ip.parameters_object_id"
 		" JOIN frame_representation fr ON fr.instance_id=i.id "
-		"   AND fr.source IN ('STORED','GENERATED')"
+		"   AND fr.rowid=(SELECT canonical.rowid FROM frame_representation canonical"
+		"     WHERE canonical.instance_id=i.id AND canonical.source_object_id=ip.source_object_id"
+		"     AND canonical.source=CASE ip.provider_kind WHEN 'part10' THEN 'STORED' ELSE 'GENERATED' END"
+		"     ORDER BY canonical.rowid LIMIT 1)"
 		" ORDER BY i.study_instance_uid, i.series_instance_uid,"
 		" i.shell_instance_index;";
 	if (!archive_index_prepare(database, instance_sql, &statement, error, error_capacity)) goto failure;
@@ -369,6 +416,10 @@ bool archive_index_open(archive_index_t* index, const archive_repository_t* repo
 	if (step_result != SQLITE_DONE) goto sql_failure;
 	sqlite3_finalize(statement);
 	statement = NULL;
+	if (!archive_index_build_uid_directory(index)) {
+		archive_index_set_error(error, error_capacity, "duplicate published UID or insufficient index memory");
+		goto failure;
+	}
 	for (i32 i = 0; i < index->series_count; ++i) {
 		const archive_instance_record_t* records = NULL;
 		i32 count = 0;
@@ -382,6 +433,7 @@ bool archive_index_open(archive_index_t* index, const archive_repository_t* repo
 			goto failure;
 		}
 	}
+	if (sqlite3_exec(database, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) goto sql_failure;
 	sqlite3_close(database);
 	return true;
 
@@ -399,6 +451,7 @@ void archive_index_destroy(archive_index_t* index) {
 	if (!index) return;
 	free(index->studies);
 	free(index->series);
+	free(index->instances_by_uid);
 	free(index->instances);
 	memset(index, 0, sizeof(*index));
 }
@@ -407,11 +460,14 @@ const archive_instance_record_t* archive_index_find_instance(const archive_index
 		const char* study_instance_uid, const char* series_instance_uid,
 		const char* sop_instance_uid) {
 	if (!index || !study_instance_uid || !series_instance_uid || !sop_instance_uid) return NULL;
-	for (i32 i = 0; i < index->instance_count; ++i) {
-		const archive_instance_record_t* record = index->instances + i;
-		if (strcmp(record->study_instance_uid, study_instance_uid) == 0 &&
-		    strcmp(record->series_instance_uid, series_instance_uid) == 0 &&
-		    strcmp(record->sop_instance_uid, sop_instance_uid) == 0) return record;
+	i32 low = 0, high = index->instance_count;
+	while (low < high && index->instances_by_uid) {
+		i32 mid = low + (high - low) / 2;
+		const archive_instance_record_t* record = index->instances_by_uid[mid];
+		i32 order = strcmp(record->sop_instance_uid, sop_instance_uid);
+		if (!order) return archive_index_compare_series_key(record->study_instance_uid,
+			record->series_instance_uid, study_instance_uid, series_instance_uid) == 0 ? record : NULL;
+		if (order < 0) low = mid + 1; else high = mid;
 	}
 	return NULL;
 }
@@ -423,22 +479,26 @@ bool archive_index_find_series_instances(const archive_index_t* index,
 	if (count) *count = 0;
 	if (!index || !study_instance_uid || !series_instance_uid || !records || !count)
 		return false;
-	i32 first = -1;
+	i32 low = 0, high = index->instance_count;
+	while (low < high) {
+		i32 mid = low + (high - low) / 2;
+		const archive_instance_record_t* record = index->instances + mid;
+		i32 order = archive_index_compare_series_key(record->study_instance_uid,
+			record->series_instance_uid, study_instance_uid, series_instance_uid);
+		if (order < 0) low = mid + 1; else high = mid;
+	}
+	i32 first = low;
 	i32 found = 0;
-	for (i32 i = 0; i < index->instance_count; ++i) {
+	for (i32 i = first; i < index->instance_count; ++i) {
 		const archive_instance_record_t* record = index->instances + i;
 		bool matches =
 			strcmp(record->study_instance_uid, study_instance_uid) == 0 &&
 			strcmp(record->series_instance_uid, series_instance_uid) == 0;
-		if (!matches) {
-			if (first >= 0) break;
-			continue;
-		}
-		if (first < 0) first = i;
+		if (!matches) break;
 		if (record->shell_instance_index != (u32)found) return false;
 		++found;
 	}
-	if (first < 0 || found == 0) return false;
+	if (found == 0) return false;
 	*records = index->instances + first;
 	*count = found;
 	return true;

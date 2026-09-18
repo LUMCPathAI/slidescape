@@ -11,6 +11,7 @@
 #include "archive_ingest.h"
 
 #include "archive_database.h"
+#include "archive_representation.h"
 #include "archive_mrxs_adapter.h"
 #include "archive_object.h"
 #include "archive_sha256.h"
@@ -38,7 +39,7 @@ typedef struct archive_ingest_paths_t {
 } archive_ingest_paths_t;
 
 typedef struct archive_ingest_member_t {
-	archive_database_part10_member_t database;
+	archive_database_instance_t database;
 	archive_object_t object;
 } archive_ingest_member_t;
 
@@ -221,7 +222,7 @@ static bool archive_ingest_build_member(archive_ingest_member_t* member,
 		const archive_object_t* object, const dicom_instance_t* instance) {
 	memset(member, 0, sizeof(*member));
 	member->object = *object;
-	archive_database_part10_member_t* record = &member->database;
+	archive_database_instance_t* record = &member->database;
 	record->object_id = object->id;
 	if (!archive_ingest_copy(record->sop_instance_uid, sizeof(record->sop_instance_uid),
 	                         instance->sop_instance_uid.value) ||
@@ -278,35 +279,7 @@ static bool archive_ingest_build_descriptor(const archive_ingest_member_t* membe
 	return true;
 }
 
-static bool archive_ingest_hash_file(const char* path, char digest[65], u64* byte_size) {
-	if (byte_size) *byte_size = 0;
-	FILE* file = fopen(path, "rb");
-	if (!file) return false;
-	u8* buffer = malloc(MEGABYTES(1));
-	archive_sha256_t sha;
-	archive_sha256_initialize(&sha);
-	u64 total = 0;
-	bool success = buffer != NULL;
-	while (success) {
-		size_t count = fread(buffer, 1, MEGABYTES(1), file);
-		if (count) {
-			success = archive_sha256_update(&sha, buffer, count);
-			total += count;
-		}
-		if (count < MEGABYTES(1)) {
-			if (ferror(file)) success = false;
-			break;
-		}
-	}
-	free(buffer);
-	if (fclose(file) != 0) success = false;
-	if (!success) return false;
-	u8 bytes[32];
-	archive_sha256_finish(&sha, bytes);
-	archive_sha256_hex(bytes, digest);
-	if (byte_size) *byte_size = total;
-	return true;
-}
+
 
 static bool archive_ingest_append(char** data, size_t* capacity, size_t* used,
 		const char* format, ...) {
@@ -358,17 +331,17 @@ static bool archive_ingest_mrxs_descriptor(const archive_mrxs_adapter_t* adapter
 	char* data = NULL;
 	if (!archive_ingest_append(&data, &capacity, &used,
 	                           "slidescape-mrxs-bundle-v1\n")) return false;
-	i32 file_count = adapter->slide.dat_count + 3;
+	i32 file_count = adapter->slide.dat_count + ARCHIVE_MRXS_MEMBER_FIRST_DATA;
 	for (i32 i = 0; i < file_count; ++i) {
 		char full_path[ARCHIVE_PATH_CAPACITY];
 		char logical_name[ARCHIVE_PATH_CAPACITY];
-		if (i == 0) {
+		if (i == ARCHIVE_MRXS_MEMBER_SLIDE) {
 			snprintf(full_path, sizeof(full_path), "%s", mrxs_path);
 			snprintf(logical_name, sizeof(logical_name), "%s", source_name);
 		} else {
-			const char* name = i == 1 ? "Slidedat.ini" :
-				i == 2 ? adapter->slide.index_dat_filename :
-				adapter->slide.dat_filenames[i - 3];
+			const char* name = i == ARCHIVE_MRXS_MEMBER_SLIDEDAT ? "Slidedat.ini" :
+				i == ARCHIVE_MRXS_MEMBER_INDEX ? adapter->slide.index_dat_filename :
+				adapter->slide.dat_filenames[i - ARCHIVE_MRXS_MEMBER_FIRST_DATA];
 			if (!name || strchr(name, '\n') || strchr(name, '\t') ||
 			    snprintf(full_path, sizeof(full_path), "%s%s%s", directory,
 			             PATH_SEP, name) >= (i32)sizeof(full_path) ||
@@ -380,7 +353,7 @@ static bool archive_ingest_mrxs_descriptor(const archive_mrxs_adapter_t* adapter
 		}
 		char digest[65];
 		u64 byte_size = 0;
-		if (!archive_ingest_hash_file(full_path, digest, &byte_size) ||
+		if (!archive_sha256_file(full_path, digest, &byte_size) ||
 		    !archive_ingest_append(
 			    &data, &capacity, &used, "object\t%d\t%s\t%s\t%llu\n",
 			    i, logical_name, digest, (unsigned long long)byte_size)) {
@@ -474,7 +447,12 @@ bool archive_ingest_part10_path(const archive_repository_t* repository,
 			success = false;
 		} else {
 			const dicom_instance_t* instance = dicom.instances;
-			if (!instance->general_study.StudyInstanceUID.len ||
+			if (!archive_frame_media_type_for_transfer_syntax(instance->transfer_syntax_uid.value)) {
+				archive_ingest_set_error(error, error_capacity, "unsupported archive transfer syntax: %s",
+					instance->transfer_syntax_uid.value);
+				success = false;
+			} else if (!instance->has_valid_wsi_image_type ||
+			    !instance->general_study.StudyInstanceUID.len ||
 			    !instance->general_series.SeriesInstanceUID.len ||
 			    !instance->sop_instance_uid.len || !instance->sop_class_uid.len ||
 			    !instance->transfer_syntax_uid.len || instance->number_of_frames <= 0 ||
@@ -527,35 +505,6 @@ bool archive_ingest_part10_path(const archive_repository_t* repository,
 			}
 		}
 	}
-	char* descriptor = NULL;
-	size_t descriptor_size = 0;
-	archive_object_t descriptor_object = {0};
-	if (success && !archive_ingest_build_descriptor(members, member_count,
-			&descriptor, &descriptor_size)) {
-		archive_ingest_set_error(error, error_capacity, "out of memory while building bundle descriptor");
-		success = false;
-	}
-	if (success) {
-		archive_object_status_t descriptor_status =
-			archive_object_store_control_bytes(
-				repository, descriptor, descriptor_size,
-				"application/vnd.slidescape.part10-bundle", &descriptor_object,
-				error, error_capacity);
-		if (descriptor_status != ARCHIVE_OBJECT_OK) success = false;
-	}
-	archive_database_part10_member_t* database_members = NULL;
-	if (success) {
-		database_members = malloc((size_t)member_count * sizeof(*database_members));
-		if (!database_members) {
-			archive_ingest_set_error(error, error_capacity, "out of memory while publishing bundle");
-			success = false;
-		}
-	}
-	for (i32 i = 0; i < member_count && success; ++i) database_members[i] = members[i].database;
-	archive_database_bundle_t bundle = {0};
-	if (success && archive_database_register_part10_bundle(repository,
-			descriptor_object.sha256, descriptor_object.id, database_members, member_count,
-			&bundle, error, error_capacity) != ARCHIVE_DATABASE_OK) success = false;
 	archive_database_shell_publication_t* publications = NULL;
 	i32 publication_count = 0;
 	if (success) {
@@ -585,8 +534,44 @@ bool archive_ingest_part10_path(const archive_repository_t* repository,
 				++group_count;
 			}
 		}
+		/* Bundle identity belongs to one logical slide, independent of the batch
+		 * used to discover it. All prepared publications still commit together. */
+		archive_ingest_member_t* group_members = calloc((size_t)group_count, sizeof(*group_members));
+		archive_database_instance_t* database_members =
+			calloc((size_t)group_count, sizeof(*database_members));
+		char* descriptor = NULL;
+		size_t descriptor_size = 0;
+		archive_object_t descriptor_object = {0};
+		archive_database_bundle_t bundle = {0};
+		i32 grouped = 0;
+		success = group_members && database_members;
+		for (i32 j = 0; j < member_count && success; ++j) {
+			if (strcmp(members[i].database.series_instance_uid,
+			           members[j].database.series_instance_uid) != 0) continue;
+			group_members[grouped] = members[j];
+			database_members[grouped++] = members[j].database;
+		}
+		success = success && archive_ingest_build_descriptor(
+			group_members, group_count, &descriptor, &descriptor_size);
+		if (success) success = archive_object_store_control_bytes(
+			repository, descriptor, descriptor_size,
+			"application/vnd.slidescape.part10-bundle", &descriptor_object,
+			error, error_capacity) == ARCHIVE_OBJECT_OK;
+		if (success) success = archive_database_register_part10_bundle(
+			repository, descriptor_object.sha256, descriptor_object.id,
+			database_members, group_count, &bundle,
+			error, error_capacity) == ARCHIVE_DATABASE_OK;
+		free(descriptor);
+		free(database_members);
+		free(group_members);
+		if (!success) {
+			if (error && !error[0]) archive_ingest_set_error(
+				error, error_capacity, "could not prepare logical slide bundle");
+			break;
+		}
 		archive_database_shell_publication_t* publication =
 			publications + publication_count;
+		publication->bundle_id = bundle.id;
 		archive_database_shell_instance_publication_t* published_instances =
 			calloc((size_t)group_count, sizeof(*published_instances));
 		dicom_series_t* dicoms = calloc((size_t)group_count, sizeof(*dicoms));
@@ -694,15 +679,15 @@ bool archive_ingest_part10_path(const archive_repository_t* repository,
 		}
 		archive_shell_buffer_destroy(&shell);
 		free(recipe);
-		for (i32 j = 0; j < group_count; ++j)
+		if (dicoms) for (i32 j = 0; j < group_count; ++j)
 			dicom_destroy(dicoms + j);
 		free(recipe_instances);
 		free(shell_instances);
 		free(dicoms);
 		free(published_instances);
 	}
-	if (success && archive_database_publish_part10_shells(
-			repository, bundle.id, publications, publication_count,
+	if (success && archive_database_publish_shells(
+			repository, publications, publication_count,
 			error, error_capacity) != ARCHIVE_DATABASE_OK) success = false;
 	if (success && result) {
 		for (i32 i = 0; i < member_count; ++i) {
@@ -722,8 +707,6 @@ bool archive_ingest_part10_path(const archive_repository_t* repository,
 	for (i32 i = 0; i < publication_count; ++i)
 		free((void*)publications[i].instances);
 	free(publications);
-	free(database_members);
-	free(descriptor);
 	free(members);
 	archive_ingest_destroy_paths(&paths);
 	return success;
@@ -761,11 +744,7 @@ static bool archive_ingest_mrxs(const archive_repository_t* repository,
 	}
 
 	archive_mrxs_adapter_t adapter = {0};
-	char provisional_fingerprint[65];
-	memset(provisional_fingerprint, '0', 64);
-	provisional_fingerprint[64] = '\0';
 	if (!archive_mrxs_adapter_open(&adapter, source_path,
-	                               provisional_fingerprint,
 	                               error, error_capacity))
 		return false;
 
@@ -782,7 +761,6 @@ static bool archive_ingest_mrxs(const archive_repository_t* repository,
 	bool success = archive_ingest_mrxs_descriptor(
 		&adapter, source_path, &descriptor, &descriptor_size,
 		error, error_capacity);
-	archive_mrxs_adapter_close(&adapter);
 
 	if (success && archive_object_store_control_bytes(
 			repository, descriptor, descriptor_size,
@@ -793,7 +771,7 @@ static bool archive_ingest_mrxs(const archive_repository_t* repository,
 	char fingerprint[65] = {0};
 	i32 fingerprint_length = success ? snprintf(
 		fingerprint_input, sizeof(fingerprint_input),
-				"slidescape-mrxs-virtual-dicom-v5\n%s\n",
+				"slidescape-mrxs-virtual-dicom-v" ARCHIVE_MRXS_ADAPTER_VERSION_STRING "\n%s\n",
 		descriptor_object.sha256) : -1;
 	if (success &&
 	    (fingerprint_length <= 0 ||
@@ -804,8 +782,7 @@ static bool archive_ingest_mrxs(const archive_repository_t* repository,
 		                         "could not fingerprint MRXS representation");
 		success = false;
 	}
-	if (success && !archive_mrxs_adapter_open(
-			&adapter, source_path, fingerprint, error, error_capacity))
+	if (success && !archive_mrxs_adapter_set_identity(&adapter, descriptor_object.sha256))
 		success = false;
 	if (success && archive_database_register_mrxs_bundle(
 			repository, descriptor_object.sha256, descriptor_object.id,
@@ -845,7 +822,7 @@ static bool archive_ingest_mrxs(const archive_repository_t* repository,
 		const mrxs_level_t* level = adapter.slide.levels + i;
 		archive_database_shell_instance_publication_t* published =
 			instances + i;
-		archive_database_part10_member_t* instance = &published->instance;
+		archive_database_instance_t* instance = &published->instance;
 		u32 scale = 1u << i;
 		instance->object_id = descriptor_object.id;
 		snprintf(instance->logical_name, sizeof(instance->logical_name),
@@ -888,6 +865,7 @@ static bool archive_ingest_mrxs(const archive_repository_t* repository,
 	}
 
 	archive_database_shell_publication_t publication = {0};
+	publication.bundle_id = bundle.id;
 	if (success) {
 		success =
 			archive_ingest_copy(publication.representation_id,
@@ -900,7 +878,7 @@ static bool archive_ingest_mrxs(const archive_repository_t* repository,
 			                    sizeof(publication.provider_kind),
 			                    "mrxs-native") &&
 			archive_ingest_copy(publication.adapter_version,
-			                    sizeof(publication.adapter_version), "5") &&
+			                    sizeof(publication.adapter_version), ARCHIVE_MRXS_ADAPTER_VERSION_STRING) &&
 			archive_ingest_copy(publication.frame_media_type,
 			                    sizeof(publication.frame_media_type),
 			                    "image/jpeg") &&
@@ -909,14 +887,14 @@ static bool archive_ingest_mrxs(const archive_repository_t* repository,
 			                    "GENERATED") &&
 			archive_ingest_copy(publication.frame_policy_version,
 			                    sizeof(publication.frame_policy_version),
-			                    "mrxs-jpeg-shell-payload-v5");
+			                    ARCHIVE_MRXS_FRAME_POLICY);
 		publication.shell_object_id = shell_object.id;
 		publication.recipe_object_id = recipe_object.id;
 		publication.instances = instances;
 		publication.instance_count = instance_count;
 	}
 	if (success && archive_database_publish_shells(
-			repository, bundle.id, &publication, 1,
+			repository, &publication, 1,
 			error, error_capacity) != ARCHIVE_DATABASE_OK)
 		success = false;
 	if (success && result) {

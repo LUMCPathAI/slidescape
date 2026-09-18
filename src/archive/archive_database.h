@@ -39,7 +39,7 @@ typedef struct archive_database_object_t {
 	bool already_registered;
 } archive_database_object_t;
 
-typedef struct archive_database_part10_member_t {
+typedef struct archive_database_instance_t {
 	i64 object_id;
 	char logical_name[81];
 	char sop_instance_uid[65];
@@ -57,7 +57,7 @@ typedef struct archive_database_part10_member_t {
 	i64 total_pixel_matrix_rows;
 	i64 total_pixel_matrix_columns;
 	char image_flavor[17];
-} archive_database_part10_member_t;
+} archive_database_instance_t;
 
 typedef struct archive_database_bundle_t {
 	i64 id;
@@ -67,11 +67,12 @@ typedef struct archive_database_bundle_t {
 } archive_database_bundle_t;
 
 typedef struct archive_database_shell_instance_publication_t {
-	archive_database_part10_member_t instance;
+	archive_database_instance_t instance;
 	u32 shell_instance_index;
 } archive_database_shell_instance_publication_t;
 
 typedef struct archive_database_shell_publication_t {
+	i64 bundle_id;
 	char representation_id[65];
 	i64 shell_object_id;
 	i64 recipe_object_id;
@@ -117,7 +118,7 @@ archive_database_status_t archive_database_read_inline_object(
 		u8** data, size_t* size, char* error, size_t error_capacity);
 archive_database_status_t archive_database_register_part10_bundle(
 		const archive_repository_t* repository, const char* bundle_digest,
-		i64 descriptor_object_id, const archive_database_part10_member_t* members,
+		i64 descriptor_object_id, const archive_database_instance_t* members,
 		i32 member_count, archive_database_bundle_t* bundle,
 		char* error, size_t error_capacity);
 archive_database_status_t archive_database_register_mrxs_bundle(
@@ -125,11 +126,7 @@ archive_database_status_t archive_database_register_mrxs_bundle(
 		i64 descriptor_object_id, archive_database_bundle_t* bundle,
 		char* error, size_t error_capacity);
 archive_database_status_t archive_database_publish_shells(
-		const archive_repository_t* repository, i64 bundle_id,
-		const archive_database_shell_publication_t* publications,
-		i32 publication_count, char* error, size_t error_capacity);
-archive_database_status_t archive_database_publish_part10_shells(
-		const archive_repository_t* repository, i64 bundle_id,
+		const archive_repository_t* repository,
 		const archive_database_shell_publication_t* publications,
 		i32 publication_count, char* error, size_t error_capacity);
 const char* archive_database_status_string(archive_database_status_t status);

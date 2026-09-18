@@ -9,6 +9,7 @@
 #include "dicomweb.h"
 #include "image_loader.h"
 #include "jpeg_decoder.h"
+#include "jpeg2000_decoder.h"
 #include "archive_database.h"
 #include "archive_frame_map.h"
 #include "archive_index.h"
@@ -676,6 +677,11 @@ static void check_archive_part10_provider(dicom_instance_t* instance, u32 one_ba
 		REQUIRE(frame.size >= 2);
 		CHECK(frame.data[0] == 0xff);
 		CHECK(frame.data[1] == 0x4f);
+		i32 width = 0, height = 0;
+		CHECK(jpeg2000_decode_image_to_bgra_bounded(frame.data, frame.size,
+			instance->columns + 1, instance->rows, MEGABYTES(64), &width, &height) == nullptr);
+		CHECK(jpeg2000_decode_image_to_bgra_bounded(frame.data, frame.size,
+			instance->columns, instance->rows, 1, &width, &height) == nullptr);
 	}
 	dicomweb_instance_metadata_t decoder_metadata = {};
 	decoder_metadata.rows = instance->rows;
@@ -1165,7 +1171,8 @@ TEST_CASE("P480 MRXS adapter builds a sparse virtual DICOM pyramid") {
 	archive_mrxs_adapter_t adapter = {};
 	char error[512] = {};
 	REQUIRE(archive_mrxs_adapter_open(
-		&adapter, fixture->path, fingerprint, error, sizeof(error)));
+		&adapter, fixture->path, error, sizeof(error)));
+	REQUIRE(archive_mrxs_adapter_set_identity(&adapter, fingerprint));
 	CHECK(adapter.slide.level_count == 10);
 	CHECK_FALSE(adapter.slide.is_fluorescence);
 	CHECK_FALSE(adapter.slide.has_overlapping_tiles);
@@ -1242,8 +1249,8 @@ TEST_CASE("P480 MRXS adapter builds a sparse virtual DICOM pyramid") {
 	REQUIRE(sample_frame > 0);
 	u8* rgb = nullptr;
 	size_t rgb_size = 0;
-	REQUIRE(archive_mrxs_adapter_get_rgb_frame(
-		&adapter, lowest_level, sample_frame, &rgb, &rgb_size,
+	REQUIRE(archive_mrxs_adapter_get_rgb_tile(
+		&adapter, lowest_level, sample_frame - 1, &rgb, &rgb_size,
 		error, sizeof(error)));
 	CHECK(rgb_size ==
 	      (size_t)adapter.slide.levels[lowest_level].tile_width *
@@ -1252,8 +1259,8 @@ TEST_CASE("P480 MRXS adapter builds a sparse virtual DICOM pyramid") {
 	free(rgb);
 	u8* native_jpeg = nullptr;
 	size_t native_jpeg_size = 0;
-	REQUIRE(archive_mrxs_adapter_get_jpeg_frame(
-		&adapter, lowest_level, sample_frame,
+	REQUIRE(archive_mrxs_adapter_get_jpeg_tile(
+		&adapter, lowest_level, sample_frame - 1,
 		&native_jpeg, &native_jpeg_size, error, sizeof(error)));
 	REQUIRE(native_jpeg_size > 2);
 	CHECK(native_jpeg[0] == 0xff);
@@ -1280,8 +1287,8 @@ TEST_CASE("P480 MRXS adapter builds a sparse virtual DICOM pyramid") {
 	REQUIRE(blank_frame > 0);
 	u8* blank_jpeg = nullptr;
 	size_t blank_jpeg_size = 0;
-	CHECK_FALSE(archive_mrxs_adapter_get_jpeg_frame(
-		&adapter, lowest_level, blank_frame,
+	CHECK_FALSE(archive_mrxs_adapter_get_jpeg_tile(
+		&adapter, lowest_level, blank_frame - 1,
 		&blank_jpeg, &blank_jpeg_size, error, sizeof(error)));
 	CHECK(blank_jpeg == nullptr);
 	CHECK(blank_jpeg_size == 0);
@@ -1365,7 +1372,7 @@ TEST_CASE("P480 MRXS adapter builds a sparse virtual DICOM pyramid") {
 	archive_database_shell_instance_publication_t published[ARCHIVE_MRXS_MAX_LEVELS] = {};
 	for (i32 i = 0; i < adapter.slide.level_count; ++i) {
 		mrxs_level_t* level = adapter.slide.levels + i;
-		archive_database_part10_member_t* instance = &published[i].instance;
+		archive_database_instance_t* instance = &published[i].instance;
 		instance->object_id = descriptor_object.id;
 		snprintf(instance->study_instance_uid,
 		         sizeof(instance->study_instance_uid), "%s",
@@ -1401,6 +1408,7 @@ TEST_CASE("P480 MRXS adapter builds a sparse virtual DICOM pyramid") {
 		published[i].shell_instance_index = (u32)i;
 	}
 	archive_database_shell_publication_t publication = {};
+	publication.bundle_id = bundle.id;
 	snprintf(publication.representation_id,
 	         sizeof(publication.representation_id), "%s",
 	         adapter.series_instance_uid);
@@ -1412,18 +1420,18 @@ TEST_CASE("P480 MRXS adapter builds a sparse virtual DICOM pyramid") {
 	publication.instance_count = adapter.slide.level_count;
 	snprintf(publication.provider_kind, sizeof(publication.provider_kind),
 	         "mrxs-native");
-	snprintf(publication.adapter_version, sizeof(publication.adapter_version), "5");
+	snprintf(publication.adapter_version, sizeof(publication.adapter_version), ARCHIVE_MRXS_ADAPTER_VERSION_STRING);
 	snprintf(publication.frame_media_type, sizeof(publication.frame_media_type),
 	         "image/jpeg");
 	snprintf(publication.frame_source, sizeof(publication.frame_source), "GENERATED");
 	snprintf(publication.frame_policy_version,
 	         sizeof(publication.frame_policy_version),
-	         "mrxs-jpeg-shell-payload-v5");
+	         ARCHIVE_MRXS_FRAME_POLICY);
 	REQUIRE(archive_database_publish_shells(
-		&repository, bundle.id, &publication, 1,
+		&repository, &publication, 1,
 		error, sizeof(error)) == ARCHIVE_DATABASE_OK);
 	REQUIRE(archive_database_publish_shells(
-		&repository, bundle.id, &publication, 1,
+		&repository, &publication, 1,
 		error, sizeof(error)) == ARCHIVE_DATABASE_OK);
 
 	archive_index_t index = {};

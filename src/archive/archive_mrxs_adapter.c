@@ -13,6 +13,7 @@
 #include "archive_sha256.h"
 #include "dicom.h"
 #include "image_loader.h"
+#include "jpeg_decoder.h"
 
 #include <stdarg.h>
 
@@ -70,12 +71,11 @@ static void archive_mrxs_set_uid(dicom_ui_t* value, const char* uid) {
 }
 
 bool archive_mrxs_adapter_open(archive_mrxs_adapter_t* adapter,
-		const char* mrxs_path, const char* representation_fingerprint,
+		const char* mrxs_path,
 		char* error, size_t error_capacity) {
 	if (adapter) memset(adapter, 0, sizeof(*adapter));
 	if (error && error_capacity) error[0] = '\0';
-	if (!adapter || !mrxs_path || !representation_fingerprint ||
-	    strlen(representation_fingerprint) != 64 ||
+	if (!adapter || !mrxs_path ||
 	    strlen(mrxs_path) >= sizeof(((file_info_t*)0)->full_filename))
 		return false;
 	struct stat source_info = {0};
@@ -122,7 +122,8 @@ bool archive_mrxs_adapter_open(archive_mrxs_adapter_t* adapter,
 	for (i32 i = 0; i < adapter->slide.level_count; ++i) {
 		const mrxs_level_t* level = adapter->slide.levels + i;
 		if (level->image_format != MRXS_IMAGE_FORMAT_JPEG ||
-		    level->tile_width <= 0 || level->tile_height <= 0 ||
+		    level->tile_width <= 0 || level->tile_width > UINT16_MAX ||
+		    level->tile_height <= 0 || level->tile_height > UINT16_MAX ||
 		    level->width_in_tiles <= 0 || level->height_in_tiles <= 0 ||
 		    !level->tiles) {
 			archive_mrxs_set_error(
@@ -157,23 +158,52 @@ bool archive_mrxs_adapter_open(archive_mrxs_adapter_t* adapter,
 			return false;
 		}
 	}
-	if (!archive_mrxs_uid(adapter->study_instance_uid,
-	                      representation_fingerprint, "study", 0) ||
-	    !archive_mrxs_uid(adapter->series_instance_uid,
-	                      representation_fingerprint, "series", 0)) {
+	/* Admission validates every stored tile header, with bounded memory and no
+	 * pixel decode. Native payloads must actually satisfy the advertised syntax. */
+	u8* header = malloc(KILOBYTES(64));
+	bool valid_headers = header != NULL;
+	for (i32 i = 0; i < adapter->slide.level_count && valid_headers; ++i) {
+		const mrxs_level_t* level = adapter->slide.levels + i;
+		u64 tile_count = (u64)level->width_in_tiles * level->height_in_tiles;
+		for (u64 tile = 0; tile < tile_count && valid_headers; ++tile) {
+			const mrxs_hier_entry_t* entry = &level->tiles[tile].hier_entry;
+			if (!entry->length) continue;
+			size_t bytes = MIN(entry->length, KILOBYTES(64));
+			valid_headers = entry->file < (u32)adapter->slide.dat_count &&
+				entry->length <= ARCHIVE_MRXS_MAX_FRAME_SIZE &&
+				file_handle_read_at_offset(header, adapter->slide.dat_file_handles[entry->file],
+					entry->offset, bytes) == bytes &&
+				jpeg_validate_baseline_ycbcr_header(header, (u32)bytes, level->tile_width, level->tile_height);
+		}
+	}
+	free(header);
+	if (!valid_headers) {
+		archive_mrxs_set_error(error, error_capacity,
+			"MRXS requires standalone baseline 8-bit YCbCr JPEG tiles with matching dimensions and headers within 64 KiB");
 		archive_mrxs_adapter_close(adapter);
+		return false;
+	}
+
+	snprintf(adapter->source_path, sizeof(adapter->source_path), "%s",
+	         mrxs_path);
+	adapter->is_open = true;
+	return true;
+}
+
+bool archive_mrxs_adapter_set_identity(archive_mrxs_adapter_t* adapter, const char* bundle_sha256) {
+	if (!adapter || !adapter->is_open || !bundle_sha256 || strlen(bundle_sha256) != 64) return false;
+	if (!archive_mrxs_uid(adapter->study_instance_uid,
+	                      bundle_sha256, "study", 0) ||
+	    !archive_mrxs_uid(adapter->series_instance_uid,
+	                      bundle_sha256, "series", 0)) {
 		return false;
 	}
 	for (i32 i = 0; i < adapter->slide.level_count; ++i)
 		if (!archive_mrxs_uid(adapter->sop_instance_uids[i],
-		                      representation_fingerprint, "volume-level",
+		                      bundle_sha256, "volume-level",
 		                      (u32)i)) {
-			archive_mrxs_adapter_close(adapter);
 			return false;
 		}
-	snprintf(adapter->source_path, sizeof(adapter->source_path), "%s",
-	         mrxs_path);
-	adapter->is_open = true;
 	return true;
 }
 
@@ -200,8 +230,8 @@ bool archive_mrxs_adapter_build_recipe(const char* mrxs_path,
 	if (!result) return false;
 	i32 length = snprintf(
 		result, capacity,
-		"slidescape-mrxs-native-recipe-v5\n"
-		"adapter\tslidescape-mrxs\t5\n"
+		ARCHIVE_MRXS_RECIPE_MAGIC "\n"
+		"adapter\tslidescape-mrxs\t" ARCHIVE_MRXS_ADAPTER_VERSION_STRING "\n"
 		"bundle-descriptor-sha256\t%s\n"
 		"bundle-descriptor-size\t%llu\n"
 		"representation-fingerprint\t%s\n"
@@ -256,6 +286,10 @@ bool archive_mrxs_adapter_build_shell(archive_mrxs_adapter_t* adapter,
 		snprintf(instance->general_series.Modality.value,
 		         sizeof(instance->general_series.Modality.value), "SM");
 		instance->image_flavor = DICOM_IMAGE_FLAVOR_VOLUME;
+		instance->has_valid_wsi_image_type = true;
+		/* The virtual pyramid is a derived representation of the native source. */
+		instance->is_image_original = false;
+		instance->is_image_resampled = i > 0;
 		instance->photometric_interpretation =
 			DICOM_PHOTOMETRIC_INTERPRETATION_YBR_FULL_422;
 		instance->instance_number = (i64)i + 1;
@@ -346,9 +380,7 @@ bool archive_mrxs_adapter_build_shell(archive_mrxs_adapter_t* adapter,
 		optical_path.OpticalPathIdentifier.present = true;
 		snprintf(optical_path.OpticalPathIdentifier.value,
 		         sizeof(optical_path.OpticalPathIdentifier.value), "0");
-		optical_path.ColorSpace.present = true;
-		snprintf(optical_path.ColorSpace.value,
-		         sizeof(optical_path.ColorSpace.value), "SRGB");
+		/* JPEG YCbCr coding does not establish an sRGB color profile. */
 		arrput(instance->optical_paths, optical_path);
 		inputs[i] = (archive_shell_build_part10_input_t){
 			.instance = instance,
@@ -379,19 +411,17 @@ bool archive_mrxs_adapter_build_shell(archive_mrxs_adapter_t* adapter,
 	return success;
 }
 
-bool archive_mrxs_adapter_get_rgb_frame(archive_mrxs_adapter_t* adapter,
-		u32 level_index, u32 one_based_frame, u8** data, size_t* size,
+bool archive_mrxs_adapter_get_rgb_tile(archive_mrxs_adapter_t* adapter,
+		u32 level_index, u32 tile_index, u8** data, size_t* size,
 		char* error, size_t error_capacity) {
 	if (data) *data = NULL;
 	if (size) *size = 0;
 	if (!adapter || !adapter->is_open || !data || !size ||
-	    level_index >= (u32)adapter->slide.level_count ||
-	    one_based_frame == 0) return false;
+	    level_index >= (u32)adapter->slide.level_count) return false;
 	mrxs_level_t* level = adapter->slide.levels + level_index;
 	u64 frame_count = (u64)level->width_in_tiles * level->height_in_tiles;
-	if (one_based_frame > frame_count) return false;
+	if (tile_index >= frame_count) return false;
 	size_t pixel_count = (size_t)level->tile_width * level->tile_height;
-	u32 tile_index = one_based_frame - 1;
 	u8* bgra = NULL;
 	if (level->tiles[tile_index].hier_entry.length) {
 		bgra = mrxs_decode_tile_to_bgra(
@@ -430,19 +460,18 @@ bool archive_mrxs_adapter_get_rgb_frame(archive_mrxs_adapter_t* adapter,
 	return true;
 }
 
-bool archive_mrxs_adapter_get_jpeg_frame(archive_mrxs_adapter_t* adapter,
-		u32 level_index, u32 one_based_frame, u8** data, size_t* size,
+bool archive_mrxs_adapter_get_jpeg_tile(archive_mrxs_adapter_t* adapter,
+		u32 level_index, u32 tile_index, u8** data, size_t* size,
 		char* error, size_t error_capacity) {
 	if (data) *data = NULL;
 	if (size) *size = 0;
 	if (!adapter || !adapter->is_open || !data || !size ||
-	    level_index >= (u32)adapter->slide.level_count ||
-	    one_based_frame == 0) return false;
+	    level_index >= (u32)adapter->slide.level_count) return false;
 	mrxs_level_t* level = adapter->slide.levels + level_index;
 	u64 frame_count = (u64)level->width_in_tiles * level->height_in_tiles;
-	if (one_based_frame > frame_count) return false;
+	if (tile_index >= frame_count) return false;
 	mrxs_hier_entry_t entry =
-		level->tiles[one_based_frame - 1].hier_entry;
+		level->tiles[tile_index].hier_entry;
 	if (entry.length) {
 		if (!adapter->slide.dat_file_handles ||
 		    entry.file >= (u32)adapter->slide.dat_count ||

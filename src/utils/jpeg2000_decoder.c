@@ -62,7 +62,8 @@ static u8 jpeg2000_sample_to_u8(const opj_image_comp_t* component, size_t index)
 	return (u8)(((u64)sample * 255 + max_sample / 2) / max_sample);
 }
 
-u8* jpeg2000_decode_image_to_bgra(const u8* input, size_t input_size,
+static u8* jpeg2000_decode_image_internal(const u8* input, size_t input_size,
+		i32 expected_width, i32 expected_height, size_t maximum_output_size,
 		i32* width, i32* height) {
 	if (width) *width = 0;
 	if (height) *height = 0;
@@ -89,26 +90,31 @@ u8* jpeg2000_decode_image_to_bgra(const u8* input, size_t input_size,
 	opj_dparameters_t parameters;
 	opj_set_default_decoder_parameters(&parameters);
 	if (!opj_setup_decoder(codec, &parameters) ||
-		!opj_read_header(stream, codec, &image) ||
-		!opj_decode(codec, stream, image) ||
-		!opj_end_decompress(codec, stream)) {
+		!opj_read_header(stream, codec, &image)) {
 		goto cleanup;
 	}
 
-	if (!image || (image->numcomps != 1 && image->numcomps < 3)) goto cleanup;
+	if (!image || (image->numcomps != 1 && image->numcomps != 3 && image->numcomps != 4)) goto cleanup;
 	opj_image_comp_t* first = image->comps;
-	if (!first->data || first->w == 0 || first->h == 0 || first->prec == 0 || first->prec > 32 ||
+	if (first->w == 0 || first->h == 0 || first->prec == 0 || first->prec > 32 ||
 		first->w > INT32_MAX || first->h > INT32_MAX) goto cleanup;
-	for (OPJ_UINT32 component_index = 1; component_index < MIN(image->numcomps, 3); ++component_index) {
+	for (OPJ_UINT32 component_index = 1; component_index < image->numcomps; ++component_index) {
 		opj_image_comp_t* component = image->comps + component_index;
-		if (!component->data || component->w != first->w || component->h != first->h ||
+		if (component->w != first->w || component->h != first->h ||
 			component->prec == 0 || component->prec > 32) {
 			goto cleanup;
 		}
 	}
 
+	/* OpenJPEG allocates component planes during decode. Validate the header first. */
+	if ((expected_width > 0 && first->w != (u32)expected_width) ||
+	    (expected_height > 0 && first->h != (u32)expected_height) ||
+	    (u64)first->w * first->h > maximum_output_size / 4) goto cleanup;
 	size_t pixel_count = (size_t)first->w * first->h;
-	if (pixel_count > SIZE_MAX / 4) goto cleanup;
+	if (!opj_decode(codec, stream, image) || !opj_end_decompress(codec, stream))
+		goto cleanup;
+	for (OPJ_UINT32 i = 0; i < image->numcomps; ++i)
+		if (!image->comps[i].data) goto cleanup;
 	result = malloc(pixel_count * 4);
 	if (!result) goto cleanup;
 	for (size_t i = 0; i < pixel_count; ++i) {
@@ -135,4 +141,17 @@ cleanup:
 	if (codec) opj_destroy_codec(codec);
 	if (stream) opj_stream_destroy(stream);
 	return result;
+}
+
+u8* jpeg2000_decode_image_to_bgra(const u8* input, size_t input_size,
+		i32* width, i32* height) {
+	return jpeg2000_decode_image_internal(input, input_size, 0, 0, SIZE_MAX, width, height);
+}
+
+u8* jpeg2000_decode_image_to_bgra_bounded(const u8* input, size_t input_size,
+		i32 expected_width, i32 expected_height, size_t maximum_output_size,
+		i32* width, i32* height) {
+	if (expected_width <= 0 || expected_height <= 0) return NULL;
+	return jpeg2000_decode_image_internal(input, input_size, expected_width,
+		expected_height, maximum_output_size, width, height);
 }

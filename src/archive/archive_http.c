@@ -18,6 +18,7 @@
 #include "memrw.h"
 #include "platform.h"
 #include "work_queue.h"
+#include "timerutils.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -47,8 +48,17 @@ typedef int archive_socket_t;
 #define ARCHIVE_MAX_FRAMES_PER_REQUEST 64
 #define ARCHIVE_MAX_MULTIPART_RESPONSE_SIZE MEGABYTES(256)
 
+#define ARCHIVE_REQUEST_DEADLINE_MS 30000
+#define ARCHIVE_SOCKET_IDLE_TIMEOUT_MS 5000
+#define ARCHIVE_RESPONSE_MEMORY_BUDGET MEGABYTES(512)
+
+typedef struct archive_connection_t {
+	archive_socket_t socket;
+	i64 accepted_at;
+} archive_connection_t;
+
 typedef struct archive_client_task_t {
-	archive_socket_t client;
+	archive_connection_t connection;
 	const archive_repository_t* repository;
 	const archive_index_t* index;
 } archive_client_task_t;
@@ -133,12 +143,32 @@ static archive_socket_t archive_accept_loopback(archive_socket_t ipv4_server,
 	return accept(ipv4_server, NULL, NULL);
 }
 
-static bool archive_send_all(archive_socket_t socket, const char* data, size_t size) {
-	while (size > 0) {
+/* Apply the remaining absolute deadline to every blocking operation. A client
+ * making tiny periodic progress cannot occupy a worker indefinitely. Queue time
+ * counts too, since accepted_at is recorded by the listener. */
+static bool archive_set_client_timeout(const archive_connection_t* connection) {
+	i32 remaining_ms = ARCHIVE_REQUEST_DEADLINE_MS -
+		(i32)(get_seconds_elapsed(connection->accepted_at, get_clock()) * 1000.0f);
+	if (remaining_ms <= 0) return false;
+	i32 timeout_ms = MIN(remaining_ms, ARCHIVE_SOCKET_IDLE_TIMEOUT_MS);
 #if defined(_WIN32)
-		i32 sent = send(socket, data, size > INT32_MAX ? INT32_MAX : (i32)size, 0);
+	DWORD timeout = (DWORD)timeout_ms;
 #else
-		ssize_t sent = send(socket, data, size, 0);
+	struct timeval timeout = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+#endif
+	return setsockopt(connection->socket, SOL_SOCKET, SO_RCVTIMEO,
+		(const char*)&timeout, sizeof(timeout)) == 0 &&
+		setsockopt(connection->socket, SOL_SOCKET, SO_SNDTIMEO,
+		(const char*)&timeout, sizeof(timeout)) == 0;
+}
+
+static bool archive_send_all(const archive_connection_t* socket, const char* data, size_t size) {
+	while (size > 0) {
+		if (!archive_set_client_timeout(socket)) return false;
+#if defined(_WIN32)
+		i32 sent = send(socket->socket, data, size > INT32_MAX ? INT32_MAX : (i32)size, 0);
+#else
+		ssize_t sent = send(socket->socket, data, size, 0);
 #endif
 		if (sent <= 0) return false;
 		data += sent;
@@ -147,8 +177,8 @@ static bool archive_send_all(archive_socket_t socket, const char* data, size_t s
 	return true;
 }
 
-static bool archive_send_body(archive_socket_t socket, i32 status, const char* reason,
-		const char* content_type, const char* body, size_t body_size) {
+static bool archive_send_headers(const archive_connection_t* socket, i32 status, const char* reason,
+		const char* content_type, size_t body_size) {
 	char header[512];
 	memrw_t builder;
 	archive_memrw_init_fixed(&builder, header, sizeof(header));
@@ -161,22 +191,28 @@ static bool archive_send_body(archive_socket_t socket, i32 status, const char* r
 	memrw_write_literal("\r\nContent-Length: ", &builder);
 	archive_memrw_write_u64(&builder, (u64)body_size);
 	memrw_write_literal("\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", &builder);
-	return archive_send_all(socket, header, builder.used_size) &&
-	       archive_send_all(socket, body, body_size);
+	return archive_send_all(socket, header, builder.used_size);
 }
 
-static bool archive_send_json(archive_socket_t socket, i32 status, const char* reason,
+static bool archive_send_body(const archive_connection_t* socket, i32 status, const char* reason,
+		const char* content_type, const char* body, size_t body_size) {
+	return archive_send_headers(socket, status, reason, content_type, body_size) &&
+		archive_send_all(socket, body, body_size);
+}
+
+static bool archive_send_json(const archive_connection_t* socket, i32 status, const char* reason,
 		const char* json) {
 	return archive_send_body(socket, status, reason, "application/json", json, strlen(json));
 }
 
-static bool archive_read_request_headers(archive_socket_t socket, char* request, size_t capacity) {
+static bool archive_read_request_headers(const archive_connection_t* socket, char* request, size_t capacity) {
 	size_t used = 0;
 	while (used + 1 < capacity) {
+		if (!archive_set_client_timeout(socket)) return false;
 #if defined(_WIN32)
-		int received = recv(socket, request + used, (int)(capacity - used - 1), 0);
+		int received = recv(socket->socket, request + used, (int)(capacity - used - 1), 0);
 #else
-		ssize_t received = recv(socket, request + used, capacity - used - 1, 0);
+		ssize_t received = recv(socket->socket, request + used, capacity - used - 1, 0);
 #endif
 		if (received <= 0) return false;
 		used += (size_t)received;
@@ -186,19 +222,8 @@ static bool archive_read_request_headers(archive_socket_t socket, char* request,
 	return false;
 }
 
-static void archive_set_client_timeout(archive_socket_t socket) {
-#if defined(_WIN32)
-	DWORD timeout_ms = 5000;
-	setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
-	setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
-#else
-	struct timeval timeout = {5, 0};
-	setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-	setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-#endif
-}
 
-static void archive_send_qido_response(archive_socket_t client, const archive_index_t* index,
+static void archive_send_qido_response(const archive_connection_t* client, const archive_index_t* index,
 		const archive_route_match_t* route, const char* target) {
 	size_t capacity = MEGABYTES(1);
 	char* body = malloc(capacity);
@@ -276,7 +301,7 @@ static void archive_write_frame_part_header(memrw_t* builder, bool include_separ
 	memrw_write_literal("\r\n\r\n", builder);
 }
 
-static void archive_send_wado_response(archive_socket_t client,
+static void archive_send_wado_response_admitted(const archive_connection_t* client,
 		const archive_repository_t* repository, const archive_index_t* index,
 		const archive_route_match_t* route, const char* request_headers) {
 	char error[512] = {0};
@@ -295,6 +320,7 @@ static void archive_send_wado_response(archive_socket_t client,
 		if (!archive_instance_provider_get_series_metadata(
 				repository, records, record_count, &json, &json_size,
 				error, sizeof(error))) {
+			fprintf(stderr, "archive metadata retrieval failed: %s\n", error);
 			archive_send_json(client, 409, "Conflict",
 			                  "{\"error\":\"representation_unavailable\"}\n");
 			return;
@@ -315,6 +341,7 @@ static void archive_send_wado_response(archive_socket_t client,
 		size_t json_size = 0;
 		if (!archive_instance_provider_get_metadata(repository, record, &json, &json_size,
 				error, sizeof(error))) {
+			fprintf(stderr, "archive metadata retrieval failed: %s\n", error);
 			archive_send_json(client, 409, "Conflict", "{\"error\":\"representation_unavailable\"}\n");
 			return;
 		}
@@ -342,6 +369,7 @@ static void archive_send_wado_response(archive_socket_t client,
 	i32 available_count = archive_instance_provider_get_frame_representations(
 		repository, record, available, COUNT(available), error, sizeof(error));
 	if (available_count <= 0) {
+		fprintf(stderr, "archive representation lookup failed: %s\n", error);
 		archive_send_json(client, 409, "Conflict",
 		                  "{\"error\":\"representation_unavailable\"}\n");
 		return;
@@ -363,8 +391,13 @@ static void archive_send_wado_response(archive_socket_t client,
 	static const char boundary[] = "slidescape-frame-boundary";
 	size_t body_size = 0;
 	for (i32 i = 0; i < frame_count; ++i) {
+		if (!archive_set_client_timeout(client)) {
+			archive_destroy_frames(frames, i);
+			return;
+		}
 		if (!archive_instance_provider_get_frame(repository, record, frame_numbers[i],
 				&selected, frames + i, error, sizeof(error))) {
+			fprintf(stderr, "archive frame retrieval failed: %s\n", error);
 			archive_destroy_frames(frames, i);
 			archive_send_json(client, 409, "Conflict", "{\"error\":\"frame_unavailable\"}\n");
 			return;
@@ -398,27 +431,6 @@ static void archive_send_wado_response(archive_socket_t client,
 		return;
 	}
 	body_size += closing_size;
-	char* body = (char*)malloc(body_size);
-	if (!body) {
-		archive_destroy_frames(frames, frame_count);
-		archive_send_json(client, 500, "Internal Server Error", "{\"error\":\"frame_response_failed\"}\n");
-		return;
-	}
-	size_t used = 0;
-	for (i32 i = 0; i < frame_count; ++i) {
-		char part_header[768];
-		memrw_t part_header_builder;
-		archive_memrw_init_fixed(&part_header_builder, part_header, sizeof(part_header));
-		archive_write_frame_part_header(&part_header_builder, i != 0, boundary,
-		                                frames + i, route, frame_numbers[i]);
-		memcpy(body + used, part_header, part_header_builder.used_size);
-		used += part_header_builder.used_size;
-		memcpy(body + used, frames[i].data, frames[i].size);
-		used += frames[i].size;
-	}
-	memcpy(body + used, closing, closing_size);
-	used += closing_size;
-	ASSERT(used == body_size);
 	char content_type[160];
 	memrw_t content_type_builder;
 	archive_memrw_init_fixed(&content_type_builder, content_type, sizeof(content_type));
@@ -429,12 +441,44 @@ static void archive_send_wado_response(archive_socket_t client,
 	memrw_write_literal("; boundary=", &content_type_builder);
 	memrw_write_string(boundary, &content_type_builder);
 	memrw_putc('\0', &content_type_builder);
-	archive_send_body(client, 200, "OK", content_type, body, body_size);
-	free(body);
-	archive_destroy_frames(frames, frame_count);
+	/* Fetch and validate all frames before committing the response headers, then
+	 * send them directly. There is no second allocation/copy of the whole body. */
+	bool sent = archive_send_headers(client, 200, "OK", content_type, body_size);
+	for (i32 i = 0; i < frame_count; ++i) {
+		char part_header[768];
+		memrw_t part_header_builder;
+		archive_memrw_init_fixed(&part_header_builder, part_header, sizeof(part_header));
+		archive_write_frame_part_header(&part_header_builder, i != 0, boundary,
+			frames + i, route, frame_numbers[i]);
+		sent = sent && archive_send_all(client, part_header, part_header_builder.used_size) &&
+			archive_send_all(client, (const char*)frames[i].data, frames[i].size);
+		archive_instance_frame_destroy(frames + i);
+	}
+	if (sent) archive_send_all(client, closing, closing_size);
 }
 
-static void archive_handle_request_with_buffer(archive_socket_t client,
+static platform_mutex_t archive_response_budget_mutex = PLATFORM_MUTEX_INITIALIZER;
+static size_t archive_response_bytes_reserved;
+
+static void archive_send_wado_response(const archive_connection_t* client,
+		const archive_repository_t* repository, const archive_index_t* index,
+		const archive_route_match_t* route, const char* request_headers) {
+	platform_mutex_lock(&archive_response_budget_mutex);
+	bool admitted = archive_response_bytes_reserved <=
+		ARCHIVE_RESPONSE_MEMORY_BUDGET - ARCHIVE_MAX_MULTIPART_RESPONSE_SIZE;
+	if (admitted) archive_response_bytes_reserved += ARCHIVE_MAX_MULTIPART_RESPONSE_SIZE;
+	platform_mutex_unlock(&archive_response_budget_mutex);
+	if (!admitted) {
+		archive_send_json(client, 503, "Service Unavailable", "{\"error\":\"response_budget_busy\"}\n");
+		return;
+	}
+	archive_send_wado_response_admitted(client, repository, index, route, request_headers);
+	platform_mutex_lock(&archive_response_budget_mutex);
+	archive_response_bytes_reserved -= ARCHIVE_MAX_MULTIPART_RESPONSE_SIZE;
+	platform_mutex_unlock(&archive_response_budget_mutex);
+}
+
+static void archive_handle_request_with_buffer(const archive_connection_t* client,
 		const archive_repository_t* repository, const archive_index_t* index,
 		char* request) {
 	if (!archive_read_request_headers(client, request, ARCHIVE_REQUEST_HEADER_LIMIT + 1)) {
@@ -470,11 +514,13 @@ static void archive_handle_request_with_buffer(archive_socket_t client,
 	if (route.kind == ARCHIVE_ROUTE_HEALTH) {
 		archive_instance_provider_cache_stats_t stats =
 			archive_instance_provider_get_cache_stats();
-		char body[512];
+		char body[1024];
 		memrw_t builder;
 		archive_memrw_init_fixed(&builder, body, sizeof(body));
 		memrw_write_literal("{\"status\":\"ok\",\"service\":\"slidescape-pathology-archive\","
-			"\"repositorySchemaVersion\":1,\"part10Cache\":{\"resident\":", &builder);
+			"\"repositorySchemaVersion\":", &builder);
+		archive_memrw_write_u64(&builder, ARCHIVE_REPOSITORY_SCHEMA_VERSION);
+		memrw_write_literal(",\"part10Cache\":{\"resident\":", &builder);
 		archive_memrw_write_u64(&builder, (u64)stats.resident_count);
 		memrw_write_literal(",\"capacity\":", &builder);
 		archive_memrw_write_u64(&builder, (u64)stats.capacity);
@@ -484,6 +530,8 @@ static void archive_handle_request_with_buffer(archive_socket_t client,
 		archive_memrw_write_u64(&builder, stats.misses);
 		memrw_write_literal(",\"evictions\":", &builder);
 		archive_memrw_write_u64(&builder, stats.evictions);
+		memrw_write_literal(",\"payloadBytes\":", &builder);
+		archive_memrw_write_u64(&builder, stats.payload_bytes);
 		memrw_write_literal("},\"shellCache\":{\"resident\":", &builder);
 		archive_memrw_write_u64(&builder, (u64)stats.shell_resident_count);
 		memrw_write_literal(",\"capacity\":", &builder);
@@ -494,6 +542,8 @@ static void archive_handle_request_with_buffer(archive_socket_t client,
 		archive_memrw_write_u64(&builder, stats.shell_misses);
 		memrw_write_literal(",\"evictions\":", &builder);
 		archive_memrw_write_u64(&builder, stats.shell_evictions);
+		memrw_write_literal(",\"bytes\":", &builder);
+		archive_memrw_write_u64(&builder, stats.shell_bytes);
 		memrw_write_literal("}}\n", &builder);
 		memrw_putc('\0', &builder);
 		archive_send_json(client, 200, "OK", body);
@@ -520,7 +570,7 @@ static void archive_handle_request_with_buffer(archive_socket_t client,
 	archive_send_json(client, 501, "Not Implemented", body);
 }
 
-static void archive_handle_request(archive_socket_t client, const archive_repository_t* repository,
+static void archive_handle_request(const archive_connection_t* client, const archive_repository_t* repository,
 		const archive_index_t* index) {
 	temp_memory_t temp = begin_temp_memory_on_local_thread();
 	char* request = arena_push_array(&threadlocal_thread_memory->temp_arena,
@@ -533,9 +583,9 @@ static void archive_handle_request(archive_socket_t client, const archive_reposi
 static void archive_handle_client_task(i32 logical_thread_index, void* userdata) {
 	(void)logical_thread_index;
 	archive_client_task_t* task = (archive_client_task_t*)userdata;
-	archive_set_client_timeout(task->client);
-	archive_handle_request(task->client, task->repository, task->index);
-	archive_socket_close(task->client);
+	if (archive_set_client_timeout(&task->connection))
+		archive_handle_request(&task->connection, task->repository, task->index);
+	archive_socket_close(task->connection.socket);
 }
 
 int archive_http_serve(const archive_repository_t* repository, u16 port,
@@ -583,10 +633,10 @@ int archive_http_serve(const archive_repository_t* repository, u16 port,
 			fprintf(stderr, "Archive accept failed\n");
 			break;
 		}
-		archive_client_task_t task = {client, repository, &index};
+		archive_client_task_t task = {{client, get_clock()}, repository, &index};
 		if (!thread_pool_submit_task(&global_thread_pool, archive_handle_client_task,
 		                             &task, sizeof(task))) {
-			archive_send_json(client, 503, "Service Unavailable", "{\"error\":\"server_busy\"}\n");
+			archive_send_json(&task.connection, 503, "Service Unavailable", "{\"error\":\"server_busy\"}\n");
 			archive_socket_close(client);
 		} else if (thread_pool_get_active_worker_thread_count(&global_thread_pool) == 0) {
 			/* A single-core host has no background worker; thread 0 remains a valid
@@ -601,5 +651,5 @@ int archive_http_serve(const archive_repository_t* repository, u16 port,
 	archive_index_destroy(&index);
 	archive_instance_provider_shutdown();
 	archive_socket_shutdown();
-	return max_requests == 0 || handled == max_requests ? 0 : 1;
+	return max_requests != 0 && handled == max_requests ? 0 : 1;
 }

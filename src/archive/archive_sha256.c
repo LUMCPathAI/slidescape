@@ -10,6 +10,9 @@
 
 #include "archive_sha256.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
 #include <limits.h>
 #include <string.h>
 
@@ -74,5 +77,34 @@ bool archive_sha256_bytes(const void* data, size_t size, char hex[65]) {
 	if (!archive_sha256_update(&sha, data, size)) return false;
 	archive_sha256_finish(&sha, digest);
 	archive_sha256_hex(digest, hex);
+	return true;
+}
+
+/* A fixed-size heap buffer keeps large-source hashing off worker stacks. */
+bool archive_sha256_file(const char* path, char digest[65], u64* byte_size) {
+	if (digest) digest[0] = '\0';
+	if (byte_size) *byte_size = 0;
+	if (!path || !digest || !byte_size) return false;
+	FILE* file = fopen(path, "rb");
+	if (!file) return false;
+	u8* buffer = malloc(MEGABYTES(1));
+	archive_sha256_t sha;
+	archive_sha256_initialize(&sha);
+	bool success = buffer != NULL;
+	while (success) {
+		size_t count = fread(buffer, 1, MEGABYTES(1), file);
+		if (count) success = archive_sha256_update(&sha, buffer, count);
+		if (count < MEGABYTES(1)) {
+			if (ferror(file)) success = false;
+			break;
+		}
+	}
+	free(buffer);
+	if (fclose(file) != 0) success = false;
+	if (!success) return false;
+	u8 bytes[32];
+	*byte_size = sha.byte_count;
+	archive_sha256_finish(&sha, bytes);
+	archive_sha256_hex(bytes, digest);
 	return true;
 }

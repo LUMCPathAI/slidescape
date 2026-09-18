@@ -56,7 +56,8 @@ representation publication if an object is malformed, lacks required WSI metadat
 or reuses a SOP Instance UID for different content. This remains a convenience path
 for interactive testing, not the eventual STOW/source-bundle ingestion pipeline.
 
-The HTTP listener is deliberately restricted to `127.0.0.1`. `GET /health` validates
+The HTTP listener is deliberately restricted to loopback IPv4 (`127.0.0.1`) and
+IPv6 (`::1`, when available). `GET /health` validates
 that the process opened a compatible repository. Study-, series-, and instance-level
 QIDO-RS reads a validated in-memory projection loaded from published SQLite shell
 representations at process startup and returns bounded DICOM JSON. Queries support
@@ -88,8 +89,8 @@ for clients that cannot decode stored JPEG 2000 still requires an explicit lossy
 quality/color policy and is not a prerequisite for extending the schema.
 
 The former TSV compatibility index has been removed. SQLite schema v5 stores the Part
-10 query projection and provider locator, and only objects belonging to a `PUBLISHED`
-bundle are loaded at startup. Protocol handlers continue to consume the in-memory
+10 query projection and provider locator. Startup loads only `PUBLISHED`
+representations, using one SQLite read snapshot for studies, series, and instances. Protocol handlers continue to consume the in-memory
 index/provider interface, so a future live database-backed query implementation does
 not need to alter HTTP routing.
 
@@ -107,7 +108,7 @@ rather than introducing a parallel manifest authority.
 `virtual_dicom_shell_v0_1.md` defines the durable representation contract, including
 aggregate ownership, identity/versioning, optical-path and color policy, provider
 behavior, publication state, and worked Part 10 and MRXS-native examples. Binary
-format v2 has an aligned section directory plus single-instance and aggregate
+format v3 has an aligned section directory plus single-instance and aggregate
 Part 10 writers/loaders. The aggregate writer combines validated instance sections,
 remaps their source/string/section references, and retains independent payload maps
 inside one logical-slide object. Transactional representation publication records the
@@ -126,18 +127,61 @@ it requires and preserves every per-frame Plane Position (Slide) and Optical Pat
 Identification value. It refuses inconsistent counts, unknown optical paths, invalid
 positions, malformed lengths, unsupported versions, and out-of-range assignments.
 
-During the current single-writer development workflow, explicit maps are atomically
-staged under a representation/version-specific name and refuse overwrite. One combined
-map key satisfies both spatial and dimension assignment references in the staged
-manifest. Durable publication must move validated maps to content-addressed immutable
-object storage; staging names are not the final canonical object identity.
+Frame maps live inside the immutable content-addressed shell. Each Study/Series group
+has its own canonical source bundle, so replaying it in a larger discovery batch does
+not change its identity. Registration stages bundles; one final transaction publishes
+all prepared bundles, representations, provider/index rows, and outbox events together.
+Failed admission may leave unreferenced objects or staged bundles, which remain
+invisible to QIDO. Exact replay is idempotent. Adding instances to an already published
+series or replacing it is deliberately rejected until explicit versioning exists.
 
-Staging a manifest does not publish it. Publication remains a future atomic
-transaction that must make the source bundle, governed metadata, representation
-manifests, and all affected index rows visible together. The structs deliberately use
-Slidescape's common types and the UID validator is shared with the DICOMweb client so
-native WSI adapters, conversion code, and server providers can converge on common
-code rather than evolve as a separate application.
+The current shell writer is v3, the Part 10 recipe/adapter is v10, and the native MRXS
+recipe/adapter is v6. Binary v2 remains readable. Its absent ImageType provenance is
+omitted from JSON rather than inferred. Only current Part 10 recipes can regenerate
+shells; older intact shells remain usable, but applying the corrected metadata/profile
+to old publications requires a fresh development repository. No in-place migration or
+silent publication replacement is performed. Repository layout v2 and SQLite schema
+v5 are unchanged. Bundle registration adapter versions (Part 10: 1, MRXS: 2) describe
+the descriptor/member contract, independently of shell-generation versions.
+
+MRXS remains reference-only. Every admitted tile must have a standalone baseline
+8-bit YCbCr JPEG header, matching dimensions, supported sampling, and required tables
+within the first 64 KiB. Admission does not decode every pixel or claim an sRGB profile.
+New native UIDs derive from canonical source membership, independently of adapter
+version. The current descriptor still includes only known referenced files and does
+not preserve an arbitrary original directory tree; owned ZIP64 preservation remains
+separate work.
+
+DICOM JSON projection is isolated in `archive_metadata.*`. It preserves ImageType,
+pixel interpretation, origin/orientation, concatenation, and sparse physical/optical
+positions. Exact size counting accounts for escaped strings and inline ICC data.
+TILED_FULL multi-focal-plane admission is rejected until focal spacing is retained.
+
+The provider shares immutable shells and coalesces cold loads with striped locks.
+Metadata is serialized on demand and never needed to serve a frame. Only delta-offset
+maps are expanded; fixed-stride and explicit-offset maps remain directly addressable.
+Native payload lookup validates layout and the requested record after full validation
+at shell opening. Defaults cap shared shell bytes at 512 MiB, expanded directories at
+64 MiB, and retained native payload handles at 256; reservations include cold loads.
+HTTP bounds each metadata/multipart response to 256 MiB and reserves at most 512 MiB
+across admitted WADO responses. Multipart sending does not duplicate frame buffers.
+These are resource-specific bounds, not a total process RSS ceiling: decoder working
+memory, the eager index, parser/repair allocations, and worker arenas also consume RAM.
+
+The blocking loopback server has a 64-entry worker queue, 5-second socket idle timeout,
+and 30-second absolute I/O deadline measured from accept (including queue time).
+Deadlines are checked between frame operations; they do not interrupt an in-progress
+filesystem read, decoder, or shell regeneration. `/health` includes shell and expanded
+directory byte accounting. Graceful shutdown, cancellation, deployment configuration,
+and production request metrics remain future work. `check` validates layout/schema;
+it is not a deep integrity or retrievability scan.
+
+For verification, build `slidescape_archive` and `slidescape_tests`, then run CTest.
+When Python 3 is available, CTest also runs `tests/test_archive_integration.py`, which
+uses only the standard library, generated public synthetic DICOM, temporary repositories,
+and a localhost listener. No private fixtures are needed for that integration test.
+Run `python3 tests/test_archive_integration.py ./slidescape_archive --slow` to also
+exercise the absolute deadline against a client sending one byte per second.
 
 ## Intended Production Storage Model
 

@@ -40,6 +40,16 @@ endif()
 
 add_test(NAME slidescape_tests COMMAND slidescape_tests)
 
+if (BUILD_SLIDESCAPE_ARCHIVE)
+        find_package(Python3 QUIET COMPONENTS Interpreter)
+        if (Python3_Interpreter_FOUND)
+                add_test(NAME slidescape_archive_integration
+                        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_archive_integration.py"
+                        "$<TARGET_FILE:slidescape_archive>")
+                set_tests_properties(slidescape_archive_integration PROPERTIES TIMEOUT 90 LABELS "archive;loopback")
+        endif()
+endif()
+
 add_executable(dicomweb_probe
         dicomweb_probe.c
         test_stb_sprintf.cpp

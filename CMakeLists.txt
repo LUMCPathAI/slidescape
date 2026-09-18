@@ -570,6 +570,7 @@ set(SLIDESCAPE_ARCHIVE_CORE_FILES
         src/archive/archive_shell_recipe.c
         src/archive/archive_index.c
         src/archive/archive_ingest.c
+        src/archive/archive_metadata.c
         src/archive/archive_mrxs_adapter.c
         src/archive/archive_representation.c
         src/archive/archive_instance_provider.c

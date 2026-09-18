@@ -34,12 +34,37 @@
 #define ARCHIVE_SHELL_SPARSE_RUN_RECORD_SIZE 16
 #define ARCHIVE_SHELL_SPARSE_RUN_VERSION 1
 #define ARCHIVE_SHELL_SECTION_CRITICAL 1
-#define ARCHIVE_SHELL_SOURCE_ROLE_PART10 1
-#define ARCHIVE_SHELL_SOURCE_ROLE_NATIVE_BUNDLE 2
-#define ARCHIVE_SHELL_INSTANCE_HAS_ORIGIN 1
-#define ARCHIVE_SHELL_INSTANCE_HAS_ORIENTATION 2
+typedef enum archive_shell_instance_flags_t {
+	ARCHIVE_SHELL_INSTANCE_HAS_ORIGIN = 1 << 0,
+	ARCHIVE_SHELL_INSTANCE_HAS_ORIENTATION = 1 << 1,
+	ARCHIVE_SHELL_INSTANCE_HAS_IMAGE_TYPE = 1 << 2,
+	ARCHIVE_SHELL_INSTANCE_IMAGE_ORIGINAL = 1 << 3,
+	ARCHIVE_SHELL_INSTANCE_IMAGE_RESAMPLED = 1 << 4,
+	ARCHIVE_SHELL_INSTANCE_TILED_FULL = 1 << 5,
+} archive_shell_instance_flags_t;
 #define ARCHIVE_SHELL_PAYLOAD_ENCAPSULATED 1
 #define ARCHIVE_SHELL_NO_SECTION UINT32_MAX
+
+/* The first nine slots are stored in the fixed instance record, in this order. */
+typedef enum archive_shell_string_slot_t {
+	ARCHIVE_SHELL_STRING_STUDY_UID = 0,
+	ARCHIVE_SHELL_STRING_SERIES_UID = 1,
+	ARCHIVE_SHELL_STRING_SOP_INSTANCE_UID = 2,
+	ARCHIVE_SHELL_STRING_SOP_CLASS_UID = 3,
+	ARCHIVE_SHELL_STRING_TRANSFER_SYNTAX_UID = 4,
+	ARCHIVE_SHELL_STRING_MODALITY = 5,
+	ARCHIVE_SHELL_STRING_IMAGE_FLAVOR = 6,
+	ARCHIVE_SHELL_STRING_PHOTOMETRIC = 7,
+	ARCHIVE_SHELL_STRING_CONCATENATION_UID = 8,
+	ARCHIVE_SHELL_STRING_PATIENT_ID = 9,
+	ARCHIVE_SHELL_STRING_PATIENT_BIRTH_DATE = 10,
+	ARCHIVE_SHELL_STRING_PATIENT_SEX = 11,
+	ARCHIVE_SHELL_STRING_STUDY_DATE = 12,
+	ARCHIVE_SHELL_STRING_ACCESSION_NUMBER = 13,
+	ARCHIVE_SHELL_STRING_STUDY_ID = 14,
+	ARCHIVE_SHELL_STRING_PATIENT_NAME = 15,
+	ARCHIVE_SHELL_STRING_COUNT,
+} archive_shell_string_slot_t;
 
 static const u8 archive_shell_magic[8] = {'S', 'S', 'H', 'E', 'L', 'L', '1', '\0'};
 static const u8 archive_shell_frame_map_magic[8] = {'S', 'S', 'F', 'M', 'A', 'P', '1', '\0'};
@@ -222,7 +247,7 @@ static void archive_shell_write_attribute(u8* record, u32 tag, char vr0, char vr
 }
 
 static bool archive_shell_build_attributes(const dicom_instance_t* instance,
-		const u32 string_offsets[16], archive_shell_section_t* section) {
+		const u32 string_offsets[ARCHIVE_SHELL_STRING_COUNT], archive_shell_section_t* section) {
 	enum { ATTRIBUTE_COUNT = 22 };
 	section->size = 16 + ATTRIBUTE_COUNT * ARCHIVE_SHELL_ATTRIBUTE_RECORD_SIZE;
 	section->data = calloc(1, section->size);
@@ -233,21 +258,21 @@ static bool archive_shell_build_attributes(const dicom_instance_t* instance,
 #define WRITE_ATTRIBUTE(tag, a, b, type, value) \
 	do { archive_shell_write_attribute(record, tag, a, b, type, (u64)(value)); \
 	     record += ARCHIVE_SHELL_ATTRIBUTE_RECORD_SIZE; } while (0)
-	WRITE_ATTRIBUTE(0x00080016, 'U', 'I', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[3]);
-	WRITE_ATTRIBUTE(0x00080018, 'U', 'I', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[2]);
-	WRITE_ATTRIBUTE(0x00080020, 'D', 'A', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[12]);
-	WRITE_ATTRIBUTE(0x00080050, 'S', 'H', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[13]);
-	WRITE_ATTRIBUTE(0x00080060, 'C', 'S', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[5]);
-	WRITE_ATTRIBUTE(0x00100010, 'P', 'N', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[15]);
-	WRITE_ATTRIBUTE(0x00100020, 'L', 'O', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[9]);
-	WRITE_ATTRIBUTE(0x00100030, 'D', 'A', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[10]);
-	WRITE_ATTRIBUTE(0x00100040, 'C', 'S', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[11]);
-	WRITE_ATTRIBUTE(0x0020000D, 'U', 'I', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[0]);
-	WRITE_ATTRIBUTE(0x0020000E, 'U', 'I', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[1]);
-	WRITE_ATTRIBUTE(0x00200010, 'S', 'H', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[14]);
+	WRITE_ATTRIBUTE(0x00080016, 'U', 'I', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[ARCHIVE_SHELL_STRING_SOP_CLASS_UID]);
+	WRITE_ATTRIBUTE(0x00080018, 'U', 'I', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[ARCHIVE_SHELL_STRING_SOP_INSTANCE_UID]);
+	WRITE_ATTRIBUTE(0x00080020, 'D', 'A', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[ARCHIVE_SHELL_STRING_STUDY_DATE]);
+	WRITE_ATTRIBUTE(0x00080050, 'S', 'H', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[ARCHIVE_SHELL_STRING_ACCESSION_NUMBER]);
+	WRITE_ATTRIBUTE(0x00080060, 'C', 'S', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[ARCHIVE_SHELL_STRING_MODALITY]);
+	WRITE_ATTRIBUTE(0x00100010, 'P', 'N', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[ARCHIVE_SHELL_STRING_PATIENT_NAME]);
+	WRITE_ATTRIBUTE(0x00100020, 'L', 'O', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[ARCHIVE_SHELL_STRING_PATIENT_ID]);
+	WRITE_ATTRIBUTE(0x00100030, 'D', 'A', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[ARCHIVE_SHELL_STRING_PATIENT_BIRTH_DATE]);
+	WRITE_ATTRIBUTE(0x00100040, 'C', 'S', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[ARCHIVE_SHELL_STRING_PATIENT_SEX]);
+	WRITE_ATTRIBUTE(0x0020000D, 'U', 'I', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[ARCHIVE_SHELL_STRING_STUDY_UID]);
+	WRITE_ATTRIBUTE(0x0020000E, 'U', 'I', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[ARCHIVE_SHELL_STRING_SERIES_UID]);
+	WRITE_ATTRIBUTE(0x00200010, 'S', 'H', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[ARCHIVE_SHELL_STRING_STUDY_ID]);
 	WRITE_ATTRIBUTE(0x00200013, 'I', 'S', ARCHIVE_SHELL_ATTRIBUTE_SIGNED, instance->instance_number);
 	WRITE_ATTRIBUTE(0x00280002, 'U', 'S', ARCHIVE_SHELL_ATTRIBUTE_UNSIGNED, instance->samples_per_pixel);
-	WRITE_ATTRIBUTE(0x00280004, 'C', 'S', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[7]);
+	WRITE_ATTRIBUTE(0x00280004, 'C', 'S', ARCHIVE_SHELL_ATTRIBUTE_STRING, string_offsets[ARCHIVE_SHELL_STRING_PHOTOMETRIC]);
 	WRITE_ATTRIBUTE(0x00280008, 'I', 'S', ARCHIVE_SHELL_ATTRIBUTE_UNSIGNED, instance->number_of_frames);
 	WRITE_ATTRIBUTE(0x00280010, 'U', 'S', ARCHIVE_SHELL_ATTRIBUTE_UNSIGNED, instance->rows);
 	WRITE_ATTRIBUTE(0x00280011, 'U', 'S', ARCHIVE_SHELL_ATTRIBUTE_UNSIGNED, instance->columns);
@@ -609,7 +634,7 @@ static bool archive_shell_try_build_sparse_runs(
 		    (!instance->is_total_pixel_matrix_origin_known ||
 		     !archive_shell_frame_offset_matches(
 			     frame->z_offset_um,
-			     instance->total_pixel_matrix_origin_z_mm))) {
+			     instance->total_pixel_matrix_origin_z_um))) {
 			success = false;
 			break;
 		}
@@ -808,12 +833,17 @@ static bool archive_shell_build_payload_map(dicom_instance_t* instance, u64 sour
 	}
 	u32 frame_count = (u32)instance->number_of_frames;
 	if (!instance->is_pixel_data_encapsulated) {
+		if (!instance->bits_allocated || instance->bits_allocated % 8 || !instance->samples_per_pixel) {
+			archive_shell_set_error(error, error_capacity, "unsupported native Part 10 pixel packing");
+			return false;
+		}
 		u64 frame_size = (u64)instance->rows * instance->columns *
 			instance->samples_per_pixel * instance->bits_allocated / 8;
 		u64 base = sizeof(dicom_header_t) + (u64)instance->pixel_data.data_offset;
 		if (!frame_size || base > source_size ||
 		    frame_size > source_size - base ||
-		    (u64)frame_count > (source_size - base) / frame_size) {
+		    (u64)frame_count > (source_size - base) / frame_size ||
+		    (u64)frame_count > instance->pixel_data.length / frame_size) {
 			archive_shell_set_error(error, error_capacity, "native Part 10 frame payload is out of bounds");
 			return false;
 		}
@@ -1098,6 +1128,27 @@ bool archive_shell_build_part10(const archive_shell_build_part10_input_t* input,
 		archive_shell_set_error(error, error_capacity, "Part 10 instance lacks required shell identity");
 		return false;
 	}
+	/* The parser does not yet retain spacing between focal planes. Until it
+	 * does, a full multi-plane grid cannot be projected faithfully. */
+	if (instance->is_tiled_full && instance->total_pixel_matrix_focal_planes > 1) {
+		archive_shell_set_error(error, error_capacity,
+			"TILED_FULL multi-focal-plane publication requires retained focal spacing");
+		return false;
+	}
+	if (!isfinite(instance->pixel_spacing.x) || !isfinite(instance->pixel_spacing.y) ||
+	    (instance->is_total_pixel_matrix_origin_known &&
+	     (!isfinite(instance->total_pixel_matrix_origin_x_mm) ||
+	      !isfinite(instance->total_pixel_matrix_origin_y_mm) ||
+	      !isfinite(instance->total_pixel_matrix_origin_z_um)))) {
+		archive_shell_set_error(error, error_capacity, "non-finite slide geometry");
+		return false;
+	}
+	if (instance->is_image_orientation_slide_known) for (i32 i = 0; i < 6; ++i) {
+		if (!isfinite(instance->image_orientation_slide[i])) {
+			archive_shell_set_error(error, error_capacity, "non-finite slide orientation");
+			return false;
+		}
+	}
 	for (i32 i = 0; i < arrlen(instance->optical_paths); ++i) {
 		const dicom_optical_path_t* optical_path = instance->optical_paths + i;
 		if (optical_path->icc_profile_size &&
@@ -1125,8 +1176,8 @@ bool archive_shell_build_part10(const archive_shell_build_part10_input_t* input,
 		         instance->general_study.StudyDate.year,
 		         instance->general_study.StudyDate.month,
 		         instance->general_study.StudyDate.day);
-	u32 string_offsets[16] = {0};
-	const char* string_values[16] = {
+	u32 string_offsets[ARCHIVE_SHELL_STRING_COUNT] = {0};
+	const char* string_values[ARCHIVE_SHELL_STRING_COUNT] = {
 		instance->general_study.StudyInstanceUID.value,
 		instance->general_series.SeriesInstanceUID.value,
 		instance->sop_instance_uid.value,
@@ -1284,18 +1335,22 @@ bool archive_shell_build_part10(const archive_shell_build_part10_input_t* input,
 		archive_shell_write_i64(record + 64, instance->instance_number);
 		archive_shell_write_u32(record + 72, instance->concatenation_frame_offset_number);
 		archive_shell_write_u32(record + 76, instance->in_concatenation_number);
-		for (i32 i = 0; i < 9; ++i)
+		for (i32 i = 0; i <= ARCHIVE_SHELL_STRING_CONCATENATION_UID; ++i)
 			archive_shell_write_u32(record + 80 + i * 4, string_offsets[i]);
 		u32 instance_flags = (instance->is_total_pixel_matrix_origin_known ?
 			ARCHIVE_SHELL_INSTANCE_HAS_ORIGIN : 0) |
 			(instance->is_image_orientation_slide_known ?
-			ARCHIVE_SHELL_INSTANCE_HAS_ORIENTATION : 0);
+			ARCHIVE_SHELL_INSTANCE_HAS_ORIENTATION : 0) |
+			(instance->has_valid_wsi_image_type ? ARCHIVE_SHELL_INSTANCE_HAS_IMAGE_TYPE : 0) |
+			(instance->is_image_original ? ARCHIVE_SHELL_INSTANCE_IMAGE_ORIGINAL : 0) |
+			(instance->is_image_resampled ? ARCHIVE_SHELL_INSTANCE_IMAGE_RESAMPLED : 0) |
+			(instance->is_tiled_full ? ARCHIVE_SHELL_INSTANCE_TILED_FULL : 0);
 		archive_shell_write_u32(record + 116, instance_flags);
 		archive_shell_write_float(record + 120, instance->pixel_spacing.x);
 		archive_shell_write_float(record + 124, instance->pixel_spacing.y);
 		archive_shell_write_float(record + 128, instance->total_pixel_matrix_origin_x_mm);
 		archive_shell_write_float(record + 132, instance->total_pixel_matrix_origin_y_mm);
-		archive_shell_write_float(record + 136, instance->total_pixel_matrix_origin_z_mm);
+		archive_shell_write_float(record + 136, instance->total_pixel_matrix_origin_z_um);
 		for (i32 i = 0; i < 6; ++i)
 			archive_shell_write_float(record + 140 + i * 4, instance->image_orientation_slide[i]);
 		archive_shell_write_u32(record + 168, attribute_section_index);
@@ -2092,7 +2147,8 @@ bool archive_shell_open(archive_shell_view_t* shell, const void* data, size_t si
 	u32 instance_count = archive_shell_read_u32(bytes + 36);
 	u32 source_count = archive_shell_read_u32(bytes + 40);
 	if (memcmp(bytes, archive_shell_magic, sizeof(archive_shell_magic)) != 0 ||
-	    archive_shell_read_u32(bytes + 8) != ARCHIVE_SHELL_FORMAT_VERSION ||
+	    (archive_shell_read_u32(bytes + 8) != ARCHIVE_SHELL_FORMAT_VERSION &&
+	     archive_shell_read_u32(bytes + 8) != 2) ||
 	    archive_shell_read_u32(bytes + 12) != ARCHIVE_SHELL_HEADER_SIZE ||
 	    encoded_size != size || directory_offset != ARCHIVE_SHELL_HEADER_SIZE ||
 	    !section_count || !instance_count || instance_count > ARCHIVE_SHELL_MAX_INSTANCES ||
@@ -2192,7 +2248,7 @@ bool archive_shell_get_source(const archive_shell_view_t* shell, u32 source_inde
 	memset(source, 0, sizeof(*source));
 	memcpy(source->sha256, record, 32);
 	source->byte_size = archive_shell_read_u64(record + 32);
-	source->role = archive_shell_read_u32(record + 40);
+	source->role = (archive_shell_source_role_t)archive_shell_read_u32(record + 40);
 	source->flags = archive_shell_read_u32(record + 44);
 	return source->byte_size > 0;
 }
@@ -2280,7 +2336,7 @@ static bool archive_shell_explicit_payload_is_valid(
 	return true;
 }
 
-static bool archive_shell_native_payload_is_valid(
+static bool archive_shell_native_payload_layout_is_valid(
 		const u8* payload, u64 payload_size, u32 frame_count) {
 	if (!payload || payload_size < ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE ||
 	    !frame_count ||
@@ -2306,6 +2362,14 @@ static bool archive_shell_native_payload_is_valid(
 	    payload_size !=
 		    ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE + records_size)
 		return false;
+	return true;
+}
+
+static bool archive_shell_native_payload_is_valid(
+		const u8* payload, u64 payload_size, u32 frame_count) {
+	if (!archive_shell_native_payload_layout_is_valid(payload, payload_size, frame_count))
+		return false;
+	u32 file_record_size = archive_shell_read_u32(payload + 24);
 	const u8* sizes =
 		payload + ARCHIVE_SHELL_PAYLOAD_HEADER_SIZE +
 		(u64)frame_count *
@@ -2412,12 +2476,17 @@ bool archive_shell_get_instance(const archive_shell_view_t* shell, u32 instance_
 		if (!*values[i]) return false;
 	}
 	u32 flags = archive_shell_read_u32(record + 116);
+	instance->has_image_type = (flags & ARCHIVE_SHELL_INSTANCE_HAS_IMAGE_TYPE) != 0;
+	instance->is_image_original = (flags & ARCHIVE_SHELL_INSTANCE_IMAGE_ORIGINAL) != 0;
+	instance->is_image_resampled = (flags & ARCHIVE_SHELL_INSTANCE_IMAGE_RESAMPLED) != 0;
+	instance->is_tiled_full = (flags & ARCHIVE_SHELL_INSTANCE_TILED_FULL) != 0 ||
+		instance->frame_map_kind == ARCHIVE_SHELL_FRAME_MAP_REGULAR_GRID;
 	instance->pixel_spacing_row_mm = archive_shell_read_float(record + 120);
 	instance->pixel_spacing_column_mm = archive_shell_read_float(record + 124);
 	instance->has_slide_coordinate_origin = (flags & ARCHIVE_SHELL_INSTANCE_HAS_ORIGIN) != 0;
 	instance->slide_coordinate_origin_x_mm = archive_shell_read_float(record + 128);
 	instance->slide_coordinate_origin_y_mm = archive_shell_read_float(record + 132);
-	instance->slide_coordinate_origin_z_mm = archive_shell_read_float(record + 136);
+	instance->slide_coordinate_origin_z_um = archive_shell_read_float(record + 136);
 	instance->has_image_orientation_slide = (flags & ARCHIVE_SHELL_INSTANCE_HAS_ORIENTATION) != 0;
 	for (i32 i = 0; i < 6; ++i)
 		instance->image_orientation_slide[i] = archive_shell_read_float(record + 140 + i * 4);
@@ -2691,7 +2760,9 @@ bool archive_shell_get_native_payload(const archive_shell_view_t* shell,
 		shell, instance->payload_map_section_index,
 		ARCHIVE_SHELL_SECTION_PAYLOAD_MAP,
 		instance->instance_index, &size);
-	if (!archive_shell_native_payload_is_valid(
+	/* Full validation happens when the shell opens; lookups check only layout
+	 * and the requested record, so tile access stays independent of slide size. */
+	if (!archive_shell_native_payload_layout_is_valid(
 			section, size, instance->frame_count))
 		return false;
 	u32 file_record_size = archive_shell_read_u32(section + 24);
@@ -2876,7 +2947,7 @@ bool archive_shell_get_frame(const archive_shell_view_t* shell,
 			frame->flags |=
 				ARCHIVE_FRAME_MAP_ENTRY_XY_OFFSET_KNOWN;
 			frame->z_offset_um =
-				instance->slide_coordinate_origin_z_mm;
+				instance->slide_coordinate_origin_z_um;
 			frame->flags |=
 				ARCHIVE_FRAME_MAP_ENTRY_Z_OFFSET_KNOWN;
 		}

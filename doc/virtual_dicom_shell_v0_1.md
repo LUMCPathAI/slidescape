@@ -1,8 +1,8 @@
 # Virtual DICOM Shell v0.1
 
-Status: binary format v2, single-instance and aggregate Part 10 writers/loaders, and
+Status: binary format v3, single-instance and aggregate Part 10 writers/loaders, and
 transactional multi-instance logical-slide publication are implemented. Aggregate
-policy v9 promotes canonically equal governed attributes and
+policy v10 preserves ImageType provenance and promotes canonically equal governed attributes and
 container/specimen/preparation metadata into explicit shared sections, and uses
 delta-encoded encapsulated-frame payload maps.
 
@@ -243,7 +243,7 @@ A separate compact specimen section retains Container Identifier and each Specim
 Identifier, Specimen UID, and Specimen Short Description.
 
 Aggregate publication retains that optical record layout under adapter recipe/policy
-`part10-cached-delta-payload-v9`, adding the ordered multi-source recipe,
+`part10-provenance-payload-v10`, adding the ordered multi-source recipe,
 logical-slide grouping contract, compact delta payload maps, shared identical
 optical-path/ICC sections, and a typed specimen-preparation section. The provider
 expands delta maps once when an instance enters its cache, making subsequent
@@ -371,7 +371,7 @@ uses Slidescape's built-in MRXS reader. It produces:
   fixture, its file index is stored once in the payload header; a per-frame file-index
   array is retained as the general multi-source fallback.
 
-At request time, policy `mrxs-jpeg-shell-payload-v5` reads the standalone native JPEG
+At request time, policy `mrxs-jpeg-shell-payload-v6` reads the standalone native JPEG
 bytes directly from the shell locator without decoding or parsing `Slidedat.ini` and
 `Index.dat`. Only occupied native positions become DICOM frames. The shell proves that
 their row-major positions and physical X/Y coordinates fit the regular grid within a
@@ -380,7 +380,7 @@ Unoccupied grid positions are absent under `TILED_SPARSE` semantics.
 
 This is a constrained development proof: the retained inline recipe contains the
 absolute source path, and request-time reads do not rehash the multi-gigabyte bundle.
-The manifest supplies admission provenance but not durable ownership. Production must
+The descriptor supplies admission provenance but not durable ownership. Production must
 replace that path with immutable logical object locators before this provider is
 cloud-safe. A materialized Part 10 export remains a derivative of the shell, never a
 competing metadata authority.
@@ -460,8 +460,8 @@ visibility transaction.
 QIDO reconstruction, metadata WADO, and frame-provider lookup now use the published
 representation rows and digest-validated shell buffers. All instances that reference
 one aggregate share a single resident shell entry; MRXS levels also share one parsed
-native adapter. A per-instance cache retains projected metadata and any Part 10 source
-handle. A shell-cache miss performs one bounded shell read; it does not reparse Part
+payload source handles. A per-instance cache retains the Part 10 source handle and
+expanded delta offsets; metadata is projected only when requested. A shell-cache miss performs one bounded shell read; it does not reparse Part
 10 metadata.
 
 Missing or corrupt Part 10 shells can be regenerated from the retained source and
@@ -476,11 +476,14 @@ primary reconstruction orchestrator.
 SQLite schema v5 publishes one representation and shell per initial Part 10
 Study/Series group. Each instance retains its individual DICOMweb identity and source
 provider while referencing its persisted directory index in the aggregate shell.
-The aggregate v7 recipe records the SOP-ordered source set, grouping policy, and
+The aggregate v10 recipe records the SOP-ordered source set, grouping policy, and
 delta-payload policy, and
 local repair can deterministically rebuild and digest-check the complete shell.
-Recipe v6 shells used the removed explicit offset/size layout and must be reingested
-in development repositories.
+The reader accepts binary v2 and v3 shells; v2 has no retained ImageType tuple, so
+that attribute is omitted rather than invented. Regeneration accepts only the current
+recipe version. To republish corrected metadata, use a fresh development repository;
+there is no implicit migration or replacement. New native identities use the source
+bundle digest rather than a version-dependent representation fingerprint.
 
 A source bundle is not automatically one slide. The current Study/Series grouping is
 an explicit first Part 10 policy; governed container/specimen/acquisition identity and

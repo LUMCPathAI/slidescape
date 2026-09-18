@@ -16,7 +16,7 @@
 extern "C" {
 #endif
 
-#define ARCHIVE_SHELL_FORMAT_VERSION 2
+#define ARCHIVE_SHELL_FORMAT_VERSION 3
 #define ARCHIVE_SHELL_HEADER_SIZE 128
 #define ARCHIVE_SHELL_SECTION_ENTRY_SIZE 40
 #define ARCHIVE_SHELL_INSTANCE_RECORD_SIZE 192
@@ -153,7 +153,7 @@ typedef struct archive_shell_instance_t {
 	bool has_slide_coordinate_origin;
 	float slide_coordinate_origin_x_mm;
 	float slide_coordinate_origin_y_mm;
-	float slide_coordinate_origin_z_mm;
+	float slide_coordinate_origin_z_um;
 	bool has_image_orientation_slide;
 	float image_orientation_slide[6];
 	u32 attribute_section_index;
@@ -161,12 +161,21 @@ typedef struct archive_shell_instance_t {
 	u32 frame_map_section_index;
 	u32 payload_map_section_index;
 	bool payload_is_encapsulated;
+	bool has_image_type;
+	bool is_image_original;
+	bool is_image_resampled;
+	bool is_tiled_full;
 } archive_shell_instance_t;
+
+typedef enum archive_shell_source_role_t {
+	ARCHIVE_SHELL_SOURCE_ROLE_PART10 = 1,
+	ARCHIVE_SHELL_SOURCE_ROLE_NATIVE_BUNDLE = 2,
+} archive_shell_source_role_t;
 
 typedef struct archive_shell_source_t {
 	u8 sha256[32];
 	u64 byte_size;
-	u32 role;
+	archive_shell_source_role_t role;
 	u32 flags;
 } archive_shell_source_t;
 

@@ -37,6 +37,9 @@ typedef enum archive_representation_selection_result_t {
 	ARCHIVE_REPRESENTATION_NOT_ACCEPTABLE,
 } archive_representation_selection_result_t;
 
+/* NULL means the archive has no stored-frame contract for this syntax. */
+const char* archive_frame_media_type_for_transfer_syntax(const char* transfer_syntax_uid);
+
 archive_representation_selection_result_t archive_select_frame_representation(
 	const char* accept, size_t accept_size,
 	const archive_frame_representation_t* available, i32 available_count,

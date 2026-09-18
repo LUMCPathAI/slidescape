@@ -12,6 +12,9 @@
 
 #include "common.h"
 
+#define ARCHIVE_PART10_ADAPTER_VERSION "10"
+#define ARCHIVE_PART10_RECIPE_MAGIC "slidescape-virtual-dicom-recipe-v10"
+#define ARCHIVE_PART10_FRAME_POLICY "part10-provenance-payload-v10"
 #define ARCHIVE_SHELL_RECIPE_CAPACITY 1024
 #define ARCHIVE_SHELL_RECIPE_MEDIA_TYPE \
 	"application/vnd.slidescape.virtual-dicom-recipe"

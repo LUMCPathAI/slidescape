@@ -477,6 +477,7 @@ typedef struct dicom_instance_t {
     dicom_ui_t concatenation_uid;
     u16 in_concatenation_number;
     u32 concatenation_frame_offset_number;
+	bool has_valid_wsi_image_type;
 	bool is_image_original;
 	dicom_cs_t image_flavor_cs;
 	dicom_image_flavor_enum image_flavor;
@@ -515,7 +516,7 @@ typedef struct dicom_instance_t {
 	u8 total_pixel_matrix_origin_component_mask;
 	float total_pixel_matrix_origin_x_mm;
 	float total_pixel_matrix_origin_y_mm;
-	float total_pixel_matrix_origin_z_mm;
+	float total_pixel_matrix_origin_z_um;
 	bool is_image_orientation_slide_known;
 	float image_orientation_slide[6];
 	dicom_tile_t* tiles; // malloc'ed

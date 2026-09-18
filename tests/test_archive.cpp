@@ -1,6 +1,8 @@
 #include "doctest.h"
 
 #include "archive_database.h"
+#include "archive_metadata.h"
+#include "jpeg_decoder.h"
 #include "archive_object.h"
 #include "archive_repository.h"
 #include "archive_routes.h"
@@ -369,7 +371,7 @@ TEST_CASE("pathology archive repository has explicit immutable and publication b
 		"application/vnd.slidescape.part10-bundle",
 		"objects/sha256/bb/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		&descriptor_object, error, sizeof(error)) == ARCHIVE_DATABASE_OK);
-	archive_database_part10_member_t member = {};
+	archive_database_instance_t member = {};
 	member.object_id = part10_object.id;
 	snprintf(member.logical_name, sizeof(member.logical_name), "1.2.3.1.1.dcm");
 	snprintf(member.study_instance_uid, sizeof(member.study_instance_uid), "1.2.3");
@@ -389,7 +391,7 @@ TEST_CASE("pathology archive repository has explicit immutable and publication b
 	member.total_pixel_matrix_columns = 4481;
 	member.total_pixel_matrix_rows = 5345;
 	snprintf(member.image_flavor, sizeof(member.image_flavor), "VOLUME");
-	archive_database_part10_member_t bundle_members[2] = {member, member};
+	archive_database_instance_t bundle_members[2] = {member, member};
 	bundle_members[1].object_id = second_part10_object.id;
 	snprintf(bundle_members[1].logical_name,
 	         sizeof(bundle_members[1].logical_name), "1.2.3.1.2.dcm");
@@ -423,6 +425,7 @@ TEST_CASE("pathology archive repository has explicit immutable and publication b
 		"shells/sha256/ee/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 		&shell_object, error, sizeof(error)) == ARCHIVE_DATABASE_OK);
 	archive_database_shell_publication_t shell_publication = {};
+	shell_publication.bundle_id = published_bundle.id;
 	archive_database_shell_instance_publication_t shell_instance_publications[2] = {};
 	shell_instance_publications[0].instance = bundle_members[0];
 	shell_instance_publications[0].shell_instance_index = 0;
@@ -438,11 +441,11 @@ TEST_CASE("pathology archive repository has explicit immutable and publication b
 	snprintf(shell_publication.representation_fingerprint,
 	         sizeof(shell_publication.representation_fingerprint),
 	         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-	REQUIRE(archive_database_publish_part10_shells(
-		&repository, published_bundle.id, &shell_publication, 1,
+	REQUIRE(archive_database_publish_shells(
+		&repository, &shell_publication, 1,
 		error, sizeof(error)) == ARCHIVE_DATABASE_OK);
-	REQUIRE(archive_database_publish_part10_shells(
-		&repository, published_bundle.id, &shell_publication, 1,
+	REQUIRE(archive_database_publish_shells(
+		&repository, &shell_publication, 1,
 		error, sizeof(error)) == ARCHIVE_DATABASE_OK);
 	sqlite3* publication_database = nullptr;
 	REQUIRE(sqlite3_open(path, &publication_database) == SQLITE_OK);
@@ -468,7 +471,7 @@ TEST_CASE("pathology archive repository has explicit immutable and publication b
 		"application/vnd.slidescape.part10-bundle",
 		"objects/sha256/cc/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 		&conflicting_descriptor, error, sizeof(error)) == ARCHIVE_DATABASE_OK);
-	archive_database_part10_member_t conflicting_member = member;
+	archive_database_instance_t conflicting_member = member;
 	conflicting_member.object_id = descriptor_object.id;
 	archive_database_bundle_t conflicting_bundle = {};
 	CHECK(archive_database_register_part10_bundle(
@@ -978,7 +981,7 @@ TEST_CASE("virtual DICOM shell loads one aligned Part 10 serving object") {
 	CHECK(recipe_size == strlen(recipe));
 	CHECK(strstr(
 		recipe,
-		"adapter-policy\tpart10-cached-delta-payload-v9\n") != nullptr);
+		"adapter-policy\tpart10-provenance-payload-v10\n") != nullptr);
 	char replay_recipe[ARCHIVE_SHELL_RECIPE_CAPACITY] = {};
 	size_t replay_recipe_size = 0;
 	char replay_fingerprint[65] = {};
@@ -1266,7 +1269,7 @@ TEST_CASE("virtual DICOM shell loads one aligned Part 10 serving object") {
 	             "grouping-policy\tpart10-study-series-v1\n") != nullptr);
 	CHECK(strstr(
 		aggregate_recipe,
-		"adapter-policy\tpart10-cached-delta-payload-v9\n") != nullptr);
+		"adapter-policy\tpart10-provenance-payload-v10\n") != nullptr);
 	archive_shell_build_part10_input_t aggregate_instances[2] = {
 		input,
 		{
@@ -1690,4 +1693,148 @@ TEST_CASE("sparse Part 10 frame maps use explicit per-frame assignments") {
 	arrfree(source.per_frame_optical_path_identifiers);
 	arrfree(source.per_frame_plane_position_slide);
 	arrfree(source.optical_paths);
+}
+
+TEST_CASE("archive Accept qualities follow the bounded decimal grammar") {
+	archive_frame_representation_t available = {};
+	snprintf(available.media_type, sizeof(available.media_type), "image/jpeg");
+	archive_frame_representation_t selected = {};
+	const char* invalid[] = {"NaN", "nan", "inf", "1e0", "+1", "-0", "1.001", "0.1234", ".5", ""};
+	for (const char* quality : invalid) {
+		char accept[128];
+		snprintf(accept, sizeof(accept), "image/jpeg;q=%s", quality);
+		CHECK(archive_select_frame_representation(accept, strlen(accept), &available, 1, &selected) ==
+		      ARCHIVE_REPRESENTATION_NOT_ACCEPTABLE);
+	}
+	const char* valid[] = {"1", "1.", "1.000", "0.001", "0.5", "0.125"};
+	for (const char* quality : valid) {
+		char accept[128];
+		snprintf(accept, sizeof(accept), "image/jpeg;q=%s", quality);
+		CHECK(archive_select_frame_representation(accept, strlen(accept), &available, 1, &selected) ==
+		      ARCHIVE_REPRESENTATION_SELECTED);
+	}
+	CHECK(archive_frame_media_type_for_transfer_syntax("9.9.9") == nullptr);
+}
+
+TEST_CASE("archive metadata preserves sparse dimensions provenance and concatenation") {
+	dicom_instance_t source = {};
+#define SET_METADATA_UID(field, text) \
+	do { snprintf((field).value, sizeof((field).value), "%s", text); \
+	     (field).len = strlen((field).value); } while (0)
+	SET_METADATA_UID(source.general_study.StudyInstanceUID, "2.25.1");
+	SET_METADATA_UID(source.general_series.SeriesInstanceUID, "2.25.2");
+	SET_METADATA_UID(source.sop_instance_uid, "2.25.3");
+	SET_METADATA_UID(source.sop_class_uid, "1.2.840.10008.5.1.4.1.1.77.1.6");
+	SET_METADATA_UID(source.transfer_syntax_uid, "1.2.840.10008.1.2.1");
+	SET_METADATA_UID(source.concatenation_uid, "2.25.4");
+#undef SET_METADATA_UID
+	source.in_concatenation_number = 2;
+	source.concatenation_frame_offset_number = 8;
+	source.has_valid_wsi_image_type = true;
+	source.is_image_resampled = true;
+	source.image_flavor = DICOM_IMAGE_FLAVOR_VOLUME;
+	source.photometric_interpretation = DICOM_PHOTOMETRIC_INTERPRETATION_RGB;
+	source.samples_per_pixel = 3;
+	source.bits_allocated = source.bits_stored = 8;
+	source.high_bit = 7;
+	source.number_of_frames = 2;
+	source.rows = source.columns = 2;
+	source.total_pixel_matrix_rows = source.total_pixel_matrix_columns = 2;
+	source.number_of_optical_paths = source.total_pixel_matrix_focal_planes = 2;
+	source.found_pixel_data = true;
+	source.pixel_data.data_offset = 128;
+	source.pixel_data.length = 24;
+	for (i32 i = 0; i < 2; ++i) {
+		dicom_optical_path_t optical = {};
+		optical.OpticalPathIdentifier.present = true;
+		snprintf(optical.OpticalPathIdentifier.value, sizeof(optical.OpticalPathIdentifier.value), "%c", 'A' + i);
+		optical.OpticalPathDescription.present = true;
+		/* Exact counting must include JSON escaping, including control bytes. */
+		memset(optical.OpticalPathDescription.value, '\t', sizeof(optical.OpticalPathDescription.value) - 1);
+		arrput(source.optical_paths, optical);
+		arrput(source.per_frame_optical_path_identifiers, optical.OpticalPathIdentifier);
+		dicom_plane_position_slide_t position = {};
+		position.row_position_in_total_image_pixel_matrix = 1;
+		position.column_position_in_total_image_pixel_matrix = 1;
+		position.offset_in_slide_coordinate_system = V2F(1.25f, 2.5f);
+		position.z_offset_in_slide_coordinate_system = 100.0f + i * 25.0f;
+		arrput(source.per_frame_plane_position_slide, position);
+	}
+	archive_shell_build_part10_input_t input = {};
+	input.instance = &source;
+	input.source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+	input.source_byte_size = sizeof(dicom_header_t) + 152;
+	input.representation_fingerprint = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+	archive_shell_buffer_t encoded = {};
+	char error[512] = {};
+	bool built = archive_shell_build_part10(&input, &encoded, error, sizeof(error));
+	INFO(error);
+	REQUIRE(built);
+	archive_shell_view_t shell = {};
+	REQUIRE(archive_shell_open(&shell, encoded.data, encoded.size, error, sizeof(error)));
+	archive_shell_instance_t instance = {};
+	REQUIRE(archive_shell_get_instance(&shell, 0, &instance));
+	CHECK(instance.has_image_type);
+	CHECK_FALSE(instance.is_image_original);
+	CHECK(instance.is_image_resampled);
+	u64 capacity = 0;
+	REQUIRE(archive_metadata_get_capacity(&shell, &instance, &capacity));
+	char* json = (char*)malloc((size_t)capacity);
+	REQUIRE(json != nullptr);
+	size_t size = 0;
+	REQUIRE(archive_metadata_write_instance(&shell, &instance, json, (size_t)capacity, &size, true));
+	CHECK(size + 1 == capacity);
+	CHECK(size == strlen(json));
+	CHECK(strstr(json, "\"DERIVED\",\"PRIMARY\",\"VOLUME\",\"RESAMPLED\"") != nullptr);
+	CHECK(strstr(json, "\"00209161\":{\"vr\":\"UI\",\"Value\":[\"2.25.4\"]}") != nullptr);
+	CHECK(strstr(json, "\"00209228\":{\"vr\":\"UL\",\"Value\":[8]}") != nullptr);
+	CHECK(strstr(json, "\"0040074A\":{\"vr\":\"DS\",\"Value\":[125]}") != nullptr);
+	CHECK(strstr(json, "\"00480207\":{\"vr\":\"SQ\",\"Value\":[{\"00480106\":{\"vr\":\"SH\",\"Value\":[\"B\"]}") != nullptr);
+	CHECK(strstr(json, "\\u0009") != nullptr);
+	CHECK_FALSE(archive_metadata_write_instance(&shell, &instance, json, (size_t)capacity - 1, &size, true));
+	/* Version-2 shells have no ImageType provenance bits. Never invent a tuple. */
+	u8* record = encoded.data + (shell.instances - shell.data);
+	encoded.data[8] = 2;
+	record[116] = 0;
+	REQUIRE(archive_shell_open(&shell, encoded.data, encoded.size, error, sizeof(error)));
+	REQUIRE(archive_shell_get_instance(&shell, 0, &instance));
+	CHECK_FALSE(instance.has_image_type);
+	REQUIRE(archive_metadata_write_instance(&shell, &instance, json, (size_t)capacity, &size, true));
+	CHECK(strstr(json, "00080008") == nullptr);
+	free(json);
+	archive_shell_buffer_destroy(&encoded);
+	arrfree(source.optical_paths);
+	arrfree(source.per_frame_optical_path_identifiers);
+	arrfree(source.per_frame_plane_position_slide);
+}
+
+TEST_CASE("archive JPEG admission and decode reject header mismatches before pixel allocation") {
+	u8 pixels[4 * 4 * 4];
+	memset(pixels, 100, sizeof(pixels));
+	u8* jpeg = nullptr;
+	u64 jpeg_size = 0;
+	jpeg_encode_image(pixels, 4, 4, 90, &jpeg, &jpeg_size);
+	REQUIRE(jpeg != nullptr);
+	REQUIRE(jpeg_size <= UINT32_MAX);
+	CHECK(jpeg_validate_baseline_ycbcr_header(jpeg, (u32)jpeg_size, 4, 4));
+	CHECK_FALSE(jpeg_validate_baseline_ycbcr_header(jpeg, (u32)jpeg_size, 5, 4));
+	CHECK_FALSE(jpeg_validate_baseline_ycbcr_header(jpeg, 20, 4, 4));
+	i32 width = 0, height = 0, channels = 0;
+	CHECK(jpeg_decode_image_bounded(jpeg, (u32)jpeg_size, 5, 4, 64, &width, &height, &channels) == nullptr);
+	CHECK(jpeg_decode_image_bounded(jpeg, (u32)jpeg_size, 4, 4, 63, &width, &height, &channels) == nullptr);
+	u8* decoded = jpeg_decode_image_bounded(jpeg, (u32)jpeg_size, 4, 4, 64, &width, &height, &channels);
+	REQUIRE(decoded != nullptr);
+	CHECK(width == 4);
+	CHECK(height == 4);
+	CHECK(channels == 4);
+	free(decoded);
+	/* An SOF2 marker changes the promised transfer syntax even with the same geometry. */
+	for (u32 i = 0; i + 1 < jpeg_size; ++i) {
+		if (jpeg[i] == 0xff && jpeg[i + 1] == 0xc0) {
+			jpeg[i + 1] = 0xc2;
+			CHECK_FALSE(jpeg_validate_baseline_ycbcr_header(jpeg, (u32)jpeg_size, 4, 4));
+			break;
+		}
+	}
+	free(jpeg);
 }

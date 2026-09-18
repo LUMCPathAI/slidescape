@@ -9,8 +9,15 @@
 */
 
 #include "archive_database.h"
+#include "archive_representation.h"
+#include "archive_shell_recipe.h"
 
 #include "sqlite3.h"
+
+/* Bundle registration versions describe the member/descriptor contract, not
+ * the independently versioned virtual-shell adapters. */
+#define ARCHIVE_PART10_BUNDLE_ADAPTER_VERSION "1"
+#define ARCHIVE_MRXS_BUNDLE_ADAPTER_VERSION "2"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -854,7 +861,7 @@ archive_database_status_t archive_database_read_inline_object(
 
 archive_database_status_t archive_database_register_part10_bundle(
 		const archive_repository_t* repository, const char* bundle_digest,
-		i64 descriptor_object_id, const archive_database_part10_member_t* members,
+		i64 descriptor_object_id, const archive_database_instance_t* members,
 		i32 member_count, archive_database_bundle_t* bundle,
 		char* error, size_t error_capacity) {
 	if (bundle) memset(bundle, 0, sizeof(*bundle));
@@ -864,7 +871,7 @@ archive_database_status_t archive_database_register_part10_bundle(
 		return ARCHIVE_DATABASE_INVALID_ARGUMENT;
 	}
 	for (i32 i = 0; i < member_count; ++i) {
-		const archive_database_part10_member_t* member = members + i;
+		const archive_database_instance_t* member = members + i;
 		if (member->object_id <= 0 || !member->logical_name[0] ||
 		    !member->sop_instance_uid[0] || !member->sop_class_uid[0] ||
 		    !member->study_instance_uid[0] || !member->series_instance_uid[0] ||
@@ -927,7 +934,7 @@ archive_database_status_t archive_database_register_part10_bundle(
 	if (status == ARCHIVE_DATABASE_OK) {
 		result = sqlite3_prepare_v2(database,
 			"INSERT INTO bundle(bundle_digest, source_format, adapter_name, adapter_version, "
-			"descriptor_object_id, state) VALUES(?1, 'dicom', 'slidescape-dicom', '1', ?2, 'PUBLISHED') "
+			"descriptor_object_id, state) VALUES(?1, 'dicom', 'slidescape-dicom', '" ARCHIVE_PART10_BUNDLE_ADAPTER_VERSION "', ?2, 'STAGED') "
 			"ON CONFLICT(bundle_digest) DO NOTHING;", -1, &statement, NULL);
 		if (result != SQLITE_OK ||
 		    sqlite3_bind_text(statement, 1, bundle_digest, -1, SQLITE_STATIC) != SQLITE_OK ||
@@ -961,7 +968,7 @@ archive_database_status_t archive_database_register_part10_bundle(
 			if (sqlite3_column_int64(statement, 1) != descriptor_object_id ||
 			    !source_format || strcmp(source_format, "dicom") != 0 ||
 			    !adapter_name || strcmp(adapter_name, "slidescape-dicom") != 0 ||
-			    !adapter_version || strcmp(adapter_version, "1") != 0) {
+			    !adapter_version || strcmp(adapter_version, ARCHIVE_PART10_BUNDLE_ADAPTER_VERSION) != 0) {
 				archive_database_set_error(error, error_capacity,
 				                           "bundle digest is registered with different metadata");
 				status = ARCHIVE_DATABASE_CONFLICT;
@@ -977,7 +984,7 @@ archive_database_status_t archive_database_register_part10_bundle(
 	}
 
 	for (i32 i = 0; i < member_count && status == ARCHIVE_DATABASE_OK; ++i) {
-		const archive_database_part10_member_t* member = members + i;
+		const archive_database_instance_t* member = members + i;
 		result = sqlite3_prepare_v2(database,
 			"INSERT INTO part10_instance(sop_instance_uid, object_id, sop_class_uid, "
 			"study_instance_uid, series_instance_uid, transfer_syntax_uid, modality, study_date, "
@@ -1171,7 +1178,7 @@ archive_database_status_t archive_database_register_mrxs_bundle(
 		const char* sql =
 			"INSERT INTO bundle(bundle_digest,source_format,adapter_name,"
 			"adapter_version,descriptor_object_id,state)"
-			" SELECT ?1,'mrxs','slidescape-mrxs','2',id,'PUBLISHED'"
+			" SELECT ?1,'mrxs','slidescape-mrxs','" ARCHIVE_MRXS_BUNDLE_ADAPTER_VERSION "',id,'STAGED'"
 			" FROM object WHERE id=?2 AND sha256=?1"
 			" ON CONFLICT(bundle_digest) DO NOTHING;";
 		if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK ||
@@ -1199,7 +1206,7 @@ archive_database_status_t archive_database_register_mrxs_bundle(
 			if (sqlite3_column_int64(statement, 1) != descriptor_object_id ||
 			    !format || strcmp(format, "mrxs") != 0 ||
 			    !adapter || strcmp(adapter, "slidescape-mrxs") != 0 ||
-			    !version || strcmp(version, "2") != 0) {
+			    !version || strcmp(version, ARCHIVE_MRXS_BUNDLE_ADAPTER_VERSION) != 0) {
 				status = ARCHIVE_DATABASE_CONFLICT;
 			} else {
 				bundle->id = sqlite3_column_int64(statement, 0);
@@ -1268,25 +1275,16 @@ archive_database_status_t archive_database_register_mrxs_bundle(
 	return status;
 }
 
-static const char* archive_database_frame_media_type(const char* transfer_syntax_uid) {
-	if (strcmp(transfer_syntax_uid, "1.2.840.10008.1.2.4.50") == 0 ||
-	    strcmp(transfer_syntax_uid, "1.2.840.10008.1.2.4.51") == 0 ||
-	    strcmp(transfer_syntax_uid, "1.2.840.10008.1.2.4.57") == 0 ||
-	    strcmp(transfer_syntax_uid, "1.2.840.10008.1.2.4.70") == 0) return "image/jpeg";
-	if (strcmp(transfer_syntax_uid, "1.2.840.10008.1.2.4.90") == 0 ||
-	    strcmp(transfer_syntax_uid, "1.2.840.10008.1.2.4.91") == 0) return "image/jp2";
-	return "application/octet-stream";
-}
 
 archive_database_status_t archive_database_publish_shells(
-		const archive_repository_t* repository, i64 bundle_id,
+		const archive_repository_t* repository,
 		const archive_database_shell_publication_t* publications,
 		i32 publication_count, char* error, size_t error_capacity) {
-	if (!repository || !repository->root[0] || bundle_id <= 0 ||
+	if (!repository || !repository->root[0] ||
 	    !publications || publication_count <= 0) return ARCHIVE_DATABASE_INVALID_ARGUMENT;
 	for (i32 i = 0; i < publication_count; ++i) {
 		const archive_database_shell_publication_t* publication = publications + i;
-		if (!publication->representation_id[0] ||
+		if (publication->bundle_id <= 0 || !publication->representation_id[0] ||
 		    publication->shell_object_id <= 0 ||
 		    publication->recipe_object_id <= 0 ||
 		    !archive_database_sha256_is_valid(
@@ -1297,13 +1295,13 @@ archive_database_status_t archive_database_publish_shells(
 		const char* provider_kind = publication->provider_kind[0] ?
 			publication->provider_kind : "part10";
 		const char* adapter_version = publication->adapter_version[0] ?
-			publication->adapter_version : "7";
+			publication->adapter_version : ARCHIVE_PART10_ADAPTER_VERSION;
 		const char* frame_source = publication->frame_source[0] ?
 			publication->frame_source : "STORED";
 		const char* frame_policy_version =
 			publication->frame_policy_version[0] ?
 			publication->frame_policy_version :
-				"part10-cached-delta-payload-v9";
+				ARCHIVE_PART10_FRAME_POLICY;
 		if ((strcmp(provider_kind, "part10") != 0 &&
 		     strcmp(provider_kind, "mrxs-native") != 0) ||
 		    !adapter_version[0] ||
@@ -1314,14 +1312,14 @@ archive_database_status_t archive_database_publish_shells(
 		for (i32 j = 0; j < publication->instance_count; ++j) {
 			const archive_database_shell_instance_publication_t* shell_instance =
 				publication->instances + j;
-			const archive_database_part10_member_t* instance =
+			const archive_database_instance_t* instance =
 				&shell_instance->instance;
 			if (instance->object_id <= 0 ||
 			    !instance->study_instance_uid[0] ||
 			    !instance->series_instance_uid[0] ||
 			    !instance->sop_instance_uid[0] ||
 			    !instance->sop_class_uid[0] ||
-			    !instance->transfer_syntax_uid[0] ||
+			    !archive_frame_media_type_for_transfer_syntax(instance->transfer_syntax_uid) ||
 			    shell_instance->shell_instance_index != (u32)j) {
 				return ARCHIVE_DATABASE_INVALID_ARGUMENT;
 			}
@@ -1354,6 +1352,7 @@ archive_database_status_t archive_database_publish_shells(
 
 	for (i32 i = 0; i < publication_count && status == ARCHIVE_DATABASE_OK; ++i) {
 		const archive_database_shell_publication_t* publication = publications + i;
+		i64 bundle_id = publication->bundle_id;
 		sqlite3_stmt* statement = NULL;
 		i64 metadata_version_id = 0;
 		i64 representation_id = 0;
@@ -1361,7 +1360,7 @@ archive_database_status_t archive_database_publish_shells(
 
 		const char* validate_sql =
 			"SELECT "
-			" EXISTS(SELECT 1 FROM bundle WHERE id=?1 AND state='PUBLISHED'),"
+			" EXISTS(SELECT 1 FROM bundle WHERE id=?1 AND state IN ('STAGED','PUBLISHED')),"
 			" EXISTS(SELECT 1 FROM object WHERE id=?2 "
 			"   AND media_type='application/vnd.slidescape.virtual-dicom-shell' "
 			"   AND storage_key GLOB 'shells/sha256/*'),"
@@ -1493,7 +1492,7 @@ archive_database_status_t archive_database_publish_shells(
 		     status == ARCHIVE_DATABASE_OK; ++j) {
 			const archive_database_shell_instance_publication_t* shell_instance =
 				publication->instances + j;
-			const archive_database_part10_member_t* instance =
+			const archive_database_instance_t* instance =
 				&shell_instance->instance;
 			i64 instance_id = 0;
 
@@ -1621,16 +1620,16 @@ archive_database_status_t archive_database_publish_shells(
 			const char* provider_kind = publication->provider_kind[0] ?
 				publication->provider_kind : "part10";
 			const char* adapter_version = publication->adapter_version[0] ?
-				publication->adapter_version : "7";
+				publication->adapter_version : ARCHIVE_PART10_ADAPTER_VERSION;
 			const char* frame_media_type = publication->frame_media_type[0] ?
 				publication->frame_media_type :
-				archive_database_frame_media_type(instance->transfer_syntax_uid);
+				archive_frame_media_type_for_transfer_syntax(instance->transfer_syntax_uid);
 			const char* frame_source = publication->frame_source[0] ?
 				publication->frame_source : "STORED";
 			const char* frame_policy_version =
 				publication->frame_policy_version[0] ?
 				publication->frame_policy_version :
-					"part10-cached-delta-payload-v9";
+					ARCHIVE_PART10_FRAME_POLICY;
 			const char* provider_sql =
 				"INSERT INTO instance_provider(instance_id, provider_kind, "
 				"source_object_id, parameters_object_id, adapter_version) "
@@ -1742,7 +1741,7 @@ archive_database_status_t archive_database_publish_shells(
 				    statement, 2,
 				    publication->frame_policy_version[0] ?
 				    publication->frame_policy_version :
-				    "part10-cached-delta-payload-v9",
+				    ARCHIVE_PART10_FRAME_POLICY,
 				    -1, SQLITE_STATIC) != SQLITE_OK ||
 			    sqlite3_step(statement) != SQLITE_DONE) {
 				status = ARCHIVE_DATABASE_IO_ERROR;
@@ -1780,6 +1779,18 @@ archive_database_status_t archive_database_publish_shells(
 			sqlite3_finalize(statement);
 			statement = NULL;
 		}
+		if (status == ARCHIVE_DATABASE_OK) {
+			const char* publish_bundle_sql =
+				"UPDATE bundle SET state='PUBLISHED' WHERE id=?1 "
+				"AND state IN ('STAGED','PUBLISHED');";
+			if (sqlite3_prepare_v2(database, publish_bundle_sql, -1, &statement, NULL) != SQLITE_OK ||
+			    sqlite3_bind_int64(statement, 1, bundle_id) != SQLITE_OK ||
+			    sqlite3_step(statement) != SQLITE_DONE || sqlite3_changes(database) != 1)
+				status = ARCHIVE_DATABASE_IO_ERROR;
+			sqlite3_finalize(statement);
+			statement = NULL;
+		}
+
 		if (status != ARCHIVE_DATABASE_OK)
 			archive_database_set_error(
 				error, error_capacity,
@@ -1802,15 +1813,6 @@ archive_database_status_t archive_database_publish_shells(
 		status = ARCHIVE_DATABASE_IO_ERROR;
 	}
 	return status;
-}
-
-archive_database_status_t archive_database_publish_part10_shells(
-		const archive_repository_t* repository, i64 bundle_id,
-		const archive_database_shell_publication_t* publications,
-		i32 publication_count, char* error, size_t error_capacity) {
-	return archive_database_publish_shells(
-		repository, bundle_id, publications, publication_count,
-		error, error_capacity);
 }
 
 const char* archive_database_status_string(archive_database_status_t status) {

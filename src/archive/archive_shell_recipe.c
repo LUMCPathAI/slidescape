@@ -11,6 +11,7 @@
 #include "archive_shell_recipe.h"
 
 #include "archive_sha256.h"
+#include "dicom_uid.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,11 +27,7 @@ static bool archive_shell_recipe_digest_is_valid(const char* digest) {
 }
 
 static bool archive_shell_recipe_uid_is_valid(const char* uid) {
-	if (!uid || !uid[0] || strlen(uid) > 64) return false;
-	for (const char* cursor = uid; *cursor; ++cursor) {
-		if ((*cursor < '0' || *cursor > '9') && *cursor != '.') return false;
-	}
-	return true;
+	return uid && dicom_uid_is_valid_string(uid, strlen(uid));
 }
 
 bool archive_shell_build_part10_recipe(
@@ -45,17 +42,17 @@ bool archive_shell_build_part10_recipe(
 	    !archive_shell_recipe_uid_is_valid(input->sop_instance_uid)) return false;
 
 	int length = snprintf(recipe, ARCHIVE_SHELL_RECIPE_CAPACITY,
-		"slidescape-virtual-dicom-recipe-v9-single\n"
+		ARCHIVE_PART10_RECIPE_MAGIC "-single\n"
 		"bundle-sha256\t%s\n"
 		"source-sha256\t%s\n"
 		"source-byte-size\t%llu\n"
 		"logical-role\tpart10-instance\n"
 		"sop-instance-uid\t%s\n"
 		"adapter\tslidescape-dicom-shell\n"
-		"adapter-version\t9\n"
-		"adapter-policy\tpart10-cached-delta-payload-v9\n"
+		"adapter-version\t" ARCHIVE_PART10_ADAPTER_VERSION "\n"
+		"adapter-policy\t" ARCHIVE_PART10_FRAME_POLICY "\n"
 		"configuration\tbuiltin-default-v1\n"
-		"shell-schema-version\t2\n",
+		"shell-schema-version\t3\n",
 		input->bundle_sha256, input->source_sha256,
 		(unsigned long long)input->source_byte_size, input->sop_instance_uid);
 	if (length < 0 || length >= ARCHIVE_SHELL_RECIPE_CAPACITY) return false;
@@ -81,7 +78,7 @@ bool archive_shell_build_part10_aggregate_recipe(
 	if (!data) return false;
 	i32 length = snprintf(
 		data, capacity,
-		"slidescape-virtual-dicom-recipe-v9\n"
+		ARCHIVE_PART10_RECIPE_MAGIC "\n"
 		"bundle-sha256\t%s\n"
 		"logical-slide-study-uid\t%s\n"
 		"logical-slide-series-uid\t%s\n"
@@ -116,10 +113,10 @@ bool archive_shell_build_part10_aggregate_recipe(
 			"logical-role\tpart10-logical-slide\n"
 			"grouping-policy\tpart10-study-series-v1\n"
 			"adapter\tslidescape-dicom-shell\n"
-			"adapter-version\t9\n"
-			"adapter-policy\tpart10-cached-delta-payload-v9\n"
+			"adapter-version\t" ARCHIVE_PART10_ADAPTER_VERSION "\n"
+			"adapter-policy\t" ARCHIVE_PART10_FRAME_POLICY "\n"
 			"configuration\tbuiltin-default-v1\n"
-			"shell-schema-version\t2\n");
+			"shell-schema-version\t3\n");
 		if (length < 0 || (size_t)length >= capacity - used)
 			success = false;
 		else

@@ -162,32 +162,7 @@ static bool archive_object_finish_staging(FILE* file, const char* path,
 	return success;
 }
 
-static bool archive_object_hash_file(const char* path, char sha256[65], u64* byte_size) {
-	FILE* file = fopen(path, "rb");
-	if (!file) return false;
-	archive_sha256_t sha;
-	archive_sha256_initialize(&sha);
-	u8 buffer[ARCHIVE_OBJECT_COPY_BUFFER_SIZE];
-	bool success = true;
-	while (true) {
-		size_t read = fread(buffer, 1, sizeof(buffer), file);
-		if (read > 0 && !archive_sha256_update(&sha, buffer, read)) {
-			success = false;
-			break;
-		}
-		if (read < sizeof(buffer)) {
-			if (ferror(file)) success = false;
-			break;
-		}
-	}
-	if (fclose(file) != 0) success = false;
-	if (!success) return false;
-	u8 digest[32];
-	*byte_size = sha.byte_count;
-	archive_sha256_finish(&sha, digest);
-	archive_sha256_hex(digest, sha256);
-	return true;
-}
+
 
 static archive_object_status_t archive_object_install(const archive_repository_t* repository,
 		const char* storage_root, const char* staging_path, const char* sha256, u64 byte_size,
@@ -253,7 +228,7 @@ static archive_object_status_t archive_object_install(const archive_repository_t
 	if (*already_present) {
 		char stored_sha256[65];
 		u64 stored_size = 0;
-		if (!archive_object_hash_file(prefix_path, stored_sha256, &stored_size)) {
+		if (!archive_sha256_file(prefix_path, stored_sha256, &stored_size)) {
 			remove(staging_path);
 			archive_object_set_error(error, error_capacity,
 			                         "could not verify existing immutable object");
@@ -396,7 +371,7 @@ archive_object_status_t archive_object_reference_file(
 	}
 	char sha256[65];
 	u64 byte_size = 0;
-	if (!archive_object_hash_file(
+	if (!archive_sha256_file(
 			absolute_source_path, sha256, &byte_size)) {
 		archive_object_set_error(error, error_capacity,
 		                         "could not hash referenced source '%s'",

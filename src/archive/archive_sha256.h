@@ -43,6 +43,9 @@ void archive_sha256_finish(archive_sha256_t* sha, u8 digest[32]);
 void archive_sha256_hex(const u8 digest[32], char hex[65]);
 bool archive_sha256_bytes(const void* data, size_t size, char hex[65]);
 
+/* Hash an entire local file; outputs are cleared on failure. */
+bool archive_sha256_file(const char* path, char digest[65], u64* byte_size);
+
 #ifdef __cplusplus
 }
 #endif

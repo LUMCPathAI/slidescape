@@ -19,10 +19,21 @@
 extern "C" {
 #endif
 
-#define ARCHIVE_MRXS_ADAPTER_VERSION 5
+#define ARCHIVE_MRXS_ADAPTER_VERSION 6
+#define ARCHIVE_MRXS_ADAPTER_VERSION_STRING "6"
+#define ARCHIVE_MRXS_RECIPE_MAGIC "slidescape-mrxs-native-recipe-v6"
+#define ARCHIVE_MRXS_FRAME_POLICY "mrxs-jpeg-shell-payload-v6"
 #define ARCHIVE_MRXS_MAX_LEVELS 16
 #define ARCHIVE_MRXS_RECIPE_MEDIA_TYPE \
 	"application/vnd.slidescape.mrxs-native-recipe"
+
+/* Fixed descriptor entries precede the indexed payload data files. */
+typedef enum archive_mrxs_member_index_t {
+	ARCHIVE_MRXS_MEMBER_SLIDE = 0,
+	ARCHIVE_MRXS_MEMBER_SLIDEDAT = 1,
+	ARCHIVE_MRXS_MEMBER_INDEX = 2,
+	ARCHIVE_MRXS_MEMBER_FIRST_DATA = 3,
+} archive_mrxs_member_index_t;
 
 typedef struct archive_mrxs_adapter_t {
 	mrxs_t slide;
@@ -34,8 +45,10 @@ typedef struct archive_mrxs_adapter_t {
 } archive_mrxs_adapter_t;
 
 bool archive_mrxs_adapter_open(archive_mrxs_adapter_t* adapter,
-		const char* mrxs_path, const char* representation_fingerprint,
+		const char* mrxs_path,
 		char* error, size_t error_capacity);
+/* Native identities depend on canonical source membership, not adapter version. */
+bool archive_mrxs_adapter_set_identity(archive_mrxs_adapter_t* adapter, const char* bundle_sha256);
 void archive_mrxs_adapter_close(archive_mrxs_adapter_t* adapter);
 bool archive_mrxs_adapter_build_shell(archive_mrxs_adapter_t* adapter,
 		const char* bundle_descriptor_sha256, u64 bundle_descriptor_size,
@@ -45,11 +58,12 @@ bool archive_mrxs_adapter_build_recipe(const char* mrxs_path,
 		const char* bundle_descriptor_sha256, u64 bundle_descriptor_size,
 		const char* representation_fingerprint, char** recipe,
 		size_t* recipe_size);
-bool archive_mrxs_adapter_get_rgb_frame(archive_mrxs_adapter_t* adapter,
-		u32 level_index, u32 one_based_frame, u8** data, size_t* size,
+/* Development comparison helpers: zero-based dense native grid indices. */
+bool archive_mrxs_adapter_get_rgb_tile(archive_mrxs_adapter_t* adapter,
+		u32 level_index, u32 tile_index, u8** data, size_t* size,
 		char* error, size_t error_capacity);
-bool archive_mrxs_adapter_get_jpeg_frame(archive_mrxs_adapter_t* adapter,
-		u32 level_index, u32 one_based_frame, u8** data, size_t* size,
+bool archive_mrxs_adapter_get_jpeg_tile(archive_mrxs_adapter_t* adapter,
+		u32 level_index, u32 tile_index, u8** data, size_t* size,
 		char* error, size_t error_capacity);
 
 #ifdef __cplusplus

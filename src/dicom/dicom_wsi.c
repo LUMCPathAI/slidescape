@@ -296,18 +296,21 @@ void dicom_wsi_interpret_top_level_data_element(dicom_instance_t* instance, dico
 			// Type 1
 			// Image identification characteristics.
 			str_t next = {data_str, element.length};
+			bool valid = true;
+			i32 value_count = 0;
 			for (i32 i = 0; i < 4; ++i) {
 				dicom_cs_t cs = dicom_parse_code_string(next, &next);
+				++value_count;
 				if (i == 0) {
 					// Value 1 shall have a value of ORIGINAL or DERIVED
 					if (strcmp(cs.value, "ORIGINAL") == 0) {
 						instance->is_image_original = true;
 					} else if (strcmp(cs.value, "DERIVED") == 0) {
 						instance->is_image_original = false;
-					}
+					} else { valid = false; }
 				} else if (i == 1) {
 					// Value 2 shall have a value of PRIMARY
-					// (we don't check this, just assume it to be PRIMARY)
+					valid = valid && strcmp(cs.value, "PRIMARY") == 0;
 				} else if (i == 2) {
 					// Value 3 (Image Flavor)
 					if (strcmp(cs.value, "VOLUME") == 0) {
@@ -320,6 +323,7 @@ void dicom_wsi_interpret_top_level_data_element(dicom_instance_t* instance, dico
 						instance->image_flavor = DICOM_IMAGE_FLAVOR_THUMBNAIL;
 					} else {
 						instance->image_flavor = DICOM_IMAGE_FLAVOR_UNKNOWN;
+						valid = false;
 					}
 					instance->image_flavor_cs = cs;
 				} else if (i == 3) {
@@ -328,12 +332,13 @@ void dicom_wsi_interpret_top_level_data_element(dicom_instance_t* instance, dico
 						instance->is_image_resampled = false;
 					} else if (strcmp(cs.value, "RESAMPLED") == 0) {
 						instance->is_image_resampled = true;
-					}
+					} else { valid = false; }
 				}
 				if (!next.s) {
 					break;
 				}
 			}
+			instance->has_valid_wsi_image_type = valid && value_count == 4 && (!next.s || !next.len);
 
 		} break;
 		case DICOM_ImagedVolumeWidth: {
@@ -550,7 +555,7 @@ void dicom_wsi_interpret_nested_data_element(dicom_instance_t* instance, dicom_d
 					instance->total_pixel_matrix_origin_component_mask |= 2;
 				} break;
 				case DICOM_ZOffsetInSlideCoordinateSystem: {
-					instance->total_pixel_matrix_origin_z_mm =
+					instance->total_pixel_matrix_origin_z_um =
 						dicom_parse_decimal_string((str_t){(char*)data, element.length}, NULL);
 					instance->total_pixel_matrix_origin_component_mask |= 4;
 				} break;

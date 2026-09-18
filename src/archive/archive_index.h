@@ -79,6 +79,8 @@ typedef struct archive_index_t {
 	archive_instance_record_t* instances;
 	i32 instance_count;
 	i32 instance_capacity;
+	/* Sorted by SOP UID; records themselves retain shell/series order. */
+	const archive_instance_record_t** instances_by_uid;
 } archive_index_t;
 
 typedef struct archive_study_query_t {
