@@ -12,6 +12,10 @@
 
 #include "common.h"
 
+/* Opt-in viewer bootstrap representation; never a replacement for DICOM JSON. */
+#define DICOMWEB_COMPACT_METADATA_MEDIA_TYPE "application/vnd.slidescape.wsi-metadata.v1+json"
+#define DICOMWEB_MAX_COMPACT_METADATA_SIZE MEGABYTES(8)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -95,10 +99,14 @@ typedef struct dicomweb_remote_image_t {
 	i32 instance_count;
 	i32 instance_capacity;
 	dicomweb_instance_metadata_t* instances;
+	i64 open_start_clock;
+	bool first_tile_upload_reported; /* Main/render thread only. */
 } dicomweb_remote_image_t;
 
 bool dicomweb_parse_instance_metadata(const char* json, size_t json_size,
                                       dicomweb_instance_metadata_t* out);
+bool dicomweb_parse_compact_metadata(const char* json, size_t json_size,
+		dicomweb_instance_metadata_t* out);
 void dicomweb_instance_metadata_destroy(dicomweb_instance_metadata_t* metadata);
 void dicomweb_remote_image_destroy(dicomweb_remote_image_t* remote);
 i32 dicomweb_parse_instance_refs(const char* json, size_t json_size,

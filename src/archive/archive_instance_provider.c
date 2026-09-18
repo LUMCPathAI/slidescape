@@ -18,6 +18,7 @@
 #include "archive_shell.h"
 #include "archive_shell_recipe.h"
 #include "dicom.h"
+#include "dicomweb.h"
 #include "jpeg_decoder.h"
 #include "jpeg2000_decoder.h"
 
@@ -1270,6 +1271,28 @@ bool archive_instance_provider_get_metadata(const archive_repository_t* reposito
 	return success;
 }
 
+bool archive_instance_provider_get_compact_metadata(const archive_repository_t* repository,
+		const archive_instance_record_t* record, char** json, size_t* json_size,
+		char* error, size_t error_capacity) {
+	if (!json || !json_size) return false;
+	*json = NULL;
+	*json_size = 0;
+	archive_provider_shell_cache_entry_t* entry = archive_provider_shared_shell_acquire(
+		repository, record, error, error_capacity);
+	if (!entry) return false;
+	archive_shell_instance_t instance = {0};
+	size_t size = 0;
+	bool success = archive_shell_get_instance(&entry->shell, record->shell_instance_index, &instance) &&
+		archive_provider_record_matches_shell(record, &entry->shell, &instance, error, error_capacity) &&
+		archive_metadata_write_compact(&entry->shell, &instance, NULL, DICOMWEB_MAX_COMPACT_METADATA_SIZE, &size);
+	char* result = success ? malloc(size + 1) : NULL;
+	success = result && archive_metadata_write_compact(&entry->shell, &instance, result, size + 1, json_size);
+	if (success) *json = result;
+	else free(result);
+	archive_provider_shell_cache_release(entry);
+	return success;
+}
+
 bool archive_instance_provider_get_series_metadata(
 		const archive_repository_t* repository,
 		const archive_instance_record_t* records, i32 record_count,
@@ -1515,6 +1538,43 @@ static bool archive_provider_read_mrxs_frame(
 	*data = jpeg;
 	*size = payload.size;
 	return true;
+}
+
+bool archive_instance_provider_get_frame_buffer_size(const archive_repository_t* repository,
+		const archive_instance_record_t* record, const u32* frame_numbers, i32 frame_count,
+		const archive_frame_representation_t* representation, size_t* size) {
+	if (!frame_numbers || frame_count <= 0 || !representation || !size) return false;
+	*size = 0;
+	archive_provider_cache_entry_t* entry = archive_provider_instance_cache_acquire(
+		repository, record, NULL, 0);
+	if (!entry) return false;
+	bool success = true;
+	for (i32 i = 0; i < frame_count && success; ++i) {
+		u32 frame = frame_numbers[i] - 1;
+		if (frame >= entry->instance.frame_count) { success = false; break; }
+		u64 bytes = 0;
+		if (entry->instance.provider_kind == ARCHIVE_SHELL_PROVIDER_MRXS_NATIVE) {
+			archive_shell_native_payload_t payload = {0};
+			success = archive_shell_get_native_payload(&entry->shared_shell->shell,
+				&entry->instance, frame, &payload);
+			bytes = payload.size;
+		} else if (representation->source == ARCHIVE_FRAME_REPRESENTATION_GENERATED) {
+			/* The only generated Part 10 representation is RGB8. */
+			success = strcmp(representation->media_type, "application/octet-stream") == 0;
+			bytes = (u64)entry->instance.rows * entry->instance.columns * 3;
+		} else {
+			archive_shell_payload_range_t range = {0};
+			if (entry->payload_ranges) range = entry->payload_ranges[frame];
+			else success = archive_shell_get_payload_range(&entry->shared_shell->shell,
+				&entry->instance, frame, &range);
+			bytes = range.size;
+		}
+		if (!bytes || bytes > ARCHIVE_PROVIDER_MAX_FRAME_SIZE || bytes > SIZE_MAX - *size)
+			success = false;
+		if (success) *size += (size_t)bytes;
+	}
+	archive_provider_cache_release(entry);
+	return success;
 }
 
 bool archive_instance_provider_get_frame(const archive_repository_t* repository,

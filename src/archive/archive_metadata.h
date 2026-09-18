@@ -25,6 +25,10 @@ bool archive_metadata_write_instance(const archive_shell_view_t* shell,
 		size_t* size, bool array_wrapper);
 bool archive_metadata_get_capacity(const archive_shell_view_t* shell,
 		const archive_shell_instance_t* instance, u64* capacity);
+/* Viewer geometry and row-major occupancy runs for a single optical/focal plane.
+ * Like write_instance, NULL counts bytes; no source paths or payload offsets. */
+bool archive_metadata_write_compact(const archive_shell_view_t* shell,
+		const archive_shell_instance_t* instance, char* dest, size_t capacity, size_t* size);
 
 #ifdef __cplusplus
 }

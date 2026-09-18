@@ -168,6 +168,17 @@ def main(binary, exercise_deadline=False):
                 assert frames[0]['0048021A']['Value'][0]['0040072A']['Value'] == [13.5]
                 assert frames[0]['0048021A']['Value'][0]['0040074A']['Value'] == [125]
                 assert frames[0]['00480207']['Value'][0]['00480106']['Value'] == ['A']
+                compact_type = 'application/vnd.slidescape.wsi-metadata.v1+json'
+                for path, full, runs in [(a, True, []), (b, False, [[1, 1, 1], [0, 2, 1]])]:
+                    status, headers, body = request(port, path + '/metadata', compact_type)
+                    assert status == 200 and headers['Content-Type'] == compact_type, body
+                    compact = json.loads(body)
+                    assert compact['version'] == 1 and compact['tiledFull'] == full
+                    assert compact['runs'] == runs and compact['frameCount'] == 2
+                    assert compact['matrixColumns'] == 4 and compact['mpp'] == [500, 500]
+                    assert compact['instanceUID'] == path.rsplit('/', 1)[1]
+                    # The extension never changes the standard representation.
+                    assert '00080008' in json.loads(request(port, path + '/metadata')[2])[0]
                 accept = 'multipart/related; type="application/octet-stream"; transfer-syntax=' + TRANSFER_SYNTAX
                 status, headers, body = request(port, a + '/frames/2,1,2', accept)
                 assert status == 200, body
@@ -175,6 +186,12 @@ def main(binary, exercise_deadline=False):
                 parts = body.split(b'--' + boundary)[1:-1]
                 payloads = [part.split(b'\r\n\r\n', 1)[1][:-2] for part in parts]
                 assert payloads == [bytes(range(12, 24)), bytes(range(12)), bytes(range(12, 24))]
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                    results = list(pool.map(lambda _: request(port, a + '/frames/2,1,2', accept), range(64)))
+                assert all(result[0] == 200 for result in results), [result[0] for result in results]
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                    results = list(pool.map(lambda _: request(port, b + '/metadata', compact_type), range(32)))
+                assert all(result[0] == 200 for result in results), [result[0] for result in results]
                 assert request(port, a + '/frames/1')[0] == 406
                 for quality in ['NaN', 'inf', '-1', '1.001', '0.1234', '1e0', '+1']:
                     assert request(port, a + '/frames/1', 'application/octet-stream;q=' + quality)[0] == 406

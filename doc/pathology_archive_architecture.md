@@ -336,9 +336,10 @@ APIs while preserving standards-correct instance/frame DICOMweb endpoints.
 
 The open design question is where pyramid selection policy lives. The current viewer
 can assemble/select DICOM instances client-side, which keeps DICOMweb conventional.
-The archive may later expose an additional Slidescape-native slide manifest or streaming
-endpoint for lower-latency clients; it should derive from the same immutable virtual
-DICOM shell rather than introduce a competing source of truth.
+The archive now offers an opt-in compact instance bootstrap for Slidescape, derived
+from the same immutable virtual DICOM shell. It sends geometry and occupancy runs
+without expanding per-frame functional groups. A complete slide manifest or streaming
+endpoint remains future work; it should retain that same source of truth.
 
 ### Logical-Slide Aggregate
 
@@ -425,3 +426,12 @@ batching are complete. The next implementation slices are:
 
 All protocol handlers depend on repository/index/provider interfaces. They must not
 encode filesystem paths, MRXS details, or GUI types into the DICOMweb layer.
+
+### September performance follow-up
+
+The viewer can opt into a versioned compact instance bootstrap representation,
+with sparse occupancy runs instead of expanded DICOM functional groups. Standard
+DICOMweb metadata is preserved. Frame response admission now reserves shell-derived
+buffer bounds instead of a fixed 256 MiB per request. See
+[the performance report](archive_performance_2026-09-18.md) for the wire contract,
+client/server timing controls, measurements, and remaining priorities.

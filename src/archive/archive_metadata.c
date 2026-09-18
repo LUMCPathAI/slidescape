@@ -626,3 +626,64 @@ bool archive_metadata_get_capacity(
 	*capacity = size + 1;
 	return true;
 }
+
+bool archive_metadata_write_compact(const archive_shell_view_t* shell,
+		const archive_shell_instance_t* instance, char* dest, size_t capacity, size_t* size) {
+	if (!shell || !instance || !size || !capacity || !instance->rows || !instance->columns ||
+	    instance->optical_path_count != 1 || instance->focal_plane_count != 1 ||
+	    !instance->frame_count || strcmp(instance->image_flavor, "VOLUME") != 0)
+		return false;
+	archive_metadata_writer_t writer = {.data = dest, .capacity = capacity};
+	archive_metadata_write(&writer, "{\"version\":1,\"studyUID\":");
+	archive_metadata_write_json_string(&writer, instance->study_instance_uid);
+	archive_metadata_write(&writer, ",\"seriesUID\":");
+	archive_metadata_write_json_string(&writer, instance->series_instance_uid);
+	archive_metadata_write(&writer, ",\"instanceUID\":");
+	archive_metadata_write_json_string(&writer, instance->sop_instance_uid);
+	archive_metadata_write(&writer, ",\"imageFlavor\":\"VOLUME\",\"photometricInterpretation\":");
+	archive_metadata_write_json_string(&writer, instance->photometric_interpretation);
+	archive_metadata_write_format(&writer,
+		",\"rows\":%u,\"columns\":%u,\"matrixColumns\":%u,\"matrixRows\":%u,"
+		"\"samplesPerPixel\":%u,\"frameCount\":%u,\"tiledFull\":%s,\"mpp\":[%.9g,%.9g],\"runs\":[",
+		instance->rows, instance->columns, instance->total_pixel_matrix_columns,
+		instance->total_pixel_matrix_rows, instance->samples_per_pixel, instance->frame_count,
+		instance->is_tiled_full ? "true" : "false",
+		(double)instance->pixel_spacing_column_mm * 1000.0,
+		(double)instance->pixel_spacing_row_mm * 1000.0);
+	/* Runs describe consecutive frame numbers at consecutive grid positions.
+	 * Sparse holes cost a new run, not a DICOM functional-group object per tile.
+	 * Full grids are implicit. This also handles explicit sparse Part 10 maps. */
+	if (!instance->is_tiled_full) {
+		u64 columns = ((u64)instance->total_pixel_matrix_columns + instance->columns - 1) / instance->columns;
+		u64 rows = ((u64)instance->total_pixel_matrix_rows + instance->rows - 1) / instance->rows;
+		u64 run_tile = 0;
+		u32 run_frame = 0, run_length = 0;
+		bool wrote_run = false;
+		for (u32 i = 0; i < instance->frame_count && !writer.failed; ++i) {
+			archive_shell_frame_t frame = {0};
+			if (!archive_shell_get_frame(shell, instance, i, &frame) ||
+			    !frame.column_position || !frame.row_position ||
+			    (frame.column_position - 1) % instance->columns ||
+			    (frame.row_position - 1) % instance->rows) return false;
+			u64 x = (frame.column_position - 1) / instance->columns;
+			u64 y = (frame.row_position - 1) / instance->rows;
+			if (x >= columns || y >= rows) return false;
+			u64 tile = y * columns + x;
+			if (run_length && tile != run_tile + run_length) {
+				archive_metadata_write_format(&writer, "%s[%llu,%u,%u]",
+					wrote_run ? "," : "", (unsigned long long)run_tile, run_frame, run_length);
+				wrote_run = true;
+				run_length = 0;
+			}
+			if (!run_length) { run_tile = tile; run_frame = i + 1; }
+			++run_length;
+		}
+		if (run_length)
+			archive_metadata_write_format(&writer, "%s[%llu,%u,%u]",
+				wrote_run ? "," : "", (unsigned long long)run_tile, run_frame, run_length);
+	}
+	archive_metadata_write(&writer, "]}\n");
+	if (writer.failed) return false;
+	*size = writer.used;
+	return true;
+}

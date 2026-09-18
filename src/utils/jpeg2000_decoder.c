@@ -117,21 +117,39 @@ static u8* jpeg2000_decode_image_internal(const u8* input, size_t input_size,
 		if (!image->comps[i].data) goto cleanup;
 	result = malloc(pixel_count * 4);
 	if (!result) goto cleanup;
-	for (size_t i = 0; i < pixel_count; ++i) {
-		u8 red;
-		u8 green;
-		u8 blue;
-		if (image->numcomps == 1) {
-			red = green = blue = jpeg2000_sample_to_u8(first, i);
-		} else {
-			red = jpeg2000_sample_to_u8(image->comps + 0, i);
-			green = jpeg2000_sample_to_u8(image->comps + 1, i);
-			blue = jpeg2000_sample_to_u8(image->comps + 2, i);
+	/* The archive's common RGB8 case needs clamping, but no per-sample
+	 * precision scaling or integer division. Keep the general path below
+	 * for signed, grayscale, and higher-precision source images. */
+	bool rgb8 = image->numcomps == 3;
+	for (OPJ_UINT32 c = 0; c < image->numcomps; ++c)
+		rgb8 = rgb8 && image->comps[c].prec == 8 && !image->comps[c].sgnd;
+	if (rgb8) {
+		const OPJ_INT32* red = image->comps[0].data;
+		const OPJ_INT32* green = image->comps[1].data;
+		const OPJ_INT32* blue = image->comps[2].data;
+		for (size_t i = 0; i < pixel_count; ++i) {
+			result[i * 4 + 0] = (u8)MIN(255, MAX(0, blue[i]));
+			result[i * 4 + 1] = (u8)MIN(255, MAX(0, green[i]));
+			result[i * 4 + 2] = (u8)MIN(255, MAX(0, red[i]));
+			result[i * 4 + 3] = 255;
 		}
-		result[i * 4 + 0] = blue;
-		result[i * 4 + 1] = green;
-		result[i * 4 + 2] = red;
-		result[i * 4 + 3] = 255;
+	} else {
+		for (size_t i = 0; i < pixel_count; ++i) {
+			u8 red;
+			u8 green;
+			u8 blue;
+			if (image->numcomps == 1) {
+				red = green = blue = jpeg2000_sample_to_u8(first, i);
+			} else {
+				red = jpeg2000_sample_to_u8(image->comps + 0, i);
+				green = jpeg2000_sample_to_u8(image->comps + 1, i);
+				blue = jpeg2000_sample_to_u8(image->comps + 2, i);
+			}
+			result[i * 4 + 0] = blue;
+			result[i * 4 + 1] = green;
+			result[i * 4 + 2] = red;
+			result[i * 4 + 3] = 255;
+		}
 	}
 	if (width) *width = (i32)first->w;
 	if (height) *height = (i32)first->h;

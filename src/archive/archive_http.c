@@ -9,6 +9,7 @@
 */
 
 #include "archive_http.h"
+#include "dicomweb.h"
 
 #include "common.h"
 #include "archive_index.h"
@@ -51,6 +52,12 @@ typedef int archive_socket_t;
 #define ARCHIVE_REQUEST_DEADLINE_MS 30000
 #define ARCHIVE_SOCKET_IDLE_TIMEOUT_MS 5000
 #define ARCHIVE_RESPONSE_MEMORY_BUDGET MEGABYTES(512)
+
+/* Opt-in stage timings, with no request URLs or patient metadata in the log. */
+static bool archive_profile_requests;
+static THREAD_LOCAL double archive_profile_send_ms;
+static THREAD_LOCAL double archive_profile_read_ms;
+static THREAD_LOCAL const char* archive_profile_route;
 
 typedef struct archive_connection_t {
 	archive_socket_t socket;
@@ -162,7 +169,7 @@ static bool archive_set_client_timeout(const archive_connection_t* connection) {
 		(const char*)&timeout, sizeof(timeout)) == 0;
 }
 
-static bool archive_send_all(const archive_connection_t* socket, const char* data, size_t size) {
+static bool archive_send_all_impl(const archive_connection_t* socket, const char* data, size_t size) {
 	while (size > 0) {
 		if (!archive_set_client_timeout(socket)) return false;
 #if defined(_WIN32)
@@ -175,6 +182,14 @@ static bool archive_send_all(const archive_connection_t* socket, const char* dat
 		size -= (size_t)sent;
 	}
 	return true;
+}
+
+static bool archive_send_all(const archive_connection_t* socket, const char* data, size_t size) {
+	if (!archive_profile_requests) return archive_send_all_impl(socket, data, size);
+	i64 start = get_clock();
+	bool success = archive_send_all_impl(socket, data, size);
+	archive_profile_send_ms += get_seconds_elapsed(start, get_clock()) * 1000.0;
+	return success;
 }
 
 static bool archive_send_headers(const archive_connection_t* socket, i32 status, const char* reason,
@@ -205,7 +220,7 @@ static bool archive_send_json(const archive_connection_t* socket, i32 status, co
 	return archive_send_body(socket, status, reason, "application/json", json, strlen(json));
 }
 
-static bool archive_read_request_headers(const archive_connection_t* socket, char* request, size_t capacity) {
+static bool archive_read_request_headers_impl(const archive_connection_t* socket, char* request, size_t capacity) {
 	size_t used = 0;
 	while (used + 1 < capacity) {
 		if (!archive_set_client_timeout(socket)) return false;
@@ -222,6 +237,14 @@ static bool archive_read_request_headers(const archive_connection_t* socket, cha
 	return false;
 }
 
+
+static bool archive_read_request_headers(const archive_connection_t* socket, char* request, size_t capacity) {
+	if (!archive_profile_requests) return archive_read_request_headers_impl(socket, request, capacity);
+	i64 start = get_clock();
+	bool success = archive_read_request_headers_impl(socket, request, capacity);
+	archive_profile_read_ms += get_seconds_elapsed(start, get_clock()) * 1000.0;
+	return success;
+}
 
 static void archive_send_qido_response(const archive_connection_t* client, const archive_index_t* index,
 		const archive_route_match_t* route, const char* target) {
@@ -276,6 +299,19 @@ static const char* archive_find_header(const char* headers, const char* name) {
 	return NULL;
 }
 
+/* The compact bootstrap is an explicit single-media-type opt-in. Ordinary
+ * DICOMweb requests continue to receive the full standards representation. */
+static bool archive_wants_compact_metadata(const char* headers) {
+	const char* value = archive_find_header(headers, "Accept");
+	if (!value) return false;
+	while (*value == ' ' || *value == '\t') ++value;
+	size_t length = strlen(DICOMWEB_COMPACT_METADATA_MEDIA_TYPE);
+	if (strncasecmp(value, DICOMWEB_COMPACT_METADATA_MEDIA_TYPE, length) != 0) return false;
+	value += length;
+	while (*value == ' ' || *value == '\t') ++value;
+	return value[0] == '\r' && value[1] == '\n';
+}
+
 static void archive_destroy_frames(archive_instance_frame_t* frames, i32 count) {
 	for (i32 i = 0; i < count; ++i) archive_instance_frame_destroy(frames + i);
 }
@@ -301,9 +337,12 @@ static void archive_write_frame_part_header(memrw_t* builder, bool include_separ
 	memrw_write_literal("\r\n\r\n", builder);
 }
 
+static platform_mutex_t archive_response_budget_mutex = PLATFORM_MUTEX_INITIALIZER;
+static size_t archive_response_bytes_reserved;
+
 static void archive_send_wado_response_admitted(const archive_connection_t* client,
 		const archive_repository_t* repository, const archive_index_t* index,
-		const archive_route_match_t* route, const char* request_headers) {
+		const archive_route_match_t* route, const char* request_headers, size_t* reservation) {
 	char error[512] = {0};
 	if (route->kind == ARCHIVE_ROUTE_WADO_SERIES_METADATA) {
 		const archive_instance_record_t* records = NULL;
@@ -337,6 +376,19 @@ static void archive_send_wado_response_admitted(const archive_connection_t* clie
 		return;
 	}
 	if (route->kind == ARCHIVE_ROUTE_WADO_INSTANCE_METADATA) {
+		if (archive_wants_compact_metadata(request_headers)) {
+			char* compact = NULL;
+			size_t compact_size = 0;
+			if (archive_instance_provider_get_compact_metadata(repository, record,
+					&compact, &compact_size, error, sizeof(error))) {
+				archive_send_body(client, 200, "OK", DICOMWEB_COMPACT_METADATA_MEDIA_TYPE,
+					compact, compact_size);
+			} else {
+				archive_send_json(client, 406, "Not Acceptable", "{\"error\":\"compact_metadata_unavailable\"}\n");
+			}
+			free(compact);
+			return;
+		}
 		char* json = NULL;
 		size_t json_size = 0;
 		if (!archive_instance_provider_get_metadata(repository, record, &json, &json_size,
@@ -381,6 +433,31 @@ static void archive_send_wado_response_admitted(const archive_connection_t* clie
 	if (selection != ARCHIVE_REPRESENTATION_SELECTED) {
 		archive_send_json(client, 406, "Not Acceptable",
 		                  "{\"error\":\"representation_not_acceptable\"}\n");
+		return;
+	}
+
+	size_t frame_bytes = 0;
+	if (!archive_instance_provider_get_frame_buffer_size(repository, record, frame_numbers,
+			frame_count, &selected, &frame_bytes)) {
+		archive_send_json(client, 409, "Conflict", "{\"error\":\"frame_unavailable\"}\n");
+		return;
+	}
+	/* Reserve actual shell-derived bounds, not 256 MiB for a few KiB of JPEG.
+	 * The old fixed reservation effectively limited the server to two requests. */
+	size_t overhead = (size_t)frame_count * 768 + 64;
+	if (frame_bytes > ARCHIVE_MAX_MULTIPART_RESPONSE_SIZE - overhead) {
+		archive_send_json(client, 413, "Content Too Large", "{\"error\":\"frame_response_too_large\"}\n");
+		return;
+	}
+	platform_mutex_lock(&archive_response_budget_mutex);
+	bool admitted = frame_bytes + overhead <= ARCHIVE_RESPONSE_MEMORY_BUDGET - archive_response_bytes_reserved;
+	if (admitted) {
+		*reservation = frame_bytes + overhead;
+		archive_response_bytes_reserved += *reservation;
+	}
+	platform_mutex_unlock(&archive_response_budget_mutex);
+	if (!admitted) {
+		archive_send_json(client, 503, "Service Unavailable", "{\"error\":\"response_budget_busy\"}\n");
 		return;
 	}
 
@@ -457,24 +534,23 @@ static void archive_send_wado_response_admitted(const archive_connection_t* clie
 	if (sent) archive_send_all(client, closing, closing_size);
 }
 
-static platform_mutex_t archive_response_budget_mutex = PLATFORM_MUTEX_INITIALIZER;
-static size_t archive_response_bytes_reserved;
-
 static void archive_send_wado_response(const archive_connection_t* client,
 		const archive_repository_t* repository, const archive_index_t* index,
 		const archive_route_match_t* route, const char* request_headers) {
+	size_t reservation = route->kind == ARCHIVE_ROUTE_WADO_FRAMES ? 0 : ARCHIVE_MAX_MULTIPART_RESPONSE_SIZE;
+	if (route->kind == ARCHIVE_ROUTE_WADO_INSTANCE_METADATA && archive_wants_compact_metadata(request_headers))
+		reservation = DICOMWEB_MAX_COMPACT_METADATA_SIZE;
 	platform_mutex_lock(&archive_response_budget_mutex);
-	bool admitted = archive_response_bytes_reserved <=
-		ARCHIVE_RESPONSE_MEMORY_BUDGET - ARCHIVE_MAX_MULTIPART_RESPONSE_SIZE;
-	if (admitted) archive_response_bytes_reserved += ARCHIVE_MAX_MULTIPART_RESPONSE_SIZE;
+	bool admitted = reservation <= ARCHIVE_RESPONSE_MEMORY_BUDGET - archive_response_bytes_reserved;
+	if (admitted) archive_response_bytes_reserved += reservation;
 	platform_mutex_unlock(&archive_response_budget_mutex);
 	if (!admitted) {
 		archive_send_json(client, 503, "Service Unavailable", "{\"error\":\"response_budget_busy\"}\n");
 		return;
 	}
-	archive_send_wado_response_admitted(client, repository, index, route, request_headers);
+	archive_send_wado_response_admitted(client, repository, index, route, request_headers, &reservation);
 	platform_mutex_lock(&archive_response_budget_mutex);
-	archive_response_bytes_reserved -= ARCHIVE_MAX_MULTIPART_RESPONSE_SIZE;
+	archive_response_bytes_reserved -= reservation;
 	platform_mutex_unlock(&archive_response_budget_mutex);
 }
 
@@ -511,6 +587,7 @@ static void archive_handle_request_with_buffer(const archive_connection_t* clien
 		archive_send_json(client, 404, "Not Found", "{\"error\":\"route_not_found\"}\n");
 		return;
 	}
+	archive_profile_route = archive_route_kind_string(route.kind);
 	if (route.kind == ARCHIVE_ROUTE_HEALTH) {
 		archive_instance_provider_cache_stats_t stats =
 			archive_instance_provider_get_cache_stats();
@@ -583,14 +660,27 @@ static void archive_handle_request(const archive_connection_t* client, const arc
 static void archive_handle_client_task(i32 logical_thread_index, void* userdata) {
 	(void)logical_thread_index;
 	archive_client_task_t* task = (archive_client_task_t*)userdata;
+	i64 start = archive_profile_requests ? get_clock() : 0;
+	archive_profile_send_ms = archive_profile_read_ms = 0;
+	archive_profile_route = "invalid";
 	if (archive_set_client_timeout(&task->connection))
 		archive_handle_request(&task->connection, task->repository, task->index);
 	archive_socket_close(task->connection.socket);
+	if (archive_profile_requests) {
+		double elapsed = get_seconds_elapsed(start, get_clock()) * 1000.0;
+		fprintf(stderr, "archive timing: route=%s queue=%.3f ms receive=%.3f ms work=%.3f ms send=%.3f ms total=%.3f ms\n",
+			archive_profile_route,
+			get_seconds_elapsed(task->connection.accepted_at, start) * 1000.0,
+			archive_profile_read_ms, MAX(0.0, elapsed - archive_profile_read_ms - archive_profile_send_ms),
+			archive_profile_send_ms, get_seconds_elapsed(task->connection.accepted_at, get_clock()) * 1000.0);
+	}
 }
 
 int archive_http_serve(const archive_repository_t* repository, u16 port,
 		size_t max_requests) {
 	if (!repository || !repository->root[0] || !archive_socket_startup()) return 1;
+	const char* profile = getenv("SLIDESCAPE_ARCHIVE_PROFILE");
+	archive_profile_requests = profile && strcmp(profile, "1") == 0;
 	if (!archive_instance_provider_initialize()) {
 		fprintf(stderr, "Could not initialize archive instance providers\n");
 		archive_socket_shutdown();

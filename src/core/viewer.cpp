@@ -335,6 +335,12 @@ static bool viewer_process_loaded_tile(app_state_t* app_state, image_t* image, t
 				renderer_submit_texture_upload(app_state, task->tile_width, task->tile_height,
 				                               4, action.upload_pixels, finalize_textures_immediately);
 		submitted_texture_upload = true;
+		if (image->backend == IMAGE_BACKEND_DICOMWEB &&
+		    !image->dicomweb.first_tile_upload_reported && image->dicomweb.open_start_clock) {
+			image->dicomweb.first_tile_upload_reported = true;
+			console_print_verbose("DICOMweb first tile upload submitted: %.2f ms after open started\n",
+				get_seconds_elapsed(image->dicomweb.open_start_clock, get_clock()) * 1000.0);
+		}
 		if (finalize_textures_immediately) {
 			tile_cache_store_gpu_texture(image, task->level, task->tile_index, transfer_state->texture);
 		} else {

@@ -8,6 +8,7 @@
 #include "tile_loader.h"
 
 #include <string>
+#include <utility>
 
 #ifndef SLIDESCAPE_TEST_DICOMWEB_FIXTURE_DIR
 #define SLIDESCAPE_TEST_DICOMWEB_FIXTURE_DIR "tests/fixtures/dicomweb"
@@ -501,4 +502,49 @@ TEST_CASE("DICOMweb counts query results independently of caller capacity") {
 		"\"00080018\":{\"vr\":\"UI\",\"Value\":[\"instance-2\"]}}"
 		"]";
 	CHECK(dicomweb_count_instance_refs(instances_json, strlen(instances_json)) == 2);
+}
+
+TEST_CASE("DICOMweb compact bootstrap validates sparse run maps and geometry") {
+	const std::string prefix =
+		"{\"version\":1,\"studyUID\":\"2.25.1\",\"seriesUID\":\"2.25.2\",\"instanceUID\":\"2.25.3\","
+		"\"imageFlavor\":\"VOLUME\",\"photometricInterpretation\":\"RGB\","
+		"\"rows\":2,\"columns\":2,\"matrixRows\":4,\"matrixColumns\":6,\"samplesPerPixel\":3,"
+		"\"frameCount\":3,\"tiledFull\":false,\"mpp\":[0.25,0.5],\"runs\":";
+	dicomweb_instance_metadata_t metadata = {};
+	std::string json = prefix + "[[4,1,2],[0,3,1]]}";
+	REQUIRE(dicomweb_parse_compact_metadata(json.data(), json.size(), &metadata));
+	CHECK(metadata.frame_map_count == 6);
+	CHECK(metadata.frame_numbers[0] == 3);
+	CHECK(metadata.frame_numbers[1] == 0);
+	CHECK(metadata.frame_numbers[4] == 1);
+	CHECK(metadata.frame_numbers[5] == 2);
+	CHECK(metadata.mpp_x == doctest::Approx(0.25));
+	CHECK(metadata.mpp_y == doctest::Approx(0.5));
+	dicomweb_instance_metadata_destroy(&metadata);
+	for (const char* runs : {"[[4,1,2],[4,3,1]]", "[[4,2,2],[0,1,1]]", "[[5,1,3]]",
+	                        "[[0,1,0]]", "[[0,1,2]]", "[[0,1,4]]", "[[0,1,1.5]]",
+	                        "[[4294967295,1,3]]", "[[0,1,3,4]]", "[]"}) {
+		json = prefix + runs + "}";
+		CHECK_FALSE(dicomweb_parse_compact_metadata(json.data(), json.size(), &metadata));
+		CHECK(metadata.frame_numbers == nullptr);
+	}
+	json = prefix + "[[0,1,3]]}";
+	for (const auto& replacement : {
+		std::pair<std::string, std::string>{"\"version\":1", "\"version\":2"},
+		{"\"rows\":2", "\"rows\":0"}, {"\"rows\":2", "\"rows\":-2"},
+		{"\"matrixRows\":4", "\"matrixRows\":4294967295"},
+		{"\"mpp\":[0.25,0.5]", "\"mpp\":[1e999,0.5]"},
+		{"\"tiledFull\":false", "\"tiledFull\":true"},
+		{"\"instanceUID\":\"2.25.3\"", "\"instanceUID\":\"not-a-uid\""}}) {
+		std::string invalid = json;
+		invalid.replace(invalid.find(replacement.first), replacement.first.size(), replacement.second);
+		CHECK_FALSE(dicomweb_parse_compact_metadata(invalid.data(), invalid.size(), &metadata));
+		CHECK(metadata.frame_numbers == nullptr);
+	}
+	json = prefix + "[]}";
+	json.replace(json.find("\"frameCount\":3"), strlen("\"frameCount\":3"), "\"frameCount\":6");
+	json.replace(json.find("false"), 5, "true");
+	REQUIRE(dicomweb_parse_compact_metadata(json.data(), json.size(), &metadata));
+	for (u32 i = 0; i < 6; ++i) CHECK(metadata.frame_numbers[i] == i + 1);
+	dicomweb_instance_metadata_destroy(&metadata);
 }

@@ -62,6 +62,9 @@ archive_instance_provider_cache_stats_t archive_instance_provider_get_cache_stat
 bool archive_instance_provider_get_metadata(const archive_repository_t* repository,
 		const archive_instance_record_t* record, char** json, size_t* json_size,
 		char* error, size_t error_capacity);
+bool archive_instance_provider_get_compact_metadata(const archive_repository_t* repository,
+		const archive_instance_record_t* record, char** json, size_t* json_size,
+		char* error, size_t error_capacity);
 bool archive_instance_provider_get_series_metadata(
 		const archive_repository_t* repository,
 		const archive_instance_record_t* records, i32 record_count,
@@ -70,6 +73,11 @@ i32 archive_instance_provider_get_frame_representations(
 		const archive_repository_t* repository, const archive_instance_record_t* record,
 		archive_frame_representation_t* representations, i32 capacity,
 		char* error, size_t error_capacity);
+/* Upper bound for retained frame buffers, computed from validated shell offsets
+ * before reading pixels. Includes encapsulation overhead for stored Part 10. */
+bool archive_instance_provider_get_frame_buffer_size(const archive_repository_t* repository,
+		const archive_instance_record_t* record, const u32* frame_numbers, i32 frame_count,
+		const archive_frame_representation_t* representation, size_t* size);
 bool archive_instance_provider_get_frame(const archive_repository_t* repository,
 		const archive_instance_record_t* record, u32 one_based_frame,
 		const archive_frame_representation_t* representation,

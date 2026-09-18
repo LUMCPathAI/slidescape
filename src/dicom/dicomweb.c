@@ -279,6 +279,113 @@ bool dicomweb_parse_instance_metadata(const char* json, size_t json_size,
 	return valid;
 }
 
+static bool compact_u32(struct json_value_s* value, u32* out) {
+	if (!value || value->type != json_type_number) return false;
+	const char* text = ((struct json_number_s*)value->payload)->number;
+	if (*text < '0' || *text > '9') return false;
+	char* end = NULL;
+	unsigned long long number = strtoull(text, &end, 10);
+	if (*end || number > UINT32_MAX) return false;
+	*out = (u32)number;
+	return true;
+}
+
+static bool compact_string(struct json_object_s* object, const char* key,
+		char* out, size_t capacity, bool uid) {
+	struct json_value_s* value = object_get(object, key);
+	if (!value || value->type != json_type_string) return false;
+	struct json_string_s* string = value->payload;
+	if (!string->string_size || string->string_size >= capacity ||
+	    strlen(string->string) != string->string_size ||
+	    (uid && !dicomweb_is_valid_uid(string->string, string->string_size))) return false;
+	memcpy(out, string->string, string->string_size + 1);
+	return true;
+}
+
+bool dicomweb_parse_compact_metadata(const char* json, size_t json_size,
+		dicomweb_instance_metadata_t* out) {
+	if (!json || !json_size || !out) return false;
+	memset(out, 0, sizeof(*out));
+	struct json_value_s* root = json_parse_ex(json, json_size, json_parse_flags_default,
+		dicomweb_json_alloc, NULL, NULL);
+	bool success = false;
+	if (!root || root->type != json_type_object) goto done;
+	struct json_object_s* object = root->payload;
+	u32 version = 0, frame_count = 0, samples = 0;
+	if (!compact_u32(object_get(object, "version"), &version) || version != 1 ||
+	    !compact_string(object, "studyUID", out->study_instance_uid, sizeof(out->study_instance_uid), true) ||
+	    !compact_string(object, "seriesUID", out->series_instance_uid, sizeof(out->series_instance_uid), true) ||
+	    !compact_string(object, "instanceUID", out->sop_instance_uid, sizeof(out->sop_instance_uid), true) ||
+	    !compact_string(object, "imageFlavor", out->image_flavor, sizeof(out->image_flavor), false) ||
+	    strcmp(out->image_flavor, "VOLUME") != 0 ||
+	    !compact_string(object, "photometricInterpretation", out->photometric_interpretation,
+		    sizeof(out->photometric_interpretation), false) ||
+	    !compact_u32(object_get(object, "rows"), &out->rows) || !out->rows ||
+	    !compact_u32(object_get(object, "columns"), &out->columns) || !out->columns ||
+	    !compact_u32(object_get(object, "matrixRows"), &out->total_pixel_matrix_rows) || !out->total_pixel_matrix_rows ||
+	    !compact_u32(object_get(object, "matrixColumns"), &out->total_pixel_matrix_columns) || !out->total_pixel_matrix_columns ||
+	    !compact_u32(object_get(object, "samplesPerPixel"), &samples) || !samples || samples > UINT16_MAX ||
+	    !compact_u32(object_get(object, "frameCount"), &frame_count) || !frame_count) goto done;
+	out->samples_per_pixel = (u16)samples;
+	out->number_of_frames = frame_count;
+	struct json_value_s* full = object_get(object, "tiledFull");
+	if (!full || (full->type != json_type_true && full->type != json_type_false)) goto done;
+	out->is_tiled_full = full->type == json_type_true;
+	struct json_value_s* mpp = object_get(object, "mpp");
+	if (!mpp || mpp->type != json_type_array) goto done;
+	struct json_array_s* spacing = mpp->payload;
+	if (spacing->length != 2) goto done;
+	const char* x = scalar_string(spacing->start->value);
+	const char* y = scalar_string(spacing->start->next->value);
+	if (!x || !y) goto done;
+	char* x_end = NULL;
+	char* y_end = NULL;
+	out->mpp_x = (float)strtod(x, &x_end);
+	out->mpp_y = (float)strtod(y, &y_end);
+	if (x_end == x || y_end == y || *x_end || *y_end ||
+	    !isfinite(out->mpp_x) || !isfinite(out->mpp_y) || out->mpp_x < 0 || out->mpp_y < 0) goto done;
+	out->is_mpp_known = out->mpp_x > 0 && out->mpp_y > 0;
+	u64 width = ((u64)out->total_pixel_matrix_columns + out->columns - 1) / out->columns;
+	u64 height = ((u64)out->total_pixel_matrix_rows + out->rows - 1) / out->rows;
+	u64 tile_count = width * height;
+	/* Bound the expanded client map, even when a tiny response claims huge geometry. */
+	if (!tile_count || tile_count > MEGABYTES(256) / sizeof(u32) || frame_count > tile_count) goto done;
+	struct json_value_s* runs_value = object_get(object, "runs");
+	if (!runs_value || runs_value->type != json_type_array) goto done;
+	struct json_array_s* runs = runs_value->payload;
+	if (out->is_tiled_full && (frame_count != tile_count || runs->length)) goto done;
+	out->frame_numbers = calloc((size_t)tile_count, sizeof(u32));
+	if (!out->frame_numbers) goto done;
+	out->frame_map_count = (u32)tile_count;
+	if (out->is_tiled_full) {
+		for (u32 i = 0; i < frame_count; ++i) out->frame_numbers[i] = i + 1;
+	} else {
+		u64 next_frame = 1;
+		for (struct json_array_element_s* run = runs->start; run; run = run->next) {
+			if (run->value->type != json_type_array) goto done;
+			struct json_array_s* values = run->value->payload;
+			if (values->length != 3) goto done;
+			u32 tile = 0, first = 0, count = 0;
+			if (!compact_u32(values->start->value, &tile) ||
+			    !compact_u32(values->start->next->value, &first) ||
+			    !compact_u32(values->start->next->next->value, &count) || !count ||
+			    first != next_frame || (u64)tile + count > tile_count ||
+			    next_frame + count > (u64)frame_count + 1) goto done;
+			for (u32 i = 0; i < count; ++i) {
+				if (out->frame_numbers[tile + i]) goto done;
+				out->frame_numbers[tile + i] = first + i;
+			}
+			next_frame += count;
+		}
+		if (next_frame != (u64)frame_count + 1) goto done;
+	}
+	success = true;
+done:
+	free(root);
+	if (!success) dicomweb_instance_metadata_destroy(out);
+	return success;
+}
+
 void dicomweb_instance_metadata_destroy(dicomweb_instance_metadata_t* metadata) {
 	if (!metadata) return;
 	free(metadata->frame_numbers);
@@ -432,8 +539,15 @@ i32 dicomweb_count_series_refs(const char* json, size_t json_size) {
 static const u8* find_bytes(const u8* haystack, size_t haystack_size,
                             const char* needle, size_t needle_size) {
 	if (!needle_size || needle_size > haystack_size) return NULL;
-	for (size_t i = 0; i <= haystack_size - needle_size; ++i) {
-		if (memcmp(haystack + i, needle, needle_size) == 0) return haystack + i;
+	const u8* cursor = haystack;
+	const u8* last = haystack + haystack_size - needle_size;
+	while (cursor <= last) {
+		/* Compressed pixels seldom contain the first boundary byte. Let libc
+		 * skip them in bulk instead of comparing at every byte of every tile. */
+		cursor = memchr(cursor, (u8)needle[0], (size_t)(last - cursor) + 1);
+		if (!cursor) return NULL;
+		if (memcmp(cursor, needle, needle_size) == 0) return cursor;
+		++cursor;
 	}
 	return NULL;
 }

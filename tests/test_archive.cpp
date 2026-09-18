@@ -1775,6 +1775,8 @@ TEST_CASE("archive metadata preserves sparse dimensions provenance and concatena
 	archive_shell_instance_t instance = {};
 	REQUIRE(archive_shell_get_instance(&shell, 0, &instance));
 	CHECK(instance.has_image_type);
+	size_t compact_size = 0;
+	CHECK_FALSE(archive_metadata_write_compact(&shell, &instance, NULL, ARCHIVE_MAX_METADATA_SIZE, &compact_size));
 	CHECK_FALSE(instance.is_image_original);
 	CHECK(instance.is_image_resampled);
 	u64 capacity = 0;
