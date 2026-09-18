@@ -14,10 +14,11 @@ for Windows, Linux and macOS.
 The viewer has built-in support for:
 * Tiled TIFF and BigTIFF (including generic and Philips TIFF variants).
 * Philips iSyntax.
-* Simple images (JPEG, PNG).
+* 3DHISTECH/MIRAX (.mrxs).
 * DICOM.
+* Simple images (JPEG, PNG).
 
-If OpenSlide is present, the Aperio, Hamamatsu, Leica, MIRAX, Sakura, Trestle, and Ventana formats can additionally be loaded.
+If OpenSlide is present, the Aperio, Hamamatsu, Leica, Sakura, Trestle, and Ventana formats can additionally be loaded.
 
 ### Viewing options
 

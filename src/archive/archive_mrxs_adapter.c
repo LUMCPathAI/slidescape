@@ -171,8 +171,8 @@ bool archive_mrxs_adapter_open(archive_mrxs_adapter_t* adapter,
 			size_t bytes = MIN(entry->length, KILOBYTES(64));
 			valid_headers = entry->file < (u32)adapter->slide.dat_count &&
 				entry->length <= ARCHIVE_MRXS_MAX_FRAME_SIZE &&
-				file_handle_read_at_offset(header, adapter->slide.dat_file_handles[entry->file],
-					entry->offset, bytes) == bytes &&
+				source_file_read(adapter->slide.dat_files + entry->file,
+					entry->offset, header, bytes) == SOURCE_READ_OK &&
 				jpeg_validate_baseline_ycbcr_header(header, (u32)bytes, level->tile_width, level->tile_height);
 		}
 	}
@@ -473,16 +473,15 @@ bool archive_mrxs_adapter_get_jpeg_tile(archive_mrxs_adapter_t* adapter,
 	mrxs_hier_entry_t entry =
 		level->tiles[tile_index].hier_entry;
 	if (entry.length) {
-		if (!adapter->slide.dat_file_handles ||
+		if (!adapter->slide.dat_files ||
 		    entry.file >= (u32)adapter->slide.dat_count ||
 		    entry.length > ARCHIVE_MRXS_MAX_FRAME_SIZE)
 			return false;
 		u8* jpeg = malloc(entry.length);
 		if (!jpeg) return false;
-		size_t read = file_handle_read_at_offset(
-			jpeg, adapter->slide.dat_file_handles[entry.file],
-			entry.offset, entry.length);
-		if (read != entry.length || entry.length < 4 ||
+		source_read_result_t read = source_file_read(adapter->slide.dat_files + entry.file,
+			entry.offset, jpeg, entry.length);
+		if (read != SOURCE_READ_OK || entry.length < 4 ||
 		    jpeg[0] != 0xff || jpeg[1] != 0xd8) {
 			free(jpeg);
 			archive_mrxs_set_error(

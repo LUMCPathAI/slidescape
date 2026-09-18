@@ -32,18 +32,17 @@
 
 
 
-static file_stream_t open_file_in_directory(const char* dirname, const char* filename) {
-    char buffer[512];
-    snprintf(buffer, sizeof(buffer), "%s" PATH_SEP "%s.ini", dirname, filename);
-    buffer[sizeof(buffer)-1] = '\0';
-    return file_stream_open_for_reading(buffer);
+static bool mrxs_source_path(char* path, size_t capacity, const char* directory, const char* name) {
+	if (!directory || !name) return false;
+	int length = snprintf(path, capacity, "%s%s%s", directory, *directory ? "/" : "", name);
+	return length >= 0 && (size_t)length < capacity;
 }
 
-static mem_t* read_entire_file_in_directory(const char* dirname, const char* filename) {
-    char buffer[512];
-    snprintf(buffer, sizeof(buffer), "%s" PATH_SEP "%s", dirname, filename);
-    buffer[sizeof(buffer)-1] = '\0';
-    return platform_read_entire_file(buffer);
+static mem_t* mrxs_read_metadata(source_fs_t* source, const char* directory, const char* name) {
+	char path[SOURCE_PATH_CAPACITY];
+	if (!mrxs_source_path(path, sizeof(path), directory, name)) return NULL;
+	/* Parser inputs are resident metadata, unlike tile data. */
+	return source_fs_read_entire(source, path, GIGABYTES(1));
 }
 
 static void mrxs_slidedat_ini_parse_section_name(mrxs_t* mrxs, char* section_name, enum mrxs_section_enum* section, i32* layer, i32* level) {
@@ -541,15 +540,15 @@ bool mrxs_read_nonhier_first_entry(mem_t* index_dat, mrxs_nonhier_entry_t* out_e
 bool mrxs_load_slide_position_file(mrxs_t* mrxs) {
     mrxs_nonhier_entry_t entry = mrxs->stitching_intensity_layer_entry;
     bool success = false;
-    if (entry.length == 0 || !mrxs->dat_file_handles) {
+    if (entry.length == 0 || !mrxs->dat_files || entry.file >= (u32)mrxs->dat_count) {
         return false;
     }
-    file_handle_t file_handle = mrxs->dat_file_handles[entry.file];
-    if (file_handle) {
+    const source_file_t* file = mrxs->dat_files + entry.file;
+    if (file->blob) {
         temp_memory_t temp = begin_temp_memory_on_local_thread();
         u8* compressed_data = (u8*)arena_push_size(temp.arena, entry.length);
-        size_t bytes_read = file_handle_read_at_offset(compressed_data, file_handle, entry.offset, entry.length);
-        if (bytes_read == entry.length) {
+        source_read_result_t read = source_file_read(file, entry.offset, compressed_data, entry.length);
+        if (read == SOURCE_READ_OK) {
             size_t out_len = 0;
             int flags = TINFL_FLAG_PARSE_ZLIB_HEADER;
             mrxs_slide_position_t* position_file = tinfl_decompress_mem_to_heap(compressed_data, entry.length, &out_len, flags);
@@ -669,15 +668,17 @@ static bool mrxs_prepare_overlap_geometry(mrxs_t* mrxs) {
     return true;
 }
 
-bool mrxs_open_from_directory(mrxs_t* mrxs, file_info_t* file, directory_info_t* directory) {
+bool mrxs_open_from_source(mrxs_t* mrxs, source_fs_t* source, const char* directory) {
     bool success = false;
+	mrxs->source = source;
+	if (!source || !directory) return false;
 
 	i64 start = get_clock();
-    mem_t* slidedat_ini = read_entire_file_in_directory(file->full_filename, "Slidedat.ini");
+    mem_t* slidedat_ini = mrxs_read_metadata(source, directory, "Slidedat.ini");
 
     if (slidedat_ini) {
         if (mrxs_parse_slidedat_ini(mrxs, slidedat_ini)) {
-            mem_t* index_dat = read_entire_file_in_directory(file->full_filename, mrxs->index_dat_filename);
+            mem_t* index_dat = mrxs_read_metadata(source, directory, mrxs->index_dat_filename);
 	        if (index_dat) {
 		        i64 index_parse_start = get_clock();
 		        char version[6] = {};
@@ -811,25 +812,21 @@ bool mrxs_open_from_directory(mrxs_t* mrxs, file_info_t* file, directory_info_t*
 
 	if (success) {
 		ASSERT(mrxs->dat_filenames && mrxs->dat_count > 0);
-		mrxs->dat_file_handles = malloc(mrxs->dat_count * sizeof(file_handle_t));
-		//TODO: measure performance, maybe move to worker threads?
+		mrxs->dat_files = calloc((size_t)mrxs->dat_count, sizeof(*mrxs->dat_files));
+		if (!mrxs->dat_files) return false;
 		for (i32 i = 0; i < mrxs->dat_count; ++i) {
-			const char* dat_filename = mrxs->dat_filenames[i];
-			char full_dat_filename[512];
-			snprintf(full_dat_filename, sizeof(full_dat_filename), "%s" PATH_SEP "%s", file->full_filename, dat_filename);
-			full_dat_filename[sizeof(full_dat_filename) - 1] = '\0';
-			file_handle_t file_handle = open_file_handle_for_simultaneous_access(full_dat_filename);
-			if (!file_handle) {
+			char path[SOURCE_PATH_CAPACITY];
+			if (!mrxs_source_path(path, sizeof(path), directory, mrxs->dat_filenames[i]) ||
+				!source_fs_open_file(source, path, mrxs->dat_files + i)) {
 				success = false;
-				console_print_error("Error: Could not open file for asynchronous I/O: %s\n", dat_filename);
+				console_print_error("Could not open MRXS data member: %s\n", mrxs->dat_filenames[i]);
 				break;
 			}
-			mrxs->dat_file_handles[i] = file_handle;
 		}
 
         console_print_verbose("Opening file handles to %d dat files took %g seconds.\n", mrxs->dat_count, get_seconds_elapsed(clock_index_loaded, get_clock()));
 
-        if (mrxs->has_overlapping_tiles) {
+        if (success && mrxs->has_overlapping_tiles) {
             // Load the slide position file
             if (mrxs_load_slide_position_file(mrxs)) {
                 mrxs_prepare_overlap_geometry(mrxs);
@@ -840,6 +837,49 @@ bool mrxs_open_from_directory(mrxs_t* mrxs, file_info_t* file, directory_info_t*
     }
 
     return success;
+}
+
+bool mrxs_open_from_directory(mrxs_t* mrxs, file_info_t* file, directory_info_t* directory) {
+	(void)directory;
+	return mrxs_open_from_source(mrxs, source_fs_open_directory(file->full_filename), "");
+}
+
+typedef struct mrxs_discovery_t {
+	source_fs_t* source;
+	char directory[SOURCE_PATH_CAPACITY];
+	u32 count;
+} mrxs_discovery_t;
+
+static bool mrxs_discover_entry(void* context, const source_entry_t* entry) {
+	mrxs_discovery_t* discovery = context;
+	if (entry->is_directory) return source_fs_list(discovery->source, entry->path, mrxs_discover_entry, discovery);
+	const char* leaf = strrchr(entry->path, '/');
+	leaf = leaf ? leaf + 1 : entry->path;
+	if (!strcasecmp(leaf, "Slidedat.ini")) {
+		++discovery->count;
+		size_t length = leaf == entry->path ? 0 : (size_t)(leaf - entry->path - 1);
+		memcpy(discovery->directory, entry->path, length);
+		discovery->directory[length] = 0;
+	}
+	return discovery->count <= 1;
+}
+
+bool mrxs_open_from_zip(mrxs_t* mrxs, const char* filename, char* error, size_t capacity) {
+	source_fs_t* source = source_fs_open_zip(filename, error, capacity);
+	if (!source) return false;
+	mrxs_discovery_t discovery = {0};
+	discovery.source = source;
+	bool scanned = source_fs_list(source, "", mrxs_discover_entry, &discovery);
+	if (!scanned || discovery.count != 1) {
+		if (error && capacity) snprintf(error, capacity, "%s", discovery.count > 1 ?
+			"ZIP contains multiple MRXS slides; selecting a slide is not supported yet" :
+			"ZIP does not contain a discoverable MRXS slide (Slidedat.ini)");
+		source_fs_close(source);
+		return false;
+	}
+	bool success = mrxs_open_from_source(mrxs, source, discovery.directory);
+	if (!success && error && capacity) snprintf(error, capacity, "Could not open MRXS members in ZIP");
+	return success;
 }
 
 u8* mrxs_decode_image_to_bgra(u8* compressed_data, size_t compressed_length, enum mrxs_image_format_enum image_format,
@@ -901,18 +941,18 @@ u8* mrxs_decode_image_to_bgra(u8* compressed_data, size_t compressed_length, enu
 }
 
 u8* mrxs_decode_simple_image_to_rgba(mrxs_t* mrxs, mrxs_simple_image_t* image) {
-    if (!mrxs || !image || image->entry.length == 0 || !mrxs->dat_file_handles || image->entry.file >= mrxs->dat_count ||
+    if (!mrxs || !image || image->entry.length == 0 || !mrxs->dat_files || image->entry.file >= mrxs->dat_count ||
         image->width <= 0 || image->height <= 0) {
         return NULL;
     }
 
     u8* result = NULL;
-    file_handle_t file_handle = mrxs->dat_file_handles[image->entry.file];
-    if (file_handle) {
+    const source_file_t* file = mrxs->dat_files + image->entry.file;
+    if (file->blob) {
         temp_memory_t temp = begin_temp_memory_on_local_thread();
         u8* compressed_data = (u8*)arena_push_size(temp.arena, image->entry.length);
-        size_t bytes_read = file_handle_read_at_offset(compressed_data, file_handle, image->entry.offset, image->entry.length);
-        if (bytes_read == image->entry.length) {
+        source_read_result_t read = source_file_read(file, image->entry.offset, compressed_data, image->entry.length);
+        if (read == SOURCE_READ_OK) {
             i32 width = 0;
             i32 height = 0;
             i32 channels_in_file = 0;
@@ -938,13 +978,13 @@ static u8* mrxs_decode_stored_tile_to_bgra(mrxs_t* mrxs, i32 level, i32 stored_t
     if (stored_tile_index >= 0 && stored_tile_index < mrxs_level->width_in_tiles * mrxs_level->height_in_tiles) {
         mrxs_tile_t* tile = mrxs_level->tiles + stored_tile_index;
         mrxs_hier_entry_t hier_entry = tile->hier_entry;
-        if (mrxs->dat_file_handles && hier_entry.length > 0 && hier_entry.file < mrxs->dat_count) {
-            file_handle_t file_handle = mrxs->dat_file_handles[hier_entry.file];
-            if (file_handle) {
+        if (mrxs->dat_files && hier_entry.length > 0 && hier_entry.file < mrxs->dat_count) {
+            const source_file_t* file = mrxs->dat_files + hier_entry.file;
+            if (file->blob) {
                 temp_memory_t temp = begin_temp_memory_on_local_thread();
                 u8* compressed_tile_data = (u8*)arena_push_size(temp.arena, hier_entry.length);
-                size_t bytes_read = file_handle_read_at_offset(compressed_tile_data, file_handle, hier_entry.offset, hier_entry.length);
-                if (bytes_read == hier_entry.length) {
+                source_read_result_t read = source_file_read(file, hier_entry.offset, compressed_tile_data, hier_entry.length);
+                if (read == SOURCE_READ_OK) {
                     result = mrxs_decode_image_to_bgra(compressed_tile_data, hier_entry.length, mrxs_level->image_format,
                                                        mrxs_level->tile_width, mrxs_level->tile_height);
                 }
@@ -1490,15 +1530,8 @@ void mrxs_destroy(mrxs_t* mrxs) {
 			}
 		}
 	}
-	if (mrxs->dat_file_handles) {
-		for (i32 i = 0; i < mrxs->dat_count; ++i) {
-			file_handle_t file_handle = mrxs->dat_file_handles[i];
-			if (file_handle) {
-				file_handle_close(file_handle);
-			}
-		}
-		free(mrxs->dat_file_handles);
-	}
+	free(mrxs->dat_files);
+	source_fs_close(mrxs->source);
 	memrw_destroy(&mrxs->string_pool);
 	if (mrxs->dat_filenames) {
 		free(mrxs->dat_filenames);

@@ -309,6 +309,9 @@ prepend_path(KEYCODE_SOURCE_FILES deps/keycode)
 
 set(SLIDESCAPE_NONGUI_BASE_FILES
         src/platform/platform.c
+        src/platform/source_io.c
+        src/platform/source_zip.c
+        src/platform/source_fs.c
         src/platform/work_queue.c
         src/platform/openslide_api.c
         src/utils/stringutils.c
@@ -333,7 +336,7 @@ set(SLIDESCAPE_NONGUI_BASE_FILES
         src/third_party/lz4.c
         src/third_party/yxml.c
         src/third_party/minfft.c
-        src/third_party/miniz_tinfl.c
+        src/third_party/miniz.c
         src/third_party/http_parser.c
         src/third_party/ltalloc.cc
         src/tiff/tiff.c

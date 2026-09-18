@@ -23,7 +23,8 @@ extern "C" {
 #endif
 
 #include "common.h"
-#include "platform.h" // for file_handle_t
+#include "platform.h"
+#include "source_fs.h"
 
 enum mrxs_section_enum {
     MRXS_SECTION_UNKNOWN = 0,
@@ -189,7 +190,8 @@ typedef struct mrxs_t {
     memrw_t string_pool; // NOTE: need destroy
     const char* index_dat_filename;
     const char** dat_filenames; // NOTE: need free
-	file_handle_t* dat_file_handles; // NOTE: need free
+	source_file_t* dat_files; // Borrowed views owned by source.
+	source_fs_t* source; // Closed after tile workers and views are released.
     i32 dat_count;
     i32 hier_count;
     i32 nonhier_count;
@@ -242,6 +244,9 @@ typedef struct mrxs_t {
 typedef struct file_info_t file_info_t;
 typedef struct directory_info_t directory_info_t;
 
+/* Takes ownership of source, also on failure; release through mrxs_destroy(). */
+bool mrxs_open_from_source(mrxs_t* mrxs, source_fs_t* source, const char* directory);
+bool mrxs_open_from_zip(mrxs_t* mrxs, const char* filename, char* error, size_t error_capacity);
 bool mrxs_open_from_directory(mrxs_t* mrxs, file_info_t* file, directory_info_t* directory);
 void mrxs_init_runtime_cache(mrxs_t* mrxs);
 u8* mrxs_decode_simple_image_to_rgba(mrxs_t* mrxs, mrxs_simple_image_t* image);

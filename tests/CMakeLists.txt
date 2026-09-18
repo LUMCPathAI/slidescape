@@ -7,6 +7,7 @@ add_executable(slidescape_tests
         test_http_response_parser.cpp
         test_http_request.cpp
         test_mathutils.cpp
+        test_source_io.cpp
         test_memrw.cpp
         test_stb_sprintf.cpp
         test_slide_score.cpp

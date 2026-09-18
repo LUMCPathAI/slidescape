@@ -175,6 +175,8 @@ static viewer_file_type_enum viewer_determine_file_type(file_info_t* file) {
 			return VIEWER_FILE_TYPE_DICOM;
 		} else if (strcasecmp(file->ext, "isyntax") == 0 || strcasecmp(file->ext, "i2syntax") == 0) {
 			return VIEWER_FILE_TYPE_ISYNTAX;
+		} else if (strcasecmp(file->ext, "zip") == 0) {
+			return VIEWER_FILE_TYPE_ZIP;
 		} else if (strcasecmp(file->ext, "mrxs") == 0) {
 			return VIEWER_FILE_TYPE_MRXS;
 		} else {
@@ -228,6 +230,7 @@ file_info_t viewer_get_file_info(const char* filename) {
 						case VIEWER_FILE_TYPE_OPENSLIDE_COMPATIBLE:
 							file.is_openslide_compatible = true;
 							// fallthrough
+						case VIEWER_FILE_TYPE_ZIP:
 						case VIEWER_FILE_TYPE_SIMPLE_IMAGE:
 						case VIEWER_FILE_TYPE_DICOM:
 						case VIEWER_FILE_TYPE_ISYNTAX:
@@ -368,7 +371,17 @@ image_t* image_load_from_file(file_info_t* file, directory_info_t* directory, im
 		memcpy(image->directory, filename, ATMOST(directory_len, sizeof(image->directory)));
 	}
 
-	if (file->type == VIEWER_FILE_TYPE_SIMPLE_IMAGE) {
+	if (file->type == VIEWER_FILE_TYPE_ZIP) {
+		mrxs_t mrxs = {0};
+		mrxs_set_thread_pool(&mrxs, options->thread_pool);
+		char error[256] = {0};
+		if (mrxs_open_from_zip(&mrxs, filename, error, sizeof(error))) {
+			init_image_from_mrxs(image, &mrxs, is_overlay);
+		} else {
+			mrxs_destroy(&mrxs);
+			console_print_error("Could not open ZIP slide: %s\n", error);
+		}
+	} else if (file->type == VIEWER_FILE_TYPE_SIMPLE_IMAGE) {
 		// Load using stb_image
 		image->type = IMAGE_TYPE_WSI;
 		image->backend = IMAGE_BACKEND_STBI;
