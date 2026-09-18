@@ -918,6 +918,27 @@ static bool archive_ingest_mrxs(const archive_repository_t* repository,
 	return success;
 }
 
+static bool archive_ingest_owned_zip(const archive_repository_t* repository,
+		const archive_object_t* object, bool validate_contents, archive_ingest_result_t* result,
+		char* error, size_t error_capacity) {
+	char owned_path[ARCHIVE_PATH_CAPACITY];
+	archive_zip_kind_t kind;
+	if (!archive_ingest_object_path(repository, object, owned_path, sizeof(owned_path)) ||
+		!archive_zip_inspect(owned_path, validate_contents, &kind, error, error_capacity)) return false;
+	return kind == ARCHIVE_ZIP_MRXS ?
+		archive_ingest_mrxs(repository, owned_path, object, result, error, error_capacity) :
+		archive_dicom_zip_ingest(repository, object, owned_path, result, error, error_capacity);
+}
+
+bool archive_ingest_capture_directory(const archive_repository_t* repository,
+		const char* source_path, archive_ingest_result_t* result, char* error, size_t error_capacity) {
+	if (result) memset(result, 0, sizeof(*result));
+	if (error && error_capacity) error[0] = 0;
+	archive_object_t object = {0};
+	return archive_zip_capture_directory(repository, source_path, &object, error, error_capacity) &&
+		archive_ingest_owned_zip(repository, &object, false, result, error, error_capacity);
+}
+
 bool archive_ingest_path(const archive_repository_t* repository,
 		const char* source_path, bool reference_source,
 		archive_ingest_result_t* result, char* error,
@@ -945,13 +966,7 @@ bool archive_ingest_path(const archive_repository_t* repository,
 		bool success = is_zip ? archive_object_import_file(repository, source_path, "application/zip", &object,
 			error, error_capacity) == ARCHIVE_OBJECT_OK :
 			archive_zip_capture_mrxs(repository, source_path, &object, error, error_capacity);
-		char owned_path[ARCHIVE_PATH_CAPACITY];
-		if (success) success = archive_ingest_object_path(repository, &object, owned_path, sizeof(owned_path));
-		archive_zip_kind_t kind = ARCHIVE_ZIP_MRXS;
-		if (success && is_zip) success = archive_zip_validate(owned_path, &kind, error, error_capacity);
-		if (success) success = kind == ARCHIVE_ZIP_MRXS ?
-			archive_ingest_mrxs(repository, owned_path, &object, result, error, error_capacity) :
-			archive_dicom_zip_ingest(repository, &object, owned_path, result, error, error_capacity);
+		if (success) success = archive_ingest_owned_zip(repository, &object, is_zip, result, error, error_capacity);
 		return success;
 	}
 	return archive_ingest_part10_path(repository, source_path, reference_source, result, error, error_capacity);

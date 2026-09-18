@@ -4,6 +4,8 @@ import concurrent.futures
 import http.client
 import hashlib
 import json
+import os
+import shutil
 from pathlib import Path
 import socket
 import sqlite3
@@ -232,10 +234,10 @@ def main(binary, exercise_deadline=False):
         print('Synthetic archive ingest/publication/HTTP regressions passed.')
 
 
-def test_dicom_zip(binary):
+def test_dicom_zip(binary, capture_directory=False):
     with tempfile.TemporaryDirectory(prefix='slidescape-dicom-zip-') as temp:
         root = Path(temp)
-        repository = root / 'repository'
+        repository = root / 'source-repository'
         a_path, b_path, c_path = [root / name for name in ('a.dcm', 'b.dcm', 'c.dcm')]
         a = write_slide(a_path, 1)
         b = write_slide(b_path, 2, series=201, sparse=True)
@@ -252,8 +254,40 @@ def test_dicom_zip(binary):
             bundle.writestr('empty/', b'')
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
         run(binary, 'init', repository)
-        run(binary, 'ingest', repository, '--source', source)
-        run(binary, 'ingest', repository, '--source', source)
+        tree = root / 'source'
+        ingest_source, options = source, []
+        expected = {}
+        if capture_directory:
+            # The chosen directory becomes the ZIP root; unrelated siblings stay outside.
+            expected = {'nested/a': a_path.read_bytes(), 'nested/b': b_path.read_bytes(),
+                        'other/c': c_path.read_bytes(), '.sidecar': b'original metadata',
+                        '.hidden/notes.txt': b'hidden', 'métadonnées.txt': b'UTF-8 path', 'zero': b''}
+            for name, data in expected.items():
+                target = tree / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            (tree / 'empty').mkdir()
+            ingest_source, options = tree, ['--zip-directory']
+            for arguments in [options, ['--source', tree, *options, '--reference'],
+                              ['--source', source, *options], ['--source', a_path, *options],
+                              ['--source', tree / 'empty', *options]]:
+                run(binary, 'ingest', repository, *arguments, success=False)
+            if os.name != 'nt':
+                alias = root / 'tree-link'
+                alias.symlink_to(tree, target_is_directory=True)
+                run(binary, 'ingest', repository, '--source', str(alias) + '/', *options, success=False)
+                alias.unlink()
+            for containing in (root, repository):
+                failed = run(binary, 'ingest', repository, '--source', containing, *options, success=False)
+                assert 'destination repository' in failed.stderr, failed.stderr
+        run(binary, 'ingest', repository, '--source', ingest_source, *options)
+        if capture_directory:
+            # Timestamps and the source root's name are not part of the capture identity.
+            os.utime(tree / 'nested/a', (1000000000, 1000000000))
+            renamed = root / 'renamed-source'
+            tree.rename(renamed)
+            ingest_source = tree = renamed
+        run(binary, 'ingest', repository, '--source', ingest_source, *options)
         with sqlite3.connect(repository / 'archive.sqlite3') as database:
             scalar = lambda sql: database.execute(sql).fetchone()[0]
             assert scalar('SELECT COUNT(*) FROM publication') == 2
@@ -261,10 +295,30 @@ def test_dicom_zip(binary):
             assert scalar('SELECT COUNT(*) FROM bundle') == 1
             assert scalar('SELECT COUNT(*) FROM bundle_object') == 1
             assert scalar("SELECT COUNT(*) FROM object WHERE media_type='application/dicom'") == 0
-            assert scalar('SELECT bundle_digest FROM bundle') == digest
             key = scalar("SELECT storage_key FROM object WHERE media_type='application/zip'")
             shells = [repository / row[0] for row in database.execute(
                 "SELECT storage_key FROM object WHERE media_type='application/vnd.slidescape.virtual-dicom-shell'")]
+            if capture_directory:
+                digest = hashlib.sha256((repository / key).read_bytes()).hexdigest()
+                with zipfile.ZipFile(repository / key) as captured:
+                    assert captured.testzip() is None
+                    assert all(info.compress_type == zipfile.ZIP_STORED for info in captured.infolist())
+                    assert captured.namelist() == sorted(captured.namelist())
+                    directories = {'nested/', 'other/', '.hidden/', 'empty/'}
+                    assert set(captured.namelist()) == set(expected) | directories
+                    for name, data in expected.items():
+                        assert captured.read(name) == data, name
+                # Changed tree: reject replacement and do not partially publish a new series.
+                write_slide(tree / 'new-instance', 5, series=200)
+                run(binary, 'ingest', repository, '--source', tree, *options, success=False)
+                (tree / 'new-instance').unlink()
+                if os.name != 'nt':
+                    (tree / 'link').symlink_to(a_path)
+                    failed = run(binary, 'ingest', repository, '--source', tree, *options, success=False)
+                    assert 'links' in failed.stderr, failed.stderr
+                    (tree / 'link').unlink()
+                assert not list((repository / 'staging').iterdir())
+            assert scalar("SELECT bundle_digest FROM bundle WHERE state='PUBLISHED'") == digest
             # Reject incomplete member payloads even when later ZIP bytes are available.
             write_slide(c_path, 4, truncated=True)
             damaged = root / 'damaged.zip'
@@ -291,6 +345,8 @@ def test_dicom_zip(binary):
             assert scalar('SELECT COUNT(*) FROM publication') == 2
             assert scalar('SELECT COUNT(*) FROM instance') == 3
         source.unlink()
+        if capture_directory:
+            shutil.rmtree(tree)
         for path in (a_path, b_path, c_path):
             path.unlink()
         owned = repository / key
@@ -354,9 +410,10 @@ def test_dicom_zip(binary):
                 except subprocess.TimeoutExpired:
                     server.kill()
                     server.wait()
-        print('DICOM ZIP ownership, publication, ordered frames, concurrency, and shell repair passed.')
+        print(f'DICOM ZIP ownership, publication, ordered frames, concurrency, and shell repair passed (capture={capture_directory}).')
 
 
 if __name__ == '__main__':
     main(str(Path(sys.argv[1]).resolve()), '--slow' in sys.argv[2:])
     test_dicom_zip(str(Path(sys.argv[1]).resolve()))
+    test_dicom_zip(str(Path(sys.argv[1]).resolve()), capture_directory=True)

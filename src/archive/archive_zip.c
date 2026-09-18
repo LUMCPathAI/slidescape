@@ -71,55 +71,118 @@ static int archive_zip_compare(const void* a, const void* b) {
 	return strcmp((*(archive_zip_member_t* const*)a)->path, (*(archive_zip_member_t* const*)b)->path);
 }
 
-static bool archive_zip_capture_mrxs_internal(const archive_repository_t* repository, const char* path,
-		archive_object_t* object, char* error, size_t capacity) {
-	char resolved[ARCHIVE_PATH_CAPACITY];
-	bool is_directory = false;
+static void archive_zip_trim_trailing_separators(char* path) {
+	size_t length = strlen(path);
+	while (length > 1 && (path[length-1] == '/' || path[length-1] == '\\') &&
+		path[length-2] != ':') path[--length] = 0;
+}
+
+/* Canonical paths also make the repository-containment check work through parent aliases. */
+static bool archive_zip_resolve_path(const char* path, char resolved[ARCHIVE_PATH_CAPACITY],
+		bool* is_directory) {
+	if (!path || !*path || strlen(path) >= ARCHIVE_PATH_CAPACITY) return false;
+	char input[ARCHIVE_PATH_CAPACITY];
+	strcpy(input, path);
+	/* lstat("link/") follows the link; inspect the selected entry itself. */
+	archive_zip_trim_trailing_separators(input);
+	path = input;
 #if WINDOWS
 	wchar_t wide[ARCHIVE_PATH_CAPACITY], absolute[ARCHIVE_PATH_CAPACITY];
 	if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, (sizeof(wide) / sizeof(*wide)))) return false;
 	DWORD attributes = GetFileAttributesW(wide);
-	DWORD length = GetFullPathNameW(wide, (sizeof(absolute) / sizeof(*absolute)), absolute, NULL);
-	if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) || !length || length >= (sizeof(absolute) / sizeof(*absolute)) ||
-		!WideCharToMultiByte(CP_UTF8, 0, absolute, -1, resolved, sizeof(resolved), NULL, NULL)) return false;
-	is_directory = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+	if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return false;
+	HANDLE handle = CreateFileW(wide, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+	if (handle == INVALID_HANDLE_VALUE) return false;
+	DWORD length = GetFinalPathNameByHandleW(handle, absolute, (sizeof(absolute) / sizeof(*absolute)), FILE_NAME_NORMALIZED);
+	CloseHandle(handle);
+	if (!length || length >= (sizeof(absolute) / sizeof(*absolute))) return false;
+	/* The namespace uses ordinary DOS/UNC paths and may join with forward slashes;
+	   those joins are not valid under the extended-path prefix returned here. */
+	wchar_t* normalized = absolute;
+	if (!wcsncmp(absolute, L"\\\\?\\UNC\\", 8)) {
+		absolute[6] = L'\\';
+		normalized = absolute + 6;
+	} else if (!wcsncmp(absolute, L"\\\\?\\", 4)) normalized = absolute + 4;
+	if (!WideCharToMultiByte(CP_UTF8, 0, normalized, -1, resolved, ARCHIVE_PATH_CAPACITY, NULL, NULL)) return false;
+	*is_directory = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 #else
 	struct stat info;
 	if (lstat(path, &info) != 0 || S_ISLNK(info.st_mode)) return false;
 	char* absolute = realpath(path, NULL);
 	if (!absolute) return false;
-	bool fits = strlen(absolute) < sizeof(resolved);
+	bool fits = strlen(absolute) < ARCHIVE_PATH_CAPACITY;
 	if (fits) strcpy(resolved, absolute);
 	free(absolute);
 	if (!fits) return false;
-	is_directory = S_ISDIR(info.st_mode);
+	*is_directory = S_ISDIR(info.st_mode);
 #endif
-	size_t resolved_length = strlen(resolved);
-	while (resolved_length > 1 && (resolved[resolved_length-1] == '/' || resolved[resolved_length-1] == '\\') &&
-		!(resolved_length == 3 && resolved[1] == ':')) resolved[--resolved_length] = 0;
-	char* extension = strrchr(resolved, '.');
-	if (!is_directory && extension && !strcasecmp(extension, ".mrxs")) *extension = 0;
-	char* name = resolved;
-	for (char* at = resolved; *at; ++at) if (*at == '/' || *at == '\\') name = at + 1;
-	if (name == resolved || !*name) return false;
-	char directory[SOURCE_PATH_CAPACITY];
-	if (strlen(name) >= sizeof(directory)) return false;
-	strcpy(directory, name);
-	/* Preserve the separator for filesystem roots ("/" and "C:\\"). */
-	if (name == resolved + 1 || (name == resolved + 3 && resolved[1] == ':')) *name = 0;
-	else name[-1] = 0;
+	archive_zip_trim_trailing_separators(resolved);
+	return true;
+}
+
+typedef enum archive_zip_capture_kind_t {
+	ARCHIVE_ZIP_CAPTURE_MRXS,
+	ARCHIVE_ZIP_CAPTURE_DIRECTORY,
+} archive_zip_capture_kind_t;
+
+static bool archive_zip_capture_internal(const archive_repository_t* repository, const char* path,
+		archive_zip_capture_kind_t kind, archive_object_t* object, char* error, size_t capacity) {
+	char resolved[ARCHIVE_PATH_CAPACITY], repository_path[ARCHIVE_PATH_CAPACITY];
+	bool is_directory = false, repository_directory = false;
+	if (!repository || !object || !archive_zip_resolve_path(path, resolved, &is_directory)) return false;
+	if (kind == ARCHIVE_ZIP_CAPTURE_DIRECTORY && !is_directory) {
+		if (error && capacity) snprintf(error, capacity, "--zip-directory requires a directory source");
+		return false;
+	}
+	if (kind == ARCHIVE_ZIP_CAPTURE_MRXS && !is_directory) {
+		char* extension = strrchr(resolved, '.');
+		if (extension && !strcasecmp(extension, ".mrxs")) *extension = 0;
+	}
+	if (!archive_zip_resolve_path(repository->root, repository_path, &repository_directory) || !repository_directory) return false;
+	/* Do not capture the database and staging files that this operation will modify. */
+	size_t root_length = strlen(resolved);
+#if WINDOWS
+	bool prefix = !strncasecmp(repository_path, resolved, root_length);
+#else
+	bool prefix = !strncmp(repository_path, resolved, root_length);
+#endif
+	if (prefix && (!repository_path[root_length] || repository_path[root_length] == '/' ||
+		repository_path[root_length] == '\\' || resolved[root_length-1] == '/' || resolved[root_length-1] == '\\')) {
+		if (error && capacity) snprintf(error, capacity, "Capture source must not contain the destination repository");
+		return false;
+	}
+	char directory[SOURCE_PATH_CAPACITY] = "";
+	if (kind == ARCHIVE_ZIP_CAPTURE_MRXS) {
+		char* name = resolved;
+		for (char* at = resolved; *at; ++at) if (*at == '/' || *at == '\\') name = at + 1;
+		if (name == resolved || !*name || strlen(name) >= sizeof(directory)) return false;
+		strcpy(directory, name);
+		/* Preserve the separator for filesystem roots ("/" and "C:\\"). */
+		if (name == resolved + 1 || (name > resolved + 1 && name[-2] == ':')) *name = 0;
+		else name[-1] = 0;
+	}
 	archive_zip_capture_t capture = {0};
 	capture.root = resolved;
 	capture.error = error; capture.error_capacity = capacity;
 	capture.source = source_fs_open_directory(resolved);
-	source_entry_t entry;
-	bool success = capture.source && source_fs_stat(capture.source, directory, &entry) && entry.is_directory &&
-		archive_zip_capture_entry(&capture, &entry);
-	char thumbnail[SOURCE_PATH_CAPACITY];
-	int thumbnail_length = snprintf(thumbnail, sizeof(thumbnail), "%s.mrxs", directory);
-	if (success && thumbnail_length > 0 && (size_t)thumbnail_length < sizeof(thumbnail) &&
-		source_fs_stat(capture.source, thumbnail, &entry))
-		success = !entry.is_directory && archive_zip_capture_entry(&capture, &entry);
+	bool success = capture.source != NULL;
+	if (success && kind == ARCHIVE_ZIP_CAPTURE_DIRECTORY) {
+		success = source_fs_list(capture.source, "", archive_zip_capture_entry, &capture);
+	} else if (success) {
+		source_entry_t entry;
+		success = source_fs_stat(capture.source, directory, &entry) && entry.is_directory &&
+			archive_zip_capture_entry(&capture, &entry);
+		char thumbnail[SOURCE_PATH_CAPACITY];
+		int thumbnail_length = snprintf(thumbnail, sizeof(thumbnail), "%s.mrxs", directory);
+		if (success && thumbnail_length > 0 && (size_t)thumbnail_length < sizeof(thumbnail) &&
+			source_fs_stat(capture.source, thumbnail, &entry))
+			success = !entry.is_directory && archive_zip_capture_entry(&capture, &entry);
+	}
+	if (success && !capture.count) {
+		if (error && capacity) snprintf(error, capacity, "Capture source directory is empty");
+		success = false;
+	}
 	source_zip_input_t* inputs = NULL;
 	if (success) {
 		qsort(capture.members, capture.count, sizeof(*capture.members), archive_zip_compare);
@@ -139,22 +202,32 @@ static bool archive_zip_capture_mrxs_internal(const archive_repository_t* reposi
 		free(member->path); free(member->local_path); free(member);
 	}
 	free(inputs); free(capture.members); source_fs_close(capture.source);
-	if (!success && error && capacity && !error[0]) snprintf(error, capacity, "Could not preserve the complete MRXS bundle");
+	if (!success && error && capacity && !error[0]) snprintf(error, capacity, "Could not preserve the complete source tree");
 	return success;
 }
 
 bool archive_zip_capture_mrxs(const archive_repository_t* repository, const char* path,
 		archive_object_t* object, char* error, size_t capacity) {
 	if (error && capacity) error[0] = 0;
-	bool success = archive_zip_capture_mrxs_internal(repository, path, object, error, capacity);
+	bool success = archive_zip_capture_internal(repository, path, ARCHIVE_ZIP_CAPTURE_MRXS, object, error, capacity);
 	if (!success && error && capacity && !error[0]) snprintf(error, capacity, "Could not capture MRXS source directory");
 	return success;
 }
 
-bool archive_zip_validate(const char* path, archive_zip_kind_t* kind, char* error, size_t capacity) {
+bool archive_zip_capture_directory(const archive_repository_t* repository, const char* path,
+		archive_object_t* object, char* error, size_t capacity) {
+	if (error && capacity) error[0] = 0;
+	bool success = archive_zip_capture_internal(repository, path, ARCHIVE_ZIP_CAPTURE_DIRECTORY, object, error, capacity);
+	if (!success && error && capacity && !error[0]) snprintf(error, capacity, "Could not capture source directory");
+	return success;
+}
+
+bool archive_zip_inspect(const char* path, bool validate_contents, archive_zip_kind_t* kind,
+		char* error, size_t capacity) {
 	source_blob_t blob = {0}; source_file_t file = {0}; source_zip_t* zip = NULL;
 	bool success = source_blob_open_local(&blob, path) && source_file_view(&blob, 0, blob.size, &file) &&
-		(zip = source_zip_open(&file, error, capacity)) && source_zip_validate_contents(zip, error, capacity);
+		(zip = source_zip_open(&file, error, capacity)) &&
+		(!validate_contents || source_zip_validate_contents(zip, error, capacity));
 	if (success && kind) {
 		*kind = ARCHIVE_ZIP_DICOM;
 		for (u32 i = 0; i < source_zip_count(zip); ++i) {

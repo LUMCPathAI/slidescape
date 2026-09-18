@@ -407,6 +407,11 @@ stored in SQLite rather than copied into `objects/`; MRXS retains its bundle pat
 the inline provider recipe. Provider-cache admission avoids rehashing the WSI.
 This option is explicitly external ownership, not durable archive storage. Omit
 `--reference` for owned MRXS ZIP preservation or to import an existing MRXS/DICOM ZIP.
+Use `ingest REPOSITORY --source DIRECTORY --zip-directory` to capture the exact
+supplied tree as one immutable ZIP and publish through the same adapters. This is
+an explicit capture boundary, not a claim of acquisition completeness. Ordinary
+DICOM directory ingestion remains unchanged; incremental additions and revisions
+remain deferred. See [stored ZIP sources](zip_sources.md) for preservation details.
 
 The viewer tile-cache locking/lifetime prerequisite and bounded four-frame DICOMweb
 batching are complete. The next implementation slices are:

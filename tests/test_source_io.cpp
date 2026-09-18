@@ -649,6 +649,25 @@ TEST_CASE("archive packages the complete MRXS directory including sidecars and o
 		CHECK(strcmp(value, !strcmp(name, "slide.mrxs") ? "thumbnail" : "original") == 0);
 	}
 	source_fs_close(source); archive_index_destroy(&index);
+	// Explicit tree capture uses the selected directory as the ZIP root and does
+	// not bring in its sibling thumbnail. The same MRXS adapter admits this layout.
+	REQUIRE_MESSAGE(archive_ingest_capture_directory(&repository, folder.c_str(), &result, error, sizeof(error)), error);
+	REQUIRE(archive_index_open(&index, &repository, error, sizeof(error)));
+	REQUIRE(index.instance_count == 2);
+	bool found_root_capture = false;
+	for (i32 i = 0; i < index.instance_count; ++i) {
+		REQUIRE(archive_repository_make_path(&repository, index.instances[i].object_key, owned, sizeof(owned)));
+		source = source_fs_open_zip(owned, error, sizeof(error)); REQUIRE_MESSAGE(source, error);
+		if (source_fs_stat(source, "Slidedat.ini", &entry)) {
+			found_root_capture = true;
+			CHECK(source_fs_stat(source, "empty", &entry)); CHECK(entry.is_directory);
+			CHECK(source_fs_stat(source, ".sidecar", &entry));
+			CHECK_FALSE(source_fs_stat(source, "slide.mrxs", &entry));
+		}
+		source_fs_close(source);
+	}
+	CHECK(found_root_capture);
+	archive_index_destroy(&index);
 	// Removing the optional thumbnail leaves a valid directory-only bundle.
 	REQUIRE(remove((folder + ".mrxs").c_str()) == 0);
 	REQUIRE_MESSAGE(archive_ingest_path(&repository, folder.c_str(), false, &result, error, sizeof(error)), error);

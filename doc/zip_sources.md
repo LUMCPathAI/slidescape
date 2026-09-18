@@ -84,7 +84,8 @@ entry itself. Miniz still parses the ZIP directory and writes the container.
 
 Build with `BUILD_SLIDESCAPE_ARCHIVE=ON`. Owned MRXS ingestion accepts a thumbnail,
 its companion directory alone, or an already-created stored ZIP. DICOM ingestion
-also accepts an existing stored ZIP, with nested Part 10 members:
+also accepts an existing stored ZIP, with nested Part 10 members, or explicit
+capture of a directory tree:
 
 ```sh
 ./slidescape_archive init data/archive_repo
@@ -92,15 +93,34 @@ also accepts an existing stored ZIP, with nested Part 10 members:
 ./slidescape_archive ingest data/archive_repo --source /slides/example
 ./slidescape_archive ingest data/archive_repo --source /slides/example.zip
 ./slidescape_archive ingest data/archive_repo --source /slides/dicom-study.zip
+./slidescape_archive ingest data/archive_repo --source /slides/dicom-study --zip-directory
 ```
 
-For a directory/thumbnail, capture includes the entire companion tree, hidden
+Automatic MRXS directory/thumbnail capture includes the entire companion tree, hidden
 sidecars, empty directories, and the optional sibling thumbnail. Files are sorted
 by relative path. The writer streams into an exclusive staged file while computing
 one SHA-256, flushes it durably, then validates the captured ZIP structure and every
 member CRC. Capture keeps one input data handle open at a time and bounds its member
 list to 64 MiB. An existing ZIP is imported byte-for-byte and fully validated from
 the owned copy. Neither route creates persistent per-member content hashes.
+
+`--zip-directory` captures exactly the selected directory's contents at the ZIP
+root, preserving relative paths, nested/hidden files, empty files, and empty directories.
+It does not include the selected directory's own name or any siblings. It supports
+DICOM trees and MRXS trees through the same ZIP discovery and admission path; for
+MRXS, include the thumbnail inside the selected tree if it should be preserved.
+The flag requires `--source DIRECTORY` and cannot be combined with `--reference`.
+Without it, ordinary DICOM directory ingestion keeps its existing loose-object behavior.
+
+Capture records the supplied set at ingestion time; it makes no claim that an entire
+acquisition or pyramid was supplied. Keep the tree unchanged until capture finishes;
+this is not a filesystem snapshot. Source links/reparse points, unsupported filesystem
+entries, and trees containing the destination repository are rejected. Captured ZIPs
+receive the same full validation and atomic publication as imported ZIPs, without a
+second content scan after the writer has already validated them. Renaming the source
+root or changing timestamps alone does not change the package identity. Exact replay
+is idempotent; changes conflicting with existing DICOM publications remain rejected.
+Incremental additions, completeness tracking, and revision replacement are deferred.
 
 The ZIP hash is the bundle identity. For MRXS it is also the input to generated
 DICOM UIDs; admission uses the same supported JPEG MRXS profile as reference ingestion. Only complete,
@@ -128,9 +148,8 @@ does not silently replace its source object.
 The initial DICOM ZIP profile allows at most 4096 Part 10 members and requires every
 recognized Part 10 member to satisfy the archive's supported WSI profile. Non-WSI
 Part 10 objects, including DICOMDIR, are not currently admitted. Other sidecars and
-empty directories are preserved but are not published as DICOM instances. Loose
-DICOM files/directories retain their existing ingestion behavior; automatic ZIP
-packaging of DICOM directories is not yet implemented.
+empty directories are preserved but are not published as DICOM instances. These
+admission rules also apply to trees supplied with `--zip-directory`.
 
 DICOM ZIP recipe v1 records only the blob hash/size and selected Study/Series UIDs.
 Its Part 10 shell parameter version is 2. Native and encapsulated frame ranges are
@@ -167,8 +186,12 @@ includes multi-study/series publication, native and fragmented-JPEG frames, conc
 ordered HTTP frame requests, replay/conflict rollback, malformed members, metadata
 without the source blob, and deterministic shell repair. A virtual member placement
 tests offsets beyond 4 GiB and prevents truncated members from reading into adjacent
-ZIP data. All new disk fixtures are tiny; no multi-gigabyte files are written.
+ZIP data. Directory capture additionally verifies exact member bytes and paths with
+Python's ZIP reader, hidden/UTF-8/empty members, root rename and timestamp-independent
+replay, conflict rollback, link/invalid-input rejection, repository containment,
+and serving/repair after deleting the original tree. All new disk fixtures are tiny;
+no multi-gigabyte files are written.
 Verified on macOS arm64: Debug and RelWithDebInfo viewer/archive builds; 133 passing
-unit cases (428,865 assertions, two skips); the archive loopback integration test;
-and 20 targeted AddressSanitizer cases (549 assertions). Windows and Linux still
+unit cases (428,877 assertions, two skips); the archive loopback integration test;
+and 20 targeted AddressSanitizer cases (561 assertions). Windows and Linux still
 need runtime verification.

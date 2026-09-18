@@ -26,9 +26,10 @@ static void archive_print_usage(const char* executable) {
 		"Usage:\n"
 		"  %s init REPOSITORY\n"
 		"  %s check REPOSITORY\n"
-		"  %s ingest REPOSITORY [--source PATH] [--reference]\n"
+		"  %s ingest REPOSITORY [--source PATH] [--reference | --zip-directory]\n"
 		"  %s list REPOSITORY [--base-url URL]\n"
-		"  %s serve REPOSITORY [--port PORT] [--max-requests COUNT]\n",
+		"  %s serve REPOSITORY [--port PORT] [--max-requests COUNT]\n"
+		"    --zip-directory captures exactly the supplied directory tree as an owned ZIP.\n",
 		executable, executable, executable, executable, executable);
 }
 
@@ -93,11 +94,14 @@ int main(int argc, char** argv) {
 	if (strcmp(argv[1], "ingest") == 0) {
 		const char* source_path = NULL;
 		bool reference_source = false;
+		bool capture_directory = false;
 		for (i32 i = 3; i < argc; ++i) {
 			if (strcmp(argv[i], "--source") == 0 && i + 1 < argc) {
 				source_path = argv[++i];
 			} else if (strcmp(argv[i], "--reference") == 0) {
 				reference_source = true;
+			} else if (strcmp(argv[i], "--zip-directory") == 0) {
+				capture_directory = true;
 			} else {
 				archive_print_usage(argv[0]);
 				return 2;
@@ -107,13 +111,22 @@ int main(int argc, char** argv) {
 			fprintf(stderr, "--reference requires an explicit --source path\n");
 			return 2;
 		}
+		if (capture_directory && (!source_path || reference_source)) {
+			fprintf(stderr, "--zip-directory requires --source DIRECTORY and cannot be combined with --reference\n");
+			return 2;
+		}
 		archive_ingest_result_t result = {0};
-		bool ingested = source_path ?
-			archive_ingest_path(
+		bool ingested;
+		if (capture_directory) {
+			ingested = archive_ingest_capture_directory(&repository, source_path, &result, error, sizeof(error));
+		} else if (source_path) {
+			ingested = archive_ingest_path(
 				&repository, source_path, reference_source,
-				&result, error, sizeof(error)) :
-			archive_ingest_part10_objects(
+				&result, error, sizeof(error));
+		} else {
+			ingested = archive_ingest_part10_objects(
 				&repository, &result, error, sizeof(error));
+		}
 		if (!ingested) {
 			fprintf(stderr, "Archive ingestion failed: %s\n", error[0] ? error : "unknown error");
 			return 1;

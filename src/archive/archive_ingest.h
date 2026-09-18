@@ -47,6 +47,12 @@ bool archive_ingest_path(const archive_repository_t* repository,
 		archive_ingest_result_t* result, char* error,
 		size_t error_capacity);
 
+/* Capture the supplied directory tree as one immutable ZIP, then publish its supported
+ * slides atomically. The source must remain stable throughout capture. No completeness
+ * claim, incremental additions, or revision replacement is implied. */
+bool archive_ingest_capture_directory(const archive_repository_t* repository,
+		const char* source_path, archive_ingest_result_t* result, char* error, size_t error_capacity);
+
 #ifdef __cplusplus
 }
 #endif
