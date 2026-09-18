@@ -19,6 +19,9 @@
 extern "C" {
 #endif
 
+#define ARCHIVE_MRXS_ZIP_ADAPTER_VERSION 7
+#define ARCHIVE_MRXS_ZIP_ADAPTER_VERSION_STRING "7"
+#define ARCHIVE_MRXS_ZIP_FRAME_POLICY "mrxs-zip-jpeg-v" ARCHIVE_MRXS_ZIP_ADAPTER_VERSION_STRING
 #define ARCHIVE_MRXS_ADAPTER_VERSION 6
 #define ARCHIVE_MRXS_ADAPTER_VERSION_STRING "6"
 #define ARCHIVE_MRXS_RECIPE_MAGIC "slidescape-mrxs-native-recipe-v6"
@@ -42,11 +45,14 @@ typedef struct archive_mrxs_adapter_t {
 	char series_instance_uid[65];
 	char sop_instance_uids[ARCHIVE_MRXS_MAX_LEVELS][65];
 	bool is_open;
+	bool is_zip;
 } archive_mrxs_adapter_t;
 
 bool archive_mrxs_adapter_open(archive_mrxs_adapter_t* adapter,
 		const char* mrxs_path,
 		char* error, size_t error_capacity);
+bool archive_mrxs_adapter_open_zip(archive_mrxs_adapter_t* adapter, const char* path, char* error, size_t capacity);
+bool archive_mrxs_zip_recipe(const char* hash, u64 size, char recipe[512], size_t* recipe_size, char fingerprint[65]);
 /* Native identities depend on canonical source membership, not adapter version. */
 bool archive_mrxs_adapter_set_identity(archive_mrxs_adapter_t* adapter, const char* bundle_sha256);
 void archive_mrxs_adapter_close(archive_mrxs_adapter_t* adapter);

@@ -565,6 +565,7 @@ target_compile_definitions(slidescape_sqlite PRIVATE
 set(SLIDESCAPE_ARCHIVE_CORE_FILES
         src/archive/archive_database.c
         src/archive/archive_frame_map.c
+        src/archive/archive_zip.c
         src/archive/archive_object.c
         src/archive/archive_repository.c
         src/archive/archive_routes.c

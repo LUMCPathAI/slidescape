@@ -23,7 +23,8 @@ extern "C" {
 #endif
 
 #include "common.h"
-#include "platform.h" // for file_handle_t
+#include "platform.h"
+#include "source_fs.h"
 #include "mathutils.h" // for v2f
 
 #ifndef DONT_INCLUDE_DICOM_DICT_H
@@ -443,7 +444,8 @@ typedef struct dicom_instance_t {
 	dicom_series_t* series;
 	dicom_parser_callback_func_t* tag_handler_func;
 	char filename[512];
-	file_handle_t file_handle; // for simultaneous file access on multiple threads
+	source_file_t file; // Bounded positional reads; ZIP offsets remain hidden from the parser.
+	source_blob_t* owned_blob; // Local-file owner, or NULL for a borrowed ZIP member.
 	i32 nesting_level;
 	dicom_parser_pos_t pos_stack[16]; // one per nesting level, for keeping track where we need to push/pop during parsing
 	dicom_tag_t nested_sequences[8]; // one for every two nesting levels (sequences only, not sequence items)
@@ -548,6 +550,7 @@ typedef struct dicom_series_t {
 	dicom_transfer_syntax_enum encoding;
 	FILE* debug_output_file;
 	char source_directory[512];
+	source_fs_t* source; // Owns all ZIP member views, if present.
 	dicom_instance_t* instances; // array
 	dicom_slide_t* slides; // array
 	i32 selected_slide_index;
@@ -563,7 +566,9 @@ void dicom_destroy(dicom_series_t* dicom_series);
 void dicom_instance_destroy(dicom_instance_t* instance);
 bool is_file_a_dicom_file(u8* file_header_data, size_t file_header_data_len);
 bool dicom_open_from_directory(dicom_series_t* dicom, directory_info_t* directory, const file_info_t* selected_file);
-bool dicom_open_from_file(dicom_series_t* dicom, file_info_t* file);
+/* Takes namespace ownership, including on failure. selected_member may be NULL. */
+bool dicom_open_from_source(dicom_series_t* dicom, source_fs_t* source,
+		const char* container_path, const char* selected_member);
 /*
  * Archive/service-facing entry point for one immutable Part 10 object. Unlike
  * dicom_open_from_directory(), this does not assemble a viewer pyramid or require

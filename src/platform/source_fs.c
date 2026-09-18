@@ -115,11 +115,13 @@ bool source_fs_stat(source_fs_t* source, const char* path, source_entry_t* entry
 	free(wide);
 	if (success) {
 		entry->is_directory = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+		entry->is_link = (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
 		entry->size = entry->is_directory ? 0 : ((u64)info.nFileSizeHigh << 32) | info.nFileSizeLow;
 	}
 #else
 	struct stat info;
-	bool success = platform_stat(joined, &info) == 0 && (S_ISREG(info.st_mode) || S_ISDIR(info.st_mode));
+	bool success = lstat(joined, &info) == 0 && (S_ISREG(info.st_mode) || S_ISDIR(info.st_mode) || S_ISLNK(info.st_mode));
+	entry->is_link = success && S_ISLNK(info.st_mode);
 	if (success) { entry->is_directory = S_ISDIR(info.st_mode); entry->size = entry->is_directory ? 0 : (u64)info.st_size; }
 #endif
 	free(joined);

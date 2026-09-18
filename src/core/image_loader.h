@@ -40,6 +40,7 @@ typedef enum viewer_file_type_enum {
 
 typedef struct file_info_t {
 	char full_filename[512];
+	char zip_member[512]; // Optional selected DICOM member; empty selects automatically.
 	char filename_prefix[512]; // directory name + trailing slash
 	char filename_in_directory[512];
 	char ext[16];

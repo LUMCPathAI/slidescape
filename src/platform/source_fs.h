@@ -16,6 +16,7 @@ typedef struct source_entry_t {
 	const char* path; /* Namespace-relative, borrowed for the callback. No trailing '/'. */
 	u64 size;
 	bool is_directory;
+	bool is_link; /* Local symlink/reparse point; archive packaging must reject it. */
 } source_entry_t;
 typedef bool (*source_visit_fn)(void* context, const source_entry_t* entry);
 

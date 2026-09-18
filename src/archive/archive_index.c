@@ -124,7 +124,8 @@ static bool archive_instance_record_is_valid(const archive_instance_record_t* re
 	                       record->object_byte_size > 0 &&
 	                       shell_valid) ||
 	                      (strcmp(record->provider, "mrxs-native") == 0 &&
-	                       !record->object_key[0] &&
+	                       (!record->object_key[0] || (strncmp(record->object_key, "objects/sha256/", 15) == 0 &&
+	                        !strstr(record->object_key, "..") && !strchr(record->object_key, '\\'))) &&
 	                       !record->external_path[0] &&
 	                       archive_index_sha256_is_valid(
 		                       record->object_sha256) &&

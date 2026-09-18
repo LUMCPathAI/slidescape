@@ -619,6 +619,8 @@ bool init_image_from_dicom(image_t* image, dicom_series_t* dicom, bool is_overla
     image->backend = IMAGE_BACKEND_DICOM;
     image->dicom = *dicom;
     dicom = &image->dicom;
+    // Lazy pixel indexing must retain the moved series, not the loader's stack copy.
+    for (i32 i = 0; i < arrlen(dicom->instances); ++i) dicom->instances[i].series = dicom;
     image->is_freshly_loaded = true;
 
     dicom_instance_t* base_level_instance = dicom->wsi.level_instances[0];

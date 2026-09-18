@@ -66,6 +66,9 @@ typedef struct archive_provider_shell_cache_entry_t {
 	size_t size;
 	archive_shell_view_t shell;
 	archive_provider_mrxs_sources_t* mrxs_sources;
+	char blob_path[ARCHIVE_PATH_CAPACITY];
+	u64 blob_size;
+	source_blob_t blob; /* Opened on the first tile request, never for metadata. */
 } archive_provider_shell_cache_entry_t;
 
 typedef struct archive_provider_cache_entry_t {
@@ -132,6 +135,7 @@ static void archive_provider_shell_cache_entry_destroy(
 	ASSERT(entry->refcount == 0);
 	archive_provider_shell_bytes -= entry->size;
 	free(entry->data);
+	source_blob_close(&entry->blob);
 	archive_provider_mrxs_sources_destroy(entry->mrxs_sources);
 	memset(entry, 0, sizeof(*entry));
 }
@@ -920,6 +924,32 @@ static void archive_provider_shell_cache_release(
 	platform_mutex_unlock(&archive_provider_cache_mutex);
 }
 
+static bool archive_provider_regenerate_mrxs_zip(const archive_repository_t* repository,
+		const archive_instance_record_t* record, char* error, size_t capacity) {
+	char canonical[512], fingerprint[65], path[ARCHIVE_PATH_CAPACITY], hash[65];
+	size_t canonical_size = 0, retained_size = 0;
+	u8* retained = NULL;
+	u64 size = 0;
+	bool success = archive_mrxs_zip_recipe(record->object_sha256, record->object_byte_size,
+		canonical, &canonical_size, fingerprint) && !strcmp(fingerprint, record->representation_fingerprint) &&
+		archive_object_read_inline_bytes(repository, record->recipe_sha256, record->recipe_byte_size,
+			ARCHIVE_MRXS_RECIPE_MEDIA_TYPE, sizeof(canonical), &retained, &retained_size, error, capacity) == ARCHIVE_OBJECT_OK &&
+		retained_size == canonical_size && !memcmp(retained, canonical, retained_size) &&
+		archive_provider_source_path(repository, record, path) && archive_sha256_file(path, hash, &size) &&
+		size == record->object_byte_size && !strcmp(hash, record->object_sha256);
+	free(retained);
+	archive_mrxs_adapter_t adapter = {0};
+	archive_shell_buffer_t shell = {0};
+	if (success) success = archive_mrxs_adapter_open_zip(&adapter, path, error, capacity) &&
+		archive_mrxs_adapter_set_identity(&adapter, record->object_sha256) &&
+		archive_mrxs_adapter_build_shell(&adapter, hash, size, fingerprint, &shell, error, capacity) &&
+		archive_object_repair_shell_bytes(repository, shell.data, shell.size, record->shell_sha256,
+			record->shell_key, error, capacity) == ARCHIVE_OBJECT_OK;
+	archive_shell_buffer_destroy(&shell);
+	archive_mrxs_adapter_close(&adapter);
+	return success;
+}
+
 static archive_provider_shell_cache_entry_t*
 archive_provider_shared_shell_acquire_locked(
 		const archive_repository_t* repository,
@@ -967,7 +997,7 @@ archive_provider_shared_shell_acquire_locked(
 	bool success = archive_provider_load_published_shell(
 		repository, record, &shell_data, &shell, &instance,
 		error, error_capacity);
-	if (!success && is_part10) {
+	if (!success && (is_part10 || (is_mrxs && record->object_key[0]))) {
 		/*
 		 * A single process-wide repair lock keeps regeneration rare and
 		 * bounded. Recheck after acquiring it because another request may
@@ -980,8 +1010,9 @@ archive_provider_shared_shell_acquire_locked(
 			error, error_capacity);
 		if (!success) {
 			if (error && error_capacity) error[0] = '\0';
-			success = archive_provider_regenerate_shell(
-				repository, record, error, error_capacity);
+			success = is_part10 ? archive_provider_regenerate_shell(
+				repository, record, error, error_capacity) :
+				archive_provider_regenerate_mrxs_zip(repository, record, error, error_capacity);
 			if (success) {
 				if (error && error_capacity) error[0] = '\0';
 				success = archive_provider_load_published_shell(
@@ -991,11 +1022,14 @@ archive_provider_shared_shell_acquire_locked(
 		}
 		platform_mutex_unlock(&archive_provider_regeneration_mutex);
 	}
+	bool is_zip = success && is_mrxs && instance.provider_parameter_version == ARCHIVE_MRXS_ZIP_ADAPTER_VERSION;
+	char blob_path[ARCHIVE_PATH_CAPACITY] = {0};
+	if (is_zip) success = archive_provider_source_path(repository, record, blob_path);
 	archive_provider_mrxs_sources_t* mrxs_sources =
-		success && is_mrxs ?
+		success && is_mrxs && !is_zip ?
 		archive_provider_open_mrxs_sources(
 			repository, record, error, error_capacity) : NULL;
-	if (success && is_mrxs) success = mrxs_sources != NULL;
+	if (success && is_mrxs && !is_zip) success = mrxs_sources != NULL;
 	if (!success) {
 		archive_provider_mrxs_sources_destroy(mrxs_sources);
 		free(shell_data);
@@ -1065,6 +1099,10 @@ archive_provider_shared_shell_acquire_locked(
 	available->size = (size_t)record->shell_byte_size;
 	available->shell = shell;
 	available->mrxs_sources = mrxs_sources;
+	if (is_zip) {
+		snprintf(available->blob_path, sizeof(available->blob_path), "%s", blob_path);
+		available->blob_size = record->object_byte_size;
+	}
 	platform_mutex_unlock(&archive_provider_cache_mutex);
 	return available;
 }
@@ -1404,7 +1442,8 @@ i32 archive_instance_provider_get_frame_representations(
 			entry->instance.provider_kind ==
 				ARCHIVE_SHELL_PROVIDER_MRXS_NATIVE &&
 			(entry->instance.provider_parameter_version == ARCHIVE_MRXS_ADAPTER_VERSION ||
-			 entry->instance.provider_parameter_version == 5) &&
+			 entry->instance.provider_parameter_version == 5 ||
+			 entry->instance.provider_parameter_version == ARCHIVE_MRXS_ZIP_ADAPTER_VERSION) &&
 			entry->instance.payload_map_kind ==
 				ARCHIVE_SHELL_PAYLOAD_NATIVE_OFFSET_SIZE_SOA;
 		archive_provider_cache_release(entry);
@@ -1499,44 +1538,40 @@ static bool archive_provider_read_shell_frame(
 }
 
 static bool archive_provider_read_mrxs_frame(
-		const archive_provider_cache_entry_t* entry,
-		u32 frame_index, u8** data, size_t* size,
+		const archive_provider_cache_entry_t* entry, u32 frame_index, u8** data, size_t* size,
 		char* error, size_t error_capacity) {
-	if (!entry || !entry->shared_shell ||
-	    !entry->shared_shell->mrxs_sources ||
-	    !data || !size)
-		return false;
+	if (!entry || !entry->shared_shell || !data || !size) return false;
+	archive_provider_shell_cache_entry_t* shared = entry->shared_shell;
 	archive_shell_native_payload_t payload = {0};
-	archive_provider_mrxs_sources_t* sources =
-		entry->shared_shell->mrxs_sources;
-	if (!archive_shell_get_native_payload(
-			&entry->shared_shell->shell, &entry->instance,
-			frame_index, &payload) ||
-	    payload.file_index >= sources->count ||
-	    payload.size > ARCHIVE_PROVIDER_MAX_FRAME_SIZE ||
-	    payload.offset > sources->sizes[payload.file_index] ||
-	    payload.size >
-		    sources->sizes[payload.file_index] - payload.offset) {
-		archive_provider_set_error(
-			error, error_capacity,
-			"MRXS shell payload range is invalid");
-		return false;
-	}
+	if (!archive_shell_get_native_payload(&shared->shell, &entry->instance, frame_index, &payload) ||
+		payload.size < 4 || payload.size > ARCHIVE_PROVIDER_MAX_FRAME_SIZE) return false;
 	u8* jpeg = malloc(payload.size);
 	if (!jpeg) return false;
-	size_t read = file_handle_read_at_offset(
-		jpeg, sources->files[payload.file_index],
-		payload.offset, payload.size);
-	if (read != payload.size || payload.size < 4 ||
-	    jpeg[0] != 0xff || jpeg[1] != 0xd8) {
+	bool success = false;
+	if (entry->instance.provider_parameter_version == ARCHIVE_MRXS_ZIP_ADAPTER_VERSION) {
+		/* Lazy handle initialization is synchronized; subsequent pread calls are
+		   concurrent and the held cache reference pins the shared blob lifetime. */
+		platform_mutex_lock(&archive_provider_cache_mutex);
+		if (!shared->blob.read && shared->blob_path[0]) {
+			if (source_blob_open_local(&shared->blob, shared->blob_path) && shared->blob.size != shared->blob_size)
+				source_blob_close(&shared->blob);
+		}
+		source_file_t view = {0};
+		success = payload.file_index == 0 && source_file_view(&shared->blob, 0, shared->blob_size, &view);
+		platform_mutex_unlock(&archive_provider_cache_mutex);
+		if (success) success = source_file_read(&view, payload.offset, jpeg, payload.size) == SOURCE_READ_OK;
+	} else {
+		archive_provider_mrxs_sources_t* sources = shared->mrxs_sources;
+		success = sources && payload.file_index < sources->count && payload.offset <= sources->sizes[payload.file_index] &&
+			payload.size <= sources->sizes[payload.file_index] - payload.offset &&
+			file_handle_read_at_offset(jpeg, sources->files[payload.file_index], payload.offset, payload.size) == payload.size;
+	}
+	if (!success || jpeg[0] != 0xff || jpeg[1] != 0xd8) {
 		free(jpeg);
-		archive_provider_set_error(
-			error, error_capacity,
-			"MRXS shell payload is not a standalone JPEG frame");
+		archive_provider_set_error(error, error_capacity, "MRXS source range is unavailable or is not a standalone JPEG frame");
 		return false;
 	}
-	*data = jpeg;
-	*size = payload.size;
+	*data = jpeg; *size = payload.size;
 	return true;
 }
 
@@ -1593,7 +1628,7 @@ bool archive_instance_provider_get_frame(const archive_repository_t* repository,
 			repository, record, error, error_capacity);
 	if (!entry) return false;
 	const archive_shell_instance_t* instance = &entry->instance;
-	if (entry->shared_shell->mrxs_sources &&
+	if ((entry->shared_shell->mrxs_sources || instance->provider_parameter_version == ARCHIVE_MRXS_ZIP_ADAPTER_VERSION) &&
 	    instance->provider_kind == ARCHIVE_SHELL_PROVIDER_MRXS_NATIVE &&
 	    representation->source == ARCHIVE_FRAME_REPRESENTATION_GENERATED &&
 	    strcmp(representation->media_type, "image/jpeg") == 0 &&

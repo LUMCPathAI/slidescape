@@ -32,9 +32,9 @@ bool archive_ingest_part10_path(const archive_repository_t* repository,
 		archive_ingest_result_t* result, char* error, size_t error_capacity);
 
 /*
- * Dispatch an explicit source path to the supported adapter. MRXS currently
- * requires reference_source because owned multi-file bundle import is not yet
- * implemented.
+ * Dispatch an explicit source path to the supported adapter. MRXS directories
+ * and thumbnails are preserved as owned stored ZIP bundles; existing MRXS ZIPs
+ * are imported byte-for-byte. Legacy .mrxs reference ingestion remains available.
  */
 bool archive_ingest_path(const archive_repository_t* repository,
 		const char* source_path, bool reference_source,

@@ -12,6 +12,7 @@
 
 #include "archive_repository.h"
 #include "common.h"
+#include "source_zip.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -93,6 +94,10 @@ archive_object_status_t archive_object_store_shell_bytes(const archive_repositor
 archive_object_status_t archive_object_repair_shell_bytes(
 		const archive_repository_t* repository, const void* data, size_t size,
 		const char* expected_sha256, const char* expected_storage_key,
+		char* error, size_t error_capacity);
+/* Stream a stored ZIP64 into staging, hash once, validate, then install/register. */
+archive_object_status_t archive_object_store_zip(const archive_repository_t* repository,
+		const source_zip_input_t* members, u32 count, archive_object_t* object,
 		char* error, size_t error_capacity);
 const char* archive_object_status_string(archive_object_status_t status);
 

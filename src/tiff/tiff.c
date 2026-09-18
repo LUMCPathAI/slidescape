@@ -119,11 +119,17 @@ const char* get_tiff_tag_name(u32 tag) {
 	return result;
 }
 
+static size_t tiff_read(tiff_t* tiff, void* dest, size_t size) {
+	size_t read = source_file_read_at_offset(dest, &tiff->file, tiff->read_cursor, size);
+	tiff->read_cursor += read;
+	return read;
+}
+
 char* tiff_read_field_ascii(tiff_t* tiff, tiff_tag_t* tag) {
 	size_t description_length = tag->data_count;
 	char* result = (char*) calloc(ATLEAST(8, description_length + 1), 1);
 	if (tag->data_is_offset) {
-		file_read_at_offset(result, tiff->fp, tag->offset, tag->data_count);
+		source_file_read_at_offset(result, &tiff->file, tag->offset, tag->data_count);
 	} else {
 		memcpy(result, tag->data, description_length);
 	}
@@ -142,7 +148,7 @@ u64* tiff_read_field_integers(tiff_t* tiff, tiff_tag_t* tag) {
 	u64 read_size = tag->data_count * bytesize;
 	if (tag->data_is_offset) {
 		void* temp_integers = calloc(bytesize, tag->data_count);
-		if (file_read_at_offset(temp_integers, tiff->fp, tag->offset, read_size) != read_size) {
+		if (source_file_read_at_offset(temp_integers, &tiff->file, tag->offset, read_size) != read_size) {
 			free(temp_integers);
 			return NULL; // failed
 		}
@@ -204,7 +210,7 @@ u16* tiff_read_field_u16(tiff_t* tiff, tiff_tag_t* tag) {
 
 		u64 read_size = tag->data_count * bytesize;
 		if (tag->data_is_offset) {
-			if (file_read_at_offset(integers, tiff->fp, tag->offset, read_size) != read_size) {
+			if (source_file_read_at_offset(integers, &tiff->file, tag->offset, read_size) != read_size) {
 				free(integers);
 				return NULL; // failed
 			}
@@ -232,7 +238,7 @@ u8* tiff_read_field_u8(tiff_t* tiff, tiff_tag_t* tag) {
 
 		u64 read_size = tag->data_count * bytesize;
 		if (tag->data_is_offset) {
-			if (file_read_at_offset(integers, tiff->fp, tag->offset, read_size) != read_size) {
+			if (source_file_read_at_offset(integers, &tiff->file, tag->offset, read_size) != read_size) {
 				free(integers);
 				return NULL; // failed
 			}
@@ -250,7 +256,7 @@ tiff_rational_t* tiff_read_field_rationals(tiff_t* tiff, tiff_tag_t* tag) {
 	tiff_rational_t* rationals = (tiff_rational_t*) calloc(ATLEAST(8, tag->data_count * sizeof(tiff_rational_t)), 1);
 
 	if (tag->data_is_offset) {
-		file_read_at_offset(rationals, tiff->fp, tag->offset, tag->data_count * sizeof(tiff_rational_t));
+		source_file_read_at_offset(rationals, &tiff->file, tag->offset, tag->data_count * sizeof(tiff_rational_t));
 	} else {
 		// data is inlined
 		rationals[0] = *(tiff_rational_t*) &tag->data_u64;
@@ -338,13 +344,14 @@ bool tiff_read_ifd(tiff_t* tiff, tiff_ifd_t* ifd, u64* next_ifd_offset) {
 	ifd->color_space = TIFF_PHOTOMETRIC_RGB;
 
 	// Set the file position to the start of the IFD
-	if (!(next_ifd_offset != NULL && file_stream_set_pos(tiff->fp, *next_ifd_offset))) {
+	if (!(next_ifd_offset != NULL && *next_ifd_offset <= tiff->file.size)) {
 		return false; // failed
 	}
 
+	tiff->read_cursor = *next_ifd_offset;
 	u64 tag_count = 0;
 	u64 tag_count_num_bytes = is_bigtiff ? 8 : 2;
-	if (file_stream_read(&tag_count, tag_count_num_bytes, tiff->fp) != tag_count_num_bytes) return false;
+	if (tiff_read(tiff, &tag_count, tag_count_num_bytes) != tag_count_num_bytes) return false;
 	tag_count = is_bigtiff ? maybe_swap_64(tag_count, is_big_endian) : maybe_swap_16(tag_count, is_big_endian);
 
 	// Read the tags
@@ -354,7 +361,7 @@ bool tiff_read_ifd(tiff_t* tiff, tiff_ifd_t* ifd, u64* next_ifd_offset) {
 		return false; // sanity check
 	}
 	u8* raw_tags = (u8*) malloc(bytes_to_read);
-	if (file_stream_read(raw_tags, bytes_to_read, tiff->fp) != bytes_to_read) {
+	if (tiff_read(tiff, raw_tags, bytes_to_read) != bytes_to_read) {
 		free(raw_tags);
 		return false; // failed
 	}
@@ -731,7 +738,7 @@ bool tiff_read_ifd(tiff_t* tiff, tiff_ifd_t* ifd, u64* next_ifd_offset) {
 
 
 	// Read the next IFD
-	if (file_stream_read(next_ifd_offset, tiff->bytesize_of_offsets, tiff->fp) != tiff->bytesize_of_offsets) return false;
+	if (tiff_read(tiff, next_ifd_offset, tiff->bytesize_of_offsets) != tiff->bytesize_of_offsets) return false;
 	console_print_verbose("next ifd offset = %lld\n", *next_ifd_offset);
 	return true; // success
 }
@@ -898,102 +905,86 @@ void tiff_post_init(tiff_t* tiff) {
 
 }
 
-bool32 open_tiff_file(tiff_t* tiff, const char* filename) {
-	console_print_verbose("Opening TIFF file %s\n", filename);
-	ASSERT(tiff);
-	int ret = 0; (void)ret; // for checking return codes from fgetpos, fsetpos, etc
-	file_stream_t fp = file_stream_open_for_reading(filename);
+static bool32 tiff_open_view(tiff_t* tiff) {
+	if (!tiff->file.blob || tiff->file.size > INT64_MAX) return false;
+	tiff->filesize = (i64)tiff->file.size;
+	int ret;
 	bool32 success = false;
-	if (fp) {
-		tiff->fp = fp;
-		tiff->filesize = file_stream_get_filesize(fp);
-		if (tiff->filesize > 8) {
-			// read the 8-byte TIFF header / 16-byte BigTIFF header
-			tiff_header_t tiff_header = {0};
-			ret = file_stream_read(&tiff_header, sizeof(tiff_header_t) /*16*/, fp);
-			if (ret != sizeof(tiff_header_t)) goto fail;
-			bool32 is_big_endian;
-			switch(tiff_header.byte_order_indication) {
-				case TIFF_BIG_ENDIAN: is_big_endian = true; break;
-				case TIFF_LITTLE_ENDIAN: is_big_endian = false; break;
-				default: goto fail;
-			}
-			tiff->is_big_endian = is_big_endian;
-			u16 filetype = maybe_swap_16(tiff_header.filetype, is_big_endian);
-			bool32 is_bigtiff;
-			switch(filetype) {
-				case 0x2A: is_bigtiff = false; break;
-				case 0x2B: is_bigtiff = true; break;
-				default: goto fail;
-			}
-			tiff->is_bigtiff = is_bigtiff;
-			u32 bytesize_of_offsets;
-			u64 next_ifd_offset = 0;
-			if (is_bigtiff) {
-				console_print_verbose("TIFF variant is BigTIFF\n");
-				bytesize_of_offsets = maybe_swap_16(tiff_header.bigtiff.offset_size, is_big_endian);
-				if (bytesize_of_offsets != 8) goto fail;
-				if (tiff_header.bigtiff.always_zero != 0) goto fail;
-				next_ifd_offset = maybe_swap_64(tiff_header.bigtiff.first_ifd_offset, is_big_endian);
-			} else {
-				console_print_verbose("TIFF variant is standard TIFF\n");
-				bytesize_of_offsets = 4;
-				next_ifd_offset = maybe_swap_32(tiff_header.tiff.first_ifd_offset, is_big_endian);
-			}
-			ASSERT((bytesize_of_offsets == 4 && !is_bigtiff) || (bytesize_of_offsets == 8 && is_bigtiff));
-			tiff->bytesize_of_offsets = bytesize_of_offsets;
+	if (tiff->filesize > 8) {
+		// read the 8-byte TIFF header / 16-byte BigTIFF header
+		tiff_header_t tiff_header = {0};
+		ret = tiff_read(tiff, &tiff_header, sizeof(tiff_header_t));
+		if (ret != sizeof(tiff_header_t)) goto fail;
+		bool32 is_big_endian;
+		switch(tiff_header.byte_order_indication) {
+			case TIFF_BIG_ENDIAN: is_big_endian = true; break;
+			case TIFF_LITTLE_ENDIAN: is_big_endian = false; break;
+			default: goto fail;
+		}
+		tiff->is_big_endian = is_big_endian;
+		u16 filetype = maybe_swap_16(tiff_header.filetype, is_big_endian);
+		bool32 is_bigtiff;
+		switch(filetype) {
+			case 0x2A: is_bigtiff = false; break;
+			case 0x2B: is_bigtiff = true; break;
+			default: goto fail;
+		}
+		tiff->is_bigtiff = is_bigtiff;
+		u32 bytesize_of_offsets;
+		u64 next_ifd_offset = 0;
+		if (is_bigtiff) {
+			console_print_verbose("TIFF variant is BigTIFF\n");
+			bytesize_of_offsets = maybe_swap_16(tiff_header.bigtiff.offset_size, is_big_endian);
+			if (bytesize_of_offsets != 8) goto fail;
+			if (tiff_header.bigtiff.always_zero != 0) goto fail;
+			next_ifd_offset = maybe_swap_64(tiff_header.bigtiff.first_ifd_offset, is_big_endian);
+		} else {
+			console_print_verbose("TIFF variant is standard TIFF\n");
+			bytesize_of_offsets = 4;
+			next_ifd_offset = maybe_swap_32(tiff_header.tiff.first_ifd_offset, is_big_endian);
+		}
+		ASSERT((bytesize_of_offsets == 4 && !is_bigtiff) || (bytesize_of_offsets == 8 && is_bigtiff));
+		tiff->bytesize_of_offsets = bytesize_of_offsets;
 
-			// Read and process the IFDs
-			tiff_ifd_t last_ifd = {0};
-			while (next_ifd_offset != 0) {
-				console_print_verbose("Reading IFD #%llu\n", tiff->ifd_count);
-				tiff_ifd_t ifd = { .ifd_index = tiff->ifd_count };
+		// Read and process the IFDs
+		tiff_ifd_t last_ifd = {0};
+		while (next_ifd_offset != 0) {
+			console_print_verbose("Reading IFD #%llu\n", tiff->ifd_count);
+			tiff_ifd_t ifd = { .ifd_index = tiff->ifd_count };
 
-				// Apply default values
-				ifd.compression = TIFF_COMPRESSION_NONE;
-				ifd.samples_per_pixel = 1; // usually 3 for RGB
+			// Apply default values
+			ifd.compression = TIFF_COMPRESSION_NONE;
+			ifd.samples_per_pixel = 1; // usually 3 for RGB
 
-				// Apply some values from the last IFD that might not be repeated.
-				ifd.min_sample_value = last_ifd.min_sample_value;
-				ifd.max_sample_value = last_ifd.max_sample_value;
+			// Apply some values from the last IFD that might not be repeated.
+			ifd.min_sample_value = last_ifd.min_sample_value;
+			ifd.max_sample_value = last_ifd.max_sample_value;
 
-				if (!tiff_read_ifd(tiff, &ifd, &next_ifd_offset)) goto fail;
-				arrput(tiff->ifds, ifd);
-				tiff->ifd_count += 1;
-				last_ifd = ifd;
-			}
-
-			tiff_post_init(tiff);
-
-			success = true;
-
-			// cleanup
-			file_stream_close(fp);
-			tiff->fp = NULL;
-
-			// Prepare for Async I/O in the worker threads
-#if !IS_SERVER
-			// TODO: make async I/O platform agnostic
-			// TODO: set FILE_FLAG_NO_BUFFERING for maximum performance (but: need to align read requests to page size...)
-			// http://vec3.ca/using-win32-asynchronous-io/
-			tiff->file_handle = open_file_handle_for_simultaneous_access(filename);
-			if (!tiff->file_handle) {
-				console_print_error("Failed to reopen WSI for simultaneous access\n");
-				success = false;
-			}
-#endif
+			if (!tiff_read_ifd(tiff, &ifd, &next_ifd_offset)) goto fail;
+			arrput(tiff->ifds, ifd);
+			tiff->ifd_count += 1;
+			last_ifd = ifd;
 		}
 
-		// TODO: better error handling than this crap
-		fail:;
-		// Note: we need async i/o in the worker threads...
-		// so for now we close and reopen the file using platform-native APIs to make that possible.
-		if (tiff->fp) {
-			file_stream_close(fp);
-			tiff->fp = NULL;
-		}
+		if (!tiff->ifd_count) goto fail;
+		tiff_post_init(tiff);
+
+		success = true;
+
 	}
+fail:
 	return success;
+}
+
+bool32 open_tiff_file(tiff_t* tiff, const char* filename) {
+	tiff->owned_blob = calloc(1, sizeof(*tiff->owned_blob));
+	return tiff->owned_blob && source_blob_open_local(tiff->owned_blob, filename) &&
+		source_file_view(tiff->owned_blob, 0, tiff->owned_blob->size, &tiff->file) && tiff_open_view(tiff);
+}
+
+bool32 open_tiff_from_source(tiff_t* tiff, source_fs_t* source, const char* member) {
+	tiff->source = source;
+	return source && source_fs_open_file(source, member, &tiff->file) && tiff_open_view(tiff);
 }
 
 
@@ -1219,10 +1210,6 @@ bool32 tiff_deserialize(tiff_t* tiff, u8* buffer, u64 buffer_size) {
 	*tiff = (tiff_t) {0};
 	tiff->is_remote = 0; // set later
 	tiff->location = (network_location_t){0}; // set later
-	tiff->fp = NULL;
-#if !IS_SERVER
-	tiff->file_handle = 0;
-#endif
 	tiff->filesize = serial_header->filesize;
 	tiff->bytesize_of_offsets = serial_header->bytesize_of_offsets;
 	tiff->ifd_count = serial_header->ifd_count;
@@ -1373,21 +1360,12 @@ bool32 tiff_deserialize(tiff_t* tiff, u8* buffer, u64 buffer_size) {
 }
 
 void tiff_destroy(tiff_t* tiff) {
-	if (tiff->fp) {
-		file_stream_close(tiff->fp);
-		tiff->fp = NULL;
+	if (tiff->owned_blob) {
+		source_blob_close(tiff->owned_blob);
+		free(tiff->owned_blob); tiff->owned_blob = NULL;
 	}
-#if !IS_SERVER
-#if WINDOWS
-	if (tiff->file_handle) {
-		CloseHandle(tiff->file_handle);
-	}
-#else
-	if (tiff->file_handle) {
-		close(tiff->file_handle);
-	}
-#endif
-#endif
+	source_fs_close(tiff->source); tiff->source = NULL;
+	tiff->file = (source_file_t){0};
 
 	for (i32 i = 0; i < tiff->ifd_count; ++i) {
 		tiff_ifd_t* ifd = tiff->ifds + i;
@@ -1536,7 +1514,10 @@ u8* tiff_decode_tile(i32 logical_thread_index, tiff_t* tiff, tiff_ifd_t* level_i
 		compressed_tile_data = (u8*)malloc(compressed_tile_size_in_bytes);
 
 		if (!tiff->is_remote) {
-			file_handle_read_at_offset(compressed_tile_data, tiff->file_handle, tile_offset, compressed_tile_size_in_bytes);
+			if (source_file_read(&tiff->file, tile_offset, compressed_tile_data, compressed_tile_size_in_bytes) != SOURCE_READ_OK) {
+				free(compressed_tile_data);
+				return NULL;
+			}
 		} else {
 			console_print_verbose("[thread %d] remote tile requested: level %d, tile %d (%d, %d)\n", logical_thread_index, level, tile_index, tile_x, tile_y);
 
@@ -1579,7 +1560,7 @@ u8* tiff_decode_tile(i32 logical_thread_index, tiff_t* tiff, tiff_ifd_t* level_i
 				if (level_ifd->strip_count == 1) {
 					compressed_tile_size_in_bytes = level_ifd->strip_byte_counts[0];
 					compressed_tile_data = (u8*)malloc(compressed_tile_size_in_bytes);
-					size_t bytes_read = file_handle_read_at_offset(compressed_tile_data, tiff->file_handle, level_ifd->strip_offsets[0], compressed_tile_size_in_bytes);
+					size_t bytes_read = source_file_read_at_offset(compressed_tile_data, &tiff->file, level_ifd->strip_offsets[0], compressed_tile_size_in_bytes);
 					if (bytes_read != compressed_tile_size_in_bytes) {
 						failed = true;
 					}
@@ -1590,7 +1571,7 @@ u8* tiff_decode_tile(i32 logical_thread_index, tiff_t* tiff, tiff_ifd_t* level_i
 						u64 strip_offset = level_ifd->strip_offsets[i];
 						u64 strip_byte_count = level_ifd->strip_byte_counts[i];
 						compressed_strip_data[i] = (u8*)malloc(strip_byte_count);
-						size_t bytes_read = file_handle_read_at_offset(compressed_strip_data[i], tiff->file_handle, strip_offset, strip_byte_count);
+						size_t bytes_read = source_file_read_at_offset(compressed_strip_data[i], &tiff->file, strip_offset, strip_byte_count);
 						if (bytes_read != strip_byte_count) {
 							failed = true;
 						}

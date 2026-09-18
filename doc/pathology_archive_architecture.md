@@ -136,21 +136,22 @@ invisible to QIDO. Exact replay is idempotent. Adding instances to an already pu
 series or replacing it is deliberately rejected until explicit versioning exists.
 
 The current shell writer is v3, the Part 10 recipe/adapter is v10, and the native MRXS
-recipe/adapter is v6. Binary v2 remains readable. Its absent ImageType provenance is
-omitted from JSON rather than inferred. Only current Part 10 recipes can regenerate
-shells; older intact shells remain usable, but applying the corrected metadata/profile
+reference recipe/adapter is v6; owned ZIP MRXS uses v7. Binary v2 remains readable.
+Its absent ImageType provenance is omitted from JSON rather than inferred. Current
+Part 10 and MRXS ZIP recipes can regenerate shells; older intact shells remain usable, but applying the corrected metadata/profile
 to old publications requires a fresh development repository. No in-place migration or
 silent publication replacement is performed. Repository layout v2 and SQLite schema
 v5 are unchanged. Bundle registration adapter versions (Part 10: 1, MRXS: 2) describe
 the descriptor/member contract, independently of shell-generation versions.
 
-MRXS remains reference-only. Every admitted tile must have a standalone baseline
-8-bit YCbCr JPEG header, matching dimensions, supported sampling, and required tables
-within the first 64 KiB. Admission does not decode every pixel or claim an sRGB profile.
-New native UIDs derive from canonical source membership, independently of adapter
-version. The current descriptor still includes only known referenced files and does
-not preserve an arbitrary original directory tree; owned ZIP64 preservation remains
-separate work.
+MRXS supports owned ZIP ingestion as well as legacy development references. Every
+admitted tile must have a standalone baseline 8-bit YCbCr JPEG header, matching
+dimensions, supported sampling, and required tables within the first 64 KiB.
+Admission does not decode every pixel or claim an sRGB profile. Owned ZIP UIDs derive
+from the complete immutable ZIP hash; the full source tree is preserved and shells
+contain direct blob ranges. See [stored ZIP sources](zip_sources.md) for the exact
+preservation contract and commands. Legacy reference descriptors still include only
+known referenced files and cannot preserve an arbitrary source tree.
 
 DICOM JSON projection is isolated in `archive_metadata.*`. It preserves ImageType,
 pixel interpretation, origin/orientation, concatenation, and sparse physical/optical
@@ -401,9 +402,9 @@ not an owned, mutation-safe cloud source.
 External development ingestion uses one command for all detected formats:
 `ingest REPOSITORY --source PATH --reference`. Part 10 canonical absolute paths are
 stored in SQLite rather than copied into `objects/`; MRXS retains its bundle path in
-the inline provider recipe. Provider-cache admission avoids rehashing the WSI. MRXS
-currently requires `--reference` because owned multi-file bundle import is not yet
-implemented. This is explicitly external ownership, not durable archive storage.
+the inline provider recipe. Provider-cache admission avoids rehashing the WSI.
+This option is explicitly external ownership, not durable archive storage. Omit
+`--reference` for owned MRXS ZIP preservation.
 
 The viewer tile-cache locking/lifetime prerequisite and bounded four-frame DICOMweb
 batching are complete. The next implementation slices are:
@@ -415,8 +416,8 @@ batching are complete. The next implementation slices are:
    failing repair jobs, and fail-fast adapter-version validation. Keep request-local
    coalescing bounded; implement cross-process cloud repair through durable jobs and
    telemetry.
-3. Import native source bundles into durable object ownership and replace filesystem
-   paths in provider recipes with logical object locators.
+3. Extend owned ZIP publication beyond MRXS to DICOM bundles and add native TIFF
+   archive admission. Add S3-compatible range storage and original-bundle downloads.
 4. Add STOW and source-bundle admission only after publication failure semantics are
    established.
 5. Expand pinned native profiles and the normalized viewer WSI model after associated

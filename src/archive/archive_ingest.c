@@ -9,6 +9,7 @@
 */
 
 #include "archive_ingest.h"
+#include "archive_zip.h"
 
 #include "archive_database.h"
 #include "archive_representation.h"
@@ -724,7 +725,7 @@ bool archive_ingest_part10_objects(const archive_repository_t* repository,
 }
 
 static bool archive_ingest_mrxs(const archive_repository_t* repository,
-		const char* mrxs_path, archive_ingest_result_t* result,
+		const char* mrxs_path, const archive_object_t* zip_object, archive_ingest_result_t* result,
 		char* error, size_t error_capacity) {
 	if (result) memset(result, 0, sizeof(*result));
 	if (error && error_capacity) error[0] = '\0';
@@ -744,8 +745,8 @@ static bool archive_ingest_mrxs(const archive_repository_t* repository,
 	}
 
 	archive_mrxs_adapter_t adapter = {0};
-	if (!archive_mrxs_adapter_open(&adapter, source_path,
-	                               error, error_capacity))
+	if (!(zip_object ? archive_mrxs_adapter_open_zip(&adapter, source_path, error, error_capacity) :
+		archive_mrxs_adapter_open(&adapter, source_path, error, error_capacity)))
 		return false;
 
 	char* descriptor = NULL;
@@ -758,44 +759,36 @@ static bool archive_ingest_mrxs(const archive_repository_t* repository,
 	char* recipe = NULL;
 	size_t recipe_size = 0;
 	archive_database_shell_instance_publication_t* instances = NULL;
-	bool success = archive_ingest_mrxs_descriptor(
+	bool success = zip_object || archive_ingest_mrxs_descriptor(
 		&adapter, source_path, &descriptor, &descriptor_size,
 		error, error_capacity);
+	if (zip_object) descriptor_object = *zip_object;
 
-	if (success && archive_object_store_control_bytes(
+	if (success && !zip_object && archive_object_store_control_bytes(
 			repository, descriptor, descriptor_size,
 			"application/vnd.slidescape.mrxs-bundle",
 			&descriptor_object, error, error_capacity) != ARCHIVE_OBJECT_OK)
 		success = false;
 	char fingerprint_input[160];
 	char fingerprint[65] = {0};
-	i32 fingerprint_length = success ? snprintf(
-		fingerprint_input, sizeof(fingerprint_input),
-				"slidescape-mrxs-virtual-dicom-v" ARCHIVE_MRXS_ADAPTER_VERSION_STRING "\n%s\n",
-		descriptor_object.sha256) : -1;
-	if (success &&
-	    (fingerprint_length <= 0 ||
-	     (size_t)fingerprint_length >= sizeof(fingerprint_input) ||
-	     !archive_sha256_bytes(fingerprint_input, (size_t)fingerprint_length,
-	                           fingerprint))) {
-		archive_ingest_set_error(error, error_capacity,
-		                         "could not fingerprint MRXS representation");
-		success = false;
+	if (success && zip_object) {
+		char canonical[512];
+		success = archive_mrxs_zip_recipe(zip_object->sha256, zip_object->byte_size, canonical, &recipe_size, fingerprint);
+		if (success) { recipe = malloc(recipe_size + 1); success = recipe != NULL; }
+		if (success) memcpy(recipe, canonical, recipe_size + 1);
+	} else if (success) {
+		i32 length = snprintf(fingerprint_input, sizeof(fingerprint_input),
+			"slidescape-mrxs-virtual-dicom-v" ARCHIVE_MRXS_ADAPTER_VERSION_STRING "\n%s\n", descriptor_object.sha256);
+		success = length > 0 && (size_t)length < sizeof(fingerprint_input) &&
+			archive_sha256_bytes(fingerprint_input, length, fingerprint) &&
+			archive_mrxs_adapter_build_recipe(source_path, descriptor_object.sha256, descriptor_object.byte_size,
+				fingerprint, &recipe, &recipe_size);
 	}
-	if (success && !archive_mrxs_adapter_set_identity(&adapter, descriptor_object.sha256))
-		success = false;
-	if (success && archive_database_register_mrxs_bundle(
-			repository, descriptor_object.sha256, descriptor_object.id,
-			&bundle, error, error_capacity) != ARCHIVE_DATABASE_OK)
-		success = false;
-	if (success && !archive_mrxs_adapter_build_recipe(
-			source_path, descriptor_object.sha256,
-			descriptor_object.byte_size, fingerprint,
-			&recipe, &recipe_size)) {
-		archive_ingest_set_error(error, error_capacity,
-		                         "could not build MRXS provider recipe");
-		success = false;
-	}
+	if (success) success = archive_mrxs_adapter_set_identity(&adapter, descriptor_object.sha256);
+	if (success) success = (zip_object ? archive_database_register_mrxs_zip_bundle(repository,
+		descriptor_object.sha256, descriptor_object.id, &bundle, error, error_capacity) :
+		archive_database_register_mrxs_bundle(repository, descriptor_object.sha256, descriptor_object.id,
+			&bundle, error, error_capacity)) == ARCHIVE_DATABASE_OK;
 	if (success && archive_object_store_control_bytes(
 			repository, recipe, recipe_size, ARCHIVE_MRXS_RECIPE_MEDIA_TYPE,
 			&recipe_object, error, error_capacity) != ARCHIVE_OBJECT_OK)
@@ -878,7 +871,7 @@ static bool archive_ingest_mrxs(const archive_repository_t* repository,
 			                    sizeof(publication.provider_kind),
 			                    "mrxs-native") &&
 			archive_ingest_copy(publication.adapter_version,
-			                    sizeof(publication.adapter_version), ARCHIVE_MRXS_ADAPTER_VERSION_STRING) &&
+			                    sizeof(publication.adapter_version), zip_object ? ARCHIVE_MRXS_ZIP_ADAPTER_VERSION_STRING : ARCHIVE_MRXS_ADAPTER_VERSION_STRING) &&
 			archive_ingest_copy(publication.frame_media_type,
 			                    sizeof(publication.frame_media_type),
 			                    "image/jpeg") &&
@@ -887,7 +880,7 @@ static bool archive_ingest_mrxs(const archive_repository_t* repository,
 			                    "GENERATED") &&
 			archive_ingest_copy(publication.frame_policy_version,
 			                    sizeof(publication.frame_policy_version),
-			                    ARCHIVE_MRXS_FRAME_POLICY);
+			                    zip_object ? ARCHIVE_MRXS_ZIP_FRAME_POLICY : ARCHIVE_MRXS_FRAME_POLICY);
 		publication.shell_object_id = shell_object.id;
 		publication.recipe_object_id = recipe_object.id;
 		publication.instances = instances;
@@ -924,19 +917,27 @@ bool archive_ingest_path(const archive_repository_t* repository,
 			error, error_capacity, "source path is required");
 		return false;
 	}
-	if (archive_ingest_has_mrxs_extension(source_path)) {
-		if (!reference_source) {
-			archive_ingest_set_error(
-				error, error_capacity,
-				"MRXS ingestion currently requires --reference; "
-				"owned multi-file bundle import is not implemented");
+	const char* extension = strrchr(source_path, '.');
+	bool is_zip = extension && !strcasecmp(extension, ".zip");
+	char slidedat[ARCHIVE_PATH_CAPACITY];
+	bool mrxs_directory = is_directory(source_path) &&
+		archive_ingest_join(slidedat, sizeof(slidedat), source_path, "Slidedat.ini") && file_exists(slidedat);
+	if (is_zip || mrxs_directory || archive_ingest_has_mrxs_extension(source_path)) {
+		if (reference_source && !is_zip && !mrxs_directory)
+			return archive_ingest_mrxs(repository, source_path, NULL, result, error, error_capacity);
+		if (reference_source) {
+			archive_ingest_set_error(error, error_capacity, "ZIP/directory ingestion retains an owned bundle; omit --reference");
 			return false;
 		}
-		return archive_ingest_mrxs(
-			repository, source_path, result, error,
-			error_capacity);
+		archive_object_t object = {0};
+		bool success = is_zip ? archive_object_import_file(repository, source_path, "application/zip", &object,
+			error, error_capacity) == ARCHIVE_OBJECT_OK :
+			archive_zip_capture_mrxs(repository, source_path, &object, error, error_capacity);
+		char owned_path[ARCHIVE_PATH_CAPACITY];
+		if (success) success = archive_ingest_object_path(repository, &object, owned_path, sizeof(owned_path));
+		if (success && is_zip) success = archive_zip_validate(owned_path, error, error_capacity);
+		if (success) success = archive_ingest_mrxs(repository, owned_path, &object, result, error, error_capacity);
+		return success;
 	}
-	return archive_ingest_part10_path(
-		repository, source_path, reference_source, result,
-		error, error_capacity);
+	return archive_ingest_part10_path(repository, source_path, reference_source, result, error, error_capacity);
 }

@@ -70,43 +70,8 @@ static void archive_mrxs_set_uid(dicom_ui_t* value, const char* uid) {
 	value->present = true;
 }
 
-bool archive_mrxs_adapter_open(archive_mrxs_adapter_t* adapter,
-		const char* mrxs_path,
+static bool archive_mrxs_validate(archive_mrxs_adapter_t* adapter, const char* mrxs_path,
 		char* error, size_t error_capacity) {
-	if (adapter) memset(adapter, 0, sizeof(*adapter));
-	if (error && error_capacity) error[0] = '\0';
-	if (!adapter || !mrxs_path ||
-	    strlen(mrxs_path) >= sizeof(((file_info_t*)0)->full_filename))
-		return false;
-	struct stat source_info = {0};
-	if (platform_stat(mrxs_path, &source_info) != 0 ||
-	    !S_ISREG(source_info.st_mode)) {
-		archive_mrxs_set_error(error, error_capacity,
-		                       "MRXS index is missing or invalid: '%s'",
-		                       mrxs_path);
-		return false;
-	}
-	char directory_path[512];
-	snprintf(directory_path, sizeof(directory_path), "%s", mrxs_path);
-	char* extension = strrchr(directory_path, '.');
-	if (!extension || strcasecmp(extension, ".mrxs") != 0) return false;
-	*extension = '\0';
-	struct stat directory_info = {0};
-	file_info_t directory = {0};
-	snprintf(directory.full_filename, sizeof(directory.full_filename),
-	         "%s", directory_path);
-	directory.is_valid =
-		platform_stat(directory_path, &directory_info) == 0;
-	directory.is_directory =
-		directory.is_valid && S_ISDIR(directory_info.st_mode);
-	if (!directory.is_directory ||
-	    !mrxs_open_from_directory(&adapter->slide, &directory, NULL)) {
-		archive_mrxs_set_error(error, error_capacity,
-		                       "built-in MRXS reader rejected '%s'",
-		                       mrxs_path);
-		archive_mrxs_adapter_close(adapter);
-		return false;
-	}
 	if (adapter->slide.is_fluorescence ||
 	    adapter->slide.has_overlapping_tiles ||
 	    !adapter->slide.is_mpp_known ||
@@ -171,6 +136,8 @@ bool archive_mrxs_adapter_open(archive_mrxs_adapter_t* adapter,
 			size_t bytes = MIN(entry->length, KILOBYTES(64));
 			valid_headers = entry->file < (u32)adapter->slide.dat_count &&
 				entry->length <= ARCHIVE_MRXS_MAX_FRAME_SIZE &&
+				entry->offset <= adapter->slide.dat_files[entry->file].size &&
+				entry->length <= adapter->slide.dat_files[entry->file].size - entry->offset &&
 				source_file_read(adapter->slide.dat_files + entry->file,
 					entry->offset, header, bytes) == SOURCE_READ_OK &&
 				jpeg_validate_baseline_ycbcr_header(header, (u32)bytes, level->tile_width, level->tile_height);
@@ -188,6 +155,46 @@ bool archive_mrxs_adapter_open(archive_mrxs_adapter_t* adapter,
 	         mrxs_path);
 	adapter->is_open = true;
 	return true;
+}
+
+bool archive_mrxs_adapter_open(archive_mrxs_adapter_t* adapter,
+		const char* mrxs_path,
+		char* error, size_t error_capacity) {
+	if (adapter) memset(adapter, 0, sizeof(*adapter));
+	if (error && error_capacity) error[0] = '\0';
+	if (!adapter || !mrxs_path ||
+	    strlen(mrxs_path) >= sizeof(((file_info_t*)0)->full_filename))
+		return false;
+	struct stat source_info = {0};
+	if (platform_stat(mrxs_path, &source_info) != 0 ||
+	    !S_ISREG(source_info.st_mode)) {
+		archive_mrxs_set_error(error, error_capacity,
+		                       "MRXS index is missing or invalid: '%s'",
+		                       mrxs_path);
+		return false;
+	}
+	char directory_path[512];
+	snprintf(directory_path, sizeof(directory_path), "%s", mrxs_path);
+	char* extension = strrchr(directory_path, '.');
+	if (!extension || strcasecmp(extension, ".mrxs") != 0) return false;
+	*extension = '\0';
+	struct stat directory_info = {0};
+	file_info_t directory = {0};
+	snprintf(directory.full_filename, sizeof(directory.full_filename),
+	         "%s", directory_path);
+	directory.is_valid =
+		platform_stat(directory_path, &directory_info) == 0;
+	directory.is_directory =
+		directory.is_valid && S_ISDIR(directory_info.st_mode);
+	if (!directory.is_directory ||
+	    !mrxs_open_from_directory(&adapter->slide, &directory, NULL)) {
+		archive_mrxs_set_error(error, error_capacity,
+		                       "built-in MRXS reader rejected '%s'",
+		                       mrxs_path);
+		archive_mrxs_adapter_close(adapter);
+		return false;
+	}
+	return archive_mrxs_validate(adapter, mrxs_path, error, error_capacity);
 }
 
 bool archive_mrxs_adapter_set_identity(archive_mrxs_adapter_t* adapter, const char* bundle_sha256) {
@@ -371,8 +378,8 @@ bool archive_mrxs_adapter_build_shell(archive_mrxs_adapter_t* adapter,
 			arrput(instance->per_frame_plane_position_slide, position);
 			payloads[i][frame_index++] =
 				(archive_shell_native_payload_t){
-					.file_index = entry.file,
-					.offset = entry.offset,
+					.file_index = adapter->is_zip ? 0 : entry.file,
+					.offset = entry.offset + (adapter->is_zip ? adapter->slide.dat_files[entry.file].offset : 0),
 					.size = entry.length,
 				};
 		}
@@ -388,7 +395,7 @@ bool archive_mrxs_adapter_build_shell(archive_mrxs_adapter_t* adapter,
 			.source_byte_size = bundle_descriptor_size,
 			.representation_fingerprint = representation_fingerprint,
 			.provider_kind = ARCHIVE_SHELL_PROVIDER_MRXS_NATIVE,
-			.provider_parameter_version = ARCHIVE_MRXS_ADAPTER_VERSION,
+			.provider_parameter_version = adapter->is_zip ? ARCHIVE_MRXS_ZIP_ADAPTER_VERSION : ARCHIVE_MRXS_ADAPTER_VERSION,
 			.native_payloads = payloads[i],
 			.native_payload_count = occupied_frame_count,
 		};
@@ -497,4 +504,22 @@ bool archive_mrxs_adapter_get_jpeg_tile(archive_mrxs_adapter_t* adapter,
 		error, error_capacity,
 		"requested MRXS grid position has no stored tile");
 	return false;
+}
+
+
+bool archive_mrxs_adapter_open_zip(archive_mrxs_adapter_t* adapter, const char* path, char* error, size_t capacity) {
+	if (!adapter || !path) return false;
+	memset(adapter, 0, sizeof(*adapter));
+	adapter->is_zip = true;
+	if (!mrxs_open_from_zip(&adapter->slide, path, error, capacity)) {
+		archive_mrxs_adapter_close(adapter); return false;
+	}
+	return archive_mrxs_validate(adapter, path, error, capacity);
+}
+
+bool archive_mrxs_zip_recipe(const char* hash, u64 size, char recipe[512], size_t* recipe_size, char fingerprint[65]) {
+	int length = snprintf(recipe, 512, "slidescape-mrxs-zip-v" ARCHIVE_MRXS_ZIP_ADAPTER_VERSION_STRING "\nblob-sha256\t%s\nblob-size\t%llu\n", hash, (unsigned long long)size);
+	if (length <= 0 || length >= 512) return false;
+	*recipe_size = (size_t)length;
+	return archive_sha256_bytes(recipe, *recipe_size, fingerprint);
 }

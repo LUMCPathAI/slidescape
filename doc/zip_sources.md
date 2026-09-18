@@ -1,16 +1,18 @@
-# Stored ZIP sources: first implementation
+# Stored ZIP sources and owned MRXS ingestion
 
-The shared source layer supports ordinary directories and ZIP/ZIP64 archives with
-stored (method 0) members. Native MRXS is the first migrated image backend. The
-viewer can open a `.zip` containing exactly one MRXS companion directory, including
-nested directories. Discovery uses `Slidedat.ini`; a `.mrxs` thumbnail and an entry
-point manifest are unnecessary. OpenSlide is never used for ZIP inputs.
+The viewer opens stored ZIP/ZIP64 bundles through the native MRXS, DICOM, and TIFF
+backends, without extraction or OpenSlide. No entry-point manifest is needed:
 
-Multiple MRXS slides currently produce an explicit unsupported-selection error.
-A container is a namespace, not implicitly a study. DICOM grouping and selection
-can later operate on the container root; multiple unrelated single-file slides
-should have explicit selection/grouping rather than being assigned one study by
-packaging alone. DICOM, TIFF and iSyntax ZIP opening are not yet integrated.
+- MRXS discovery uses `Slidedat.ini`, including in nested directories. The sibling
+  `.mrxs` thumbnail is optional. MRXS discovery takes precedence over its image sidecars.
+- DICOM discovery starts at the ZIP root, recursively recognizes Part 10 headers,
+  and keeps the existing series grouping and multi-slide selector. Member extensions
+  are not required; selecting another slide reopens the same container and member.
+  Annotation sidecar names include the series UID so slides do not share annotations.
+- A single TIFF/BigTIFF member is recognized by its header and opened directly.
+  Multiple TIFFs, multiple MRXS slides, and mixed DICOM/TIFF containers are rejected
+  pending a general slide-selection policy. iSyntax and simple-image ZIP loading
+  are not yet supported.
 
 ## Shared interfaces
 
@@ -25,14 +27,16 @@ packaging alone. DICOM, TIFF and iSyntax ZIP opening are not yet integrated.
   enumeration includes hidden files and empty directories.
 
 Namespaces own their handles and indexes. Open member views on the loading thread;
-then read them concurrently. Stop readers before closing the namespace. MRXS owns
-its namespace and closes it after outstanding tile work completes. The lower-level
+then read them concurrently. Stop readers before closing the namespace. Image
+backends own their namespace and close it after outstanding tile work completes.
+Local TIFF and DICOM files also use bounded positional views, without closing and
+reopening the file between metadata parsing and tile access. The lower-level
 ZIP index borrows its container; callers using that API own the container lifetime.
 
 The namespace is a file-access abstraction, not an OS security sandbox. Ordinary
-local directory access retains normal filesystem link resolution. A future archive
-packager must explicitly reject or define source symlinks instead of following them
-into an unintended preservation scope.
+local directory access retains normal filesystem link resolution. The archive packager rejects source
+symlinks and Windows reparse points. Sources must remain stable during capture; this
+is not a transactional filesystem snapshot.
 
 ## ZIP profile and preservation
 
@@ -76,23 +80,50 @@ some valid mixed-width ZIP64 archives (including its own streaming output). The
 adapter therefore checks the local header and descriptor against each central
 entry itself. Miniz still parses the ZIP directory and writes the container.
 
-## Archive integration remaining
+## Archive ingestion
 
-This change provides the shared reader/writer and migrates existing archive MRXS
-adapter reads to bounded views. It does **not** yet add ZIP ingestion, change the
-repository schema/identity policy, or migrate existing path-dependent recipes.
+Build with `BUILD_SLIDESCAPE_ARCHIVE=ON`. Owned MRXS ingestion now accepts a thumbnail,
+its companion directory alone, or an already-created stored ZIP:
 
-The next stage should stream the complete original bundle into a staged ZIP,
-validate it, retain one immutable object hash, and publish only after finalization.
-The shell should store enough member placements/payload offsets to serve frames
-without mounting or parsing the ZIP. ZIP parsing belongs to ingestion and shell
-rebuild; opening a remote slide should fetch its shell, and subsequent tile reads
-should fetch only their resolved byte ranges. Staging, durable installation and
-publication remain archive responsibilities, outside the shared ZIP writer.
+```sh
+./slidescape_archive init data/archive_repo
+./slidescape_archive ingest data/archive_repo --source /slides/example.mrxs
+./slidescape_archive ingest data/archive_repo --source /slides/example
+./slidescape_archive ingest data/archive_repo --source /slides/example.zip
+```
+
+For a directory/thumbnail, capture includes the entire companion tree, hidden
+sidecars, empty directories, and the optional sibling thumbnail. Files are sorted
+by relative path. The writer streams into an exclusive staged file while computing
+one SHA-256, flushes it durably, then validates the captured ZIP structure and every
+member CRC. Capture keeps one input data handle open at a time and bounds its member
+list to 64 MiB. An existing ZIP is imported byte-for-byte and fully validated from
+the owned copy. Neither route creates persistent per-member content hashes.
+
+The ZIP hash is the bundle identity and the input to generated DICOM UIDs. Admission
+uses the same supported JPEG MRXS profile as reference ingestion. Only complete,
+validated output can be published. Failures can leave an unreferenced immutable
+object for future garbage collection, but never a partial publication.
+
+MRXS ZIP recipe v7 contains the blob hash and size, with no external paths. Its shell
+stores absolute blob offsets for native JPEG frames. Metadata requests open only the
+shell; the ZIP blob handle opens lazily on the first tile request. Frame reads are
+bounded direct ranges, with no ZIP mounting, directory parsing, or complete hashing.
+Missing/corrupt shells rebuild from the retained recipe and hash-verified ZIP.
+Repository/schema versions are unchanged, and legacy MRXS v5/v6 reference publications
+remain readable. Re-ingesting legacy sources as owned ZIPs gives them new identities;
+there is no silent replacement or migration.
+
+`--reference` remains a development option for ordinary `.mrxs` and Part 10 paths.
+It is not accepted for ZIP ingestion. The archive currently admits **MRXS ZIPs only**;
+DICOM ZIP publication and native TIFF archive admission are subsequent adapter work.
+Viewer support is broader than archive admission. S3 range storage and a source-download
+endpoint are also still pending; the retained ZIP itself already preserves the original
+member bytes and tree for standard ZIP tools to restore.
 
 The writer never publishes or repairs partial output. Sink errors and short source
-reads fail the operation; the caller must discard staged output. No in-place ZIP
-append or update API is exposed.
+reads fail the operation; staged output is discarded. No in-place ZIP append or
+update API is exposed.
 
 ## Verification
 
@@ -103,9 +134,11 @@ CRC-free mounting versus explicit validation, concurrent reads, nested/implicit
 namespaces, empty/hidden/UTF-8 members, malformed headers and unsafe paths, failed
 writes, and native MRXS discovery/decoding through the viewer's image-loading path.
 
-Verified on macOS arm64: Debug and RelWithDebInfo viewer/archive builds; the full
-unit suite (126 cases, 428,578 assertions; two fixture skips); the archive loopback
-integration test; and 14 targeted AddressSanitizer cases. Python's `zipfile`
-independently verified writer output, and the reader validated Python-generated
-streaming ZIP32 and ZIP64 inputs. The 65,536-member boundary test is entirely in
-memory. Windows and Linux branches were reviewed but not built in this session.
+Tests additionally cover owned MRXS capture (including hidden sidecars, an optional
+thumbnail, and empty directories), idempotent ingestion, metadata with the blob
+unavailable, frame reads with an unusable ZIP directory, shell regeneration, and
+nested TIFF/DICOM ZIP tile decoding and DICOM slide selection. All new disk fixtures
+are tiny; no multi-gigabyte files are written. Verified on macOS arm64: Debug and RelWithDebInfo viewer/archive builds; 131 passing
+unit cases (428,789 assertions, two skips); the archive loopback integration test;
+and 18 targeted AddressSanitizer cases (473 assertions). Windows and Linux still
+need runtime verification.

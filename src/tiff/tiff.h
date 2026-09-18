@@ -25,6 +25,7 @@ extern "C" {
 
 #include "common.h"
 #include "platform.h"
+#include "source_fs.h"
 #include "intrinsics.h"
 
 #define TIFF_LITTLE_ENDIAN 0x4949
@@ -304,10 +305,10 @@ typedef struct network_location_t {
 struct tiff_t {
 	bool32 is_remote;
 	network_location_t location;
-	file_stream_t fp;
-#if !IS_SERVER
-	file_handle_t file_handle;
-#endif
+	source_file_t file;
+	source_blob_t* owned_blob; /* Local-file owner; heap stable when tiff_t is moved. */
+	source_fs_t* source; /* ZIP namespace owner, if present. */
+	u64 read_cursor; /* Metadata parser only; tile reads are positional. */
 	i64 filesize;
 	u32 bytesize_of_offsets;
 	u64 ifd_count;
@@ -396,6 +397,8 @@ typedef struct {
 
 u32 get_tiff_field_size(u16 data_type);
 bool32 open_tiff_file(tiff_t* tiff, const char* filename);
+/* Takes namespace ownership, including on failure. Destroy with tiff_destroy(). */
+bool32 open_tiff_from_source(tiff_t* tiff, source_fs_t* source, const char* member);
 memrw_t* tiff_serialize(tiff_t* tiff, memrw_t* buffer);
 i64 find_end_of_http_headers(u8* str, u64 len);
 bool32 tiff_deserialize(tiff_t* tiff, u8* buffer, u64 buffer_size);

@@ -314,7 +314,7 @@ TEST_CASE("pathology archive repository has explicit immutable and publication b
 	CHECK_FALSE(archive_ingest_path(
 		&repository, "missing.mrxs", false, &unsupported_ingest,
 		error, sizeof(error)));
-	CHECK(strstr(error, "requires --reference") != nullptr);
+	CHECK(error[0] != 0);
 	snprintf(path, sizeof(path), "%s/%s", temp_path, ARCHIVE_DATABASE_FILENAME);
 	FILE* database_file = fopen(path, "rb");
 	REQUIRE(database_file != nullptr);
@@ -1086,7 +1086,7 @@ TEST_CASE("virtual DICOM shell loads one aligned Part 10 serving object") {
 	compact_source.pixel_data_offsets = compact_offsets;
 	compact_source.pixel_data_sizes = compact_sizes;
 	compact_source.pixel_data_start_offset = 256;
-	compact_source.file_handle = 0;
+	compact_source.file = {};
 	archive_shell_build_part10_input_t compact_input = input;
 	compact_input.instance = &compact_source;
 	compact_input.source_byte_size = 1024;
@@ -1518,7 +1518,9 @@ TEST_CASE("virtual DICOM shell bounds a final encapsulated frame before trailing
 	REQUIRE(source.pixel_data_sizes != nullptr);
 	/* Reproduce the legacy parser estimate that extends through trailing elements. */
 	source.pixel_data_sizes[0] = (u32)(source_size - frame_offset);
-	source.file_handle = open_file_handle_for_simultaneous_access(temp_path);
+	source_blob_t source_blob = {};
+	REQUIRE(source_blob_open_local(&source_blob, temp_path));
+	REQUIRE(source_file_view(&source_blob, 0, source_blob.size, &source.file));
 
 	archive_shell_build_part10_input_t input = {
 		.instance = &source,
@@ -1541,7 +1543,7 @@ TEST_CASE("virtual DICOM shell bounds a final encapsulated frame before trailing
 	CHECK(payload.size == 12);
 
 	archive_shell_buffer_destroy(&encoded);
-	file_handle_close(source.file_handle);
+	source_blob_close(&source_blob);
 	free(source.pixel_data_offsets);
 	free(source.pixel_data_sizes);
 	CHECK(remove(temp_path) == 0);

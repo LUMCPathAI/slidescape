@@ -523,13 +523,14 @@ bool viewer_load_new_image(app_state_t* app_state, file_info_t* file, directory_
             // Check if there is an associated annotation file.
             char temp_filename[512];
             temp_filename[0] = '\0';
+            const char* annotation_name = file->type == VIEWER_FILE_TYPE_ZIP ? image->name : file->filename_in_directory;
             const char* prefix = (app_state->annotation_directory[0] != '\0') ? app_state->annotation_directory : file->filename_prefix;
-            snprintf(temp_filename, sizeof(temp_filename), "%s%s", prefix, file->filename_in_directory);
+            snprintf(temp_filename, sizeof(temp_filename), "%s%s", prefix, annotation_name);
             bool were_annotations_loaded = false;
 
 			const char* annotation_extensions[] = { "xml", "geojson", "json" };
 			for (i32 extension_index = 0; extension_index < COUNT(annotation_extensions); ++extension_index) {
-				snprintf(temp_filename, sizeof(temp_filename), "%s%s", prefix, file->filename_in_directory);
+				snprintf(temp_filename, sizeof(temp_filename), "%s%s", prefix, annotation_name);
 				replace_file_extension(temp_filename, sizeof(temp_filename), annotation_extensions[extension_index]);
 				if (file_exists(temp_filename)) {
 					if (were_annotations_loaded) {
@@ -613,6 +614,12 @@ bool load_generic_file(app_state_t* app_state, const char* filename, u32 filetyp
 
 bool load_dicom_file_from_directory(app_state_t* app_state, const char* filename,
 		const char* directory_path, u32 filetype_hint) {
+	// A ZIP is the virtual root of a DICOM study. Preserve its selected member on reload.
+	file_info_t container = viewer_get_file_info(directory_path);
+	if (container.is_valid && container.type == VIEWER_FILE_TYPE_ZIP) {
+		copy_cstring(container.zip_member, filename, sizeof(container.zip_member));
+		return viewer_load_new_image(app_state, &container, NULL, filetype_hint);
+	}
 	file_info_t file = viewer_get_file_info(filename);
 	if (!file.is_valid || !file.is_regular_file || file.type != VIEWER_FILE_TYPE_DICOM) {
 		console_print_error("Could not load DICOM file '%s'\n", filename);
@@ -689,7 +696,8 @@ image_t* load_image_from_file(app_state_t* app_state, file_info_t* file, directo
 #endif
 		thread_pool_wait_for_completion(&global_thread_pool);
 	}
-	if (file->type == VIEWER_FILE_TYPE_DICOM && !is_dicom_available && !is_dicom_loading_done) {
+	if ((file->type == VIEWER_FILE_TYPE_DICOM || file->type == VIEWER_FILE_TYPE_ZIP) &&
+	    !is_dicom_available && !is_dicom_loading_done) {
 #if DO_DEBUG
 		console_print("Waiting for DICOM support to finish loading...\n");
 #endif

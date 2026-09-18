@@ -806,43 +806,41 @@ u8* dicom_wsi_decode_tile_to_bgra(dicom_series_t* dicom_series, i32 instance_ind
 	dicom_instance_t* instance = dicom_tile->instance;
 	if (!dicom_tile->exists || !instance) return NULL;
 	if (!dicom_tile->is_offset_known) {
-		if (!dicom_instance_index_pixel_data(instance) ||
-		    !instance->pixel_data_offsets || !instance->pixel_data_sizes ||
-		    dicom_tile->frame_index >= instance->pixel_data_offset_count) {
-			return NULL;
+		if (!dicom_instance_index_pixel_data(instance)) return NULL;
+		// Concatenation tiles can borrow a different instance's offset table.
+		if (!dicom_tile->is_offset_known) {
+			if (!instance->pixel_data_offsets || !instance->pixel_data_sizes ||
+				dicom_tile->frame_index >= instance->pixel_data_offset_count) return NULL;
+			dicom_tile->data_offset_in_file = sizeof(dicom_header_t) + instance->pixel_data_start_offset +
+				instance->pixel_data_offsets[dicom_tile->frame_index];
+			dicom_tile->data_size = instance->pixel_data_sizes[dicom_tile->frame_index];
+			dicom_tile->is_offset_known = true;
 		}
-		dicom_tile->data_offset_in_file = sizeof(dicom_header_t) + instance->pixel_data_start_offset +
-		                                  instance->pixel_data_offsets[dicom_tile->frame_index];
-		dicom_tile->data_size = instance->pixel_data_sizes[dicom_tile->frame_index];
-		dicom_tile->is_offset_known = true;
 	}
 	size_t read_size = dicom_tile->data_size;
 	if (dicom_tile->data_size == DICOM_UNDEFINED_LENGTH) {
 		u8 temp[12];
-		size_t bytes_read = file_handle_read_at_offset(temp, instance->file_handle, dicom_tile->data_offset_in_file, 12);
+		size_t bytes_read = source_file_read_at_offset(temp, &instance->file, dicom_tile->data_offset_in_file, 12);
 		dicom_data_element_t element = dicom_read_data_element(temp, 0, instance->encoding, bytes_read);
 		if (element.tag.as_u32 == DICOM_Item) {
-			read_size = element.length; // TODO: bounds/sanity checks
+			read_size = (u64)element.length + 8; // Include the encapsulation item header.
 		} else {
 			ASSERT(!"could not read a valid Item");
 			return NULL;
 		}
 	}
-	if (read_size == DICOM_UNDEFINED_LENGTH) {
-		ASSERT(!"unknown length");
-		return NULL;
-	}
+	if (!read_size || dicom_tile->data_offset_in_file > instance->file.size) return NULL;
+	// The last Basic Offset Table entry can conservatively extend through EOF.
+	u64 available = instance->file.size - dicom_tile->data_offset_in_file;
+	if (read_size > available) read_size = available;
+	if (!read_size || read_size > MEGABYTES(64)) return NULL;
     temp_memory_t temp = begin_temp_memory_on_local_thread();
 	u8* tile_data = (u8*)arena_push_size(temp.arena, read_size);
-	size_t bytes_read = file_handle_read_at_offset(tile_data, instance->file_handle,
+	size_t bytes_read = source_file_read_at_offset(tile_data, &instance->file,
 	                                              dicom_tile->data_offset_in_file, read_size);
 	if (bytes_read != read_size) {
-		// NOTE: this can happen for the last data frame, where the size is not known in advance
-		// (read length can extend past the end of the file)
-		// TODO: better determine the true situation where we need to error out
-		console_print_verbose("DICOM tile decode: could not read complete Pixel Data frame\n");
-//		release_temp_memory(&temp);
-//		return NULL;
+		release_temp_memory(&temp);
+		return NULL;
 	}
 
     u8* result = NULL;

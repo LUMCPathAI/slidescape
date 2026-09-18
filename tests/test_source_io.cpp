@@ -4,6 +4,12 @@
 #include "mrxs.h"
 #include "image_loader.h"
 #include "test_temp.h"
+#include "archive_ingest.h"
+#include "archive_instance_provider.h"
+#include "archive_object.h"
+#include "jpeg_decoder.h"
+#include "dicom_wsi.h"
+
 #include <vector>
 #include <string>
 #include <thread>
@@ -303,14 +309,16 @@ TEST_CASE("ZIP namespace discovers nested implicit directories and keeps one sha
 	source_fs_close(source);
 }
 
-static std::vector<u8> tiny_mrxs_zip(bool duplicate = false, bool omit_data = false) {
+static std::vector<u8> tiny_mrxs_zip(bool duplicate = false, bool omit_data = false, bool jpeg = false) {
 	const char* ini = "[GENERAL]\nIMAGENUMBER_X=1\nIMAGENUMBER_Y=1\nCameraImageDivisionsPerSide=1\n"
 		"[HIERARCHICAL]\nINDEXFILE=Index.dat\nHIER_COUNT=1\nNONHIER_COUNT=0\n"
 		"HIER_0_NAME=Slide zoom level\nHIER_0_COUNT=1\nHIER_0_VAL_0=ZoomLevel_0\nHIER_0_VAL_0_SECTION=ZOOM\n"
 		"[DATAFILE]\nFILE_COUNT=1\nFILE_0=Data0000.dat\n"
 		"[ZOOM]\nDIGITIZER_WIDTH=2\nDIGITIZER_HEIGHT=2\nIMAGE_FORMAT=BMP24\n"
 		"MICROMETER_PER_PIXEL_X=0.25\nMICROMETER_PER_PIXEL_Y=0.25\n";
-	std::vector<u8> ini_bytes(ini, ini+strlen(ini));
+	std::string ini_text(ini);
+	if (jpeg) ini_text.replace(ini_text.find("BMP24"), 5, "JPEG");
+	std::vector<u8> ini_bytes(ini_text.begin(), ini_text.end());
 	std::vector<u8> index(77);
 	memcpy(index.data(), "01.02", 5);
 	put(index, 37, 45, 4); put(index, 41, 49, 4); put(index, 45, 53, 4);
@@ -321,6 +329,14 @@ static std::vector<u8> tiny_mrxs_zip(bool duplicate = false, bool omit_data = fa
 	put(bmp, 18, 2, 4); put(bmp, 22, 2, 4); put(bmp, 26, 1, 2); put(bmp, 28, 24, 2);
 	for (size_t row = 0; row < 2; ++row)
 		for (size_t x = 0; x < 2; ++x) { bmp[54+row*8+x*3] = 30; bmp[55+row*8+x*3] = 20; bmp[56+row*8+x*3] = 10; }
+	if (jpeg) {
+		u8 pixels[16] = {30,20,10,255,30,20,10,255,30,20,10,255,30,20,10,255};
+		u8* encoded = nullptr; u64 size = 0;
+		jpeg_encode_image(pixels, 2, 2, 90, &encoded, &size);
+		REQUIRE(encoded);
+		bmp.assign(encoded, encoded + size); free(encoded);
+		put(index, 69, size, 4);
+	}
 	std::vector<u8> data = {99,98,97}; data.insert(data.end(), bmp.begin(), bmp.end());
 	auto ini_blob = memory_blob(ini_bytes), index_blob = memory_blob(index), data_blob = memory_blob(data);
 	source_zip_input_t members[] = {
@@ -485,4 +501,288 @@ TEST_CASE("ZIP64 entry count crosses 65535 entirely in memory") {
 	CHECK(source_zip_count(zip) == count);
 	CHECK(source_zip_find(zip, "members/65535") != nullptr);
 	source_zip_close(zip);
+}
+
+struct source_test_cleanup { source_fs_t* source; const char* root; };
+static bool source_test_remove(void* context, const source_entry_t* entry) {
+	auto* cleanup = (source_test_cleanup*)context;
+	std::string path = std::string(cleanup->root) + "/" + entry->path;
+	if (!entry->is_directory) return remove(path.c_str()) == 0;
+	bool success = source_fs_list(cleanup->source, entry->path, source_test_remove, cleanup);
+#if defined(_WIN32)
+	return _rmdir(path.c_str()) == 0 && success;
+#else
+	return rmdir(path.c_str()) == 0 && success;
+#endif
+}
+struct source_test_directory {
+	char path[ARCHIVE_PATH_CAPACITY];
+	source_test_directory() { REQUIRE(slidescape_test_make_temp_directory(path, sizeof(path), "slidescape-zip-ingest")); }
+	~source_test_directory() {
+		source_test_cleanup cleanup = {source_fs_open_directory(path), path};
+		if (cleanup.source) source_fs_list(cleanup.source, "", source_test_remove, &cleanup);
+		source_fs_close(cleanup.source);
+#if defined(_WIN32)
+		_rmdir(path);
+#else
+		rmdir(path);
+#endif
+	}
+};
+
+TEST_CASE("archive owns MRXS ZIP bytes and serves metadata and frames without mounting the bundle") {
+	source_test_directory root;
+	auto bytes = tiny_mrxs_zip(false, false, true);
+	std::string original = std::string(root.path) + "/original.zip";
+	FILE* fp = fopen(original.c_str(), "wb"); REQUIRE(fp);
+	REQUIRE(fwrite(bytes.data(), 1, bytes.size(), fp) == bytes.size()); REQUIRE(fclose(fp) == 0);
+	archive_repository_t repository = {};
+	char error[512] = {};
+	std::string repo_path = std::string(root.path) + "/repo";
+	REQUIRE(archive_repository_initialize(&repository, repo_path.c_str(), error, sizeof(error)) == ARCHIVE_REPOSITORY_OK);
+	REQUIRE(archive_instance_provider_initialize());
+	archive_ingest_result_t result = {};
+	REQUIRE_MESSAGE(archive_ingest_path(&repository, original.c_str(), false, &result, error, sizeof(error)), error);
+	CHECK(result.instance_count == 1);
+	// Replaying the same immutable bundle is idempotent.
+	REQUIRE_MESSAGE(archive_ingest_path(&repository, original.c_str(), false, &result, error, sizeof(error)), error);
+	REQUIRE(remove(original.c_str()) == 0);
+	archive_index_t index = {};
+	REQUIRE_MESSAGE(archive_index_open(&index, &repository, error, sizeof(error)), error);
+	REQUIRE(index.instance_count == 1);
+	const auto& record = index.instances[0];
+	CHECK(strcmp(record.object_sha256, record.bundle_sha256) == 0);
+	char blob_path[ARCHIVE_PATH_CAPACITY], shell_path[ARCHIVE_PATH_CAPACITY];
+	REQUIRE(archive_repository_make_path(&repository, record.object_key, blob_path, sizeof(blob_path)));
+	REQUIRE(archive_repository_make_path(&repository, record.shell_key, shell_path, sizeof(shell_path)));
+	std::string hidden = std::string(blob_path) + ".hidden";
+	REQUIRE(rename(blob_path, hidden.c_str()) == 0);
+	char* json = nullptr; size_t json_size = 0;
+	REQUIRE_MESSAGE(archive_instance_provider_get_metadata(&repository, &record, &json, &json_size, error, sizeof(error)), error);
+	CHECK(json_size > 0); free(json);
+	REQUIRE(rename(hidden.c_str(), blob_path) == 0);
+	// Destroy the central-directory signature: frame access must use shell offsets only.
+	const size_t central = signature(bytes, 0x02014b50);
+	REQUIRE(central < bytes.size());
+	fp = fopen(blob_path, "r+b"); REQUIRE(fp);
+	REQUIRE(fseek(fp, (long)central, SEEK_SET) == 0); REQUIRE(fputc(0, fp) != EOF); REQUIRE(fclose(fp) == 0);
+	archive_frame_representation_t representation = {};
+	REQUIRE_MESSAGE(archive_instance_provider_get_frame_representations(&repository, &record, &representation, 1, error, sizeof(error)) == 1, error);
+	std::atomic<int> completed(0);
+	std::vector<std::thread> readers;
+	for (int i = 0; i < 8; ++i) readers.emplace_back([&] {
+		for (int j = 0; j < 4; ++j) {
+			archive_instance_frame_t concurrent_frame = {};
+			char concurrent_error[256] = {};
+			if (archive_instance_provider_get_frame(&repository, &record, 1, &representation,
+				&concurrent_frame, concurrent_error, sizeof(concurrent_error)) && concurrent_frame.size > 4 &&
+				concurrent_frame.data[0] == 0xff && concurrent_frame.data[1] == 0xd8) ++completed;
+			archive_instance_frame_destroy(&concurrent_frame);
+		}
+	});
+	for (auto& reader : readers) reader.join();
+	CHECK(completed.load() == 32);
+	archive_instance_frame_t frame = {};
+	REQUIRE_MESSAGE(archive_instance_provider_get_frame(&repository, &record, 1, &representation, &frame, error, sizeof(error)), error);
+	CHECK(frame.size > 4); CHECK(frame.data[0] == 0xff); CHECK(frame.data[1] == 0xd8);
+	archive_instance_frame_destroy(&frame);
+	archive_instance_provider_shutdown();
+	fp = fopen(blob_path, "r+b"); REQUIRE(fp);
+	REQUIRE(fseek(fp, (long)central, SEEK_SET) == 0); REQUIRE(fputc(bytes[central], fp) != EOF); REQUIRE(fclose(fp) == 0);
+	// Missing derived shells rebuild from the immutable bundle and canonical recipe.
+	REQUIRE(remove(shell_path) == 0);
+	REQUIRE(archive_instance_provider_initialize());
+	REQUIRE_MESSAGE(archive_instance_provider_get_metadata(&repository, &record, &json, &json_size, error, sizeof(error)), error);
+	free(json);
+	fp = fopen(shell_path, "rb"); CHECK(fp); if (fp) fclose(fp);
+	archive_instance_provider_shutdown();
+	archive_index_destroy(&index);
+}
+
+static void source_test_mkdir(const std::string& path) {
+#if defined(_WIN32)
+	REQUIRE(_mkdir(path.c_str()) == 0);
+#else
+	REQUIRE(mkdir(path.c_str(), 0700) == 0);
+#endif
+}
+static void source_test_write(const std::string& path, const void* data, size_t size) {
+	FILE* fp = fopen(path.c_str(), "wb"); REQUIRE(fp);
+	REQUIRE(fwrite(data, 1, size, fp) == size); REQUIRE(fclose(fp) == 0);
+}
+
+TEST_CASE("archive packages the complete MRXS directory including sidecars and optional thumbnail") {
+	source_test_directory root;
+	std::string folder = std::string(root.path) + "/slide";
+	source_test_mkdir(folder); source_test_mkdir(folder + "/empty");
+	auto bytes = tiny_mrxs_zip(false, false, true);
+	auto blob = memory_blob(bytes); auto view = entire(blob);
+	auto zip = source_zip_open(&view, nullptr, 0); REQUIRE(zip);
+	for (const char* name : {"Slidedat.ini", "Index.dat", "Data0000.dat"}) {
+		std::string member_path = std::string("wrapper/slide/") + name;
+		auto member = source_zip_find(zip, member_path.c_str()); REQUIRE(member);
+		std::vector<u8> data(member->file.size);
+		REQUIRE(source_file_read(&member->file, 0, data.data(), data.size()) == SOURCE_READ_OK);
+		source_test_write(folder + "/" + name, data.data(), data.size());
+	}
+	source_zip_close(zip);
+	source_test_write(folder + "/.sidecar", "original", 8);
+	source_test_write(folder + ".mrxs", "thumbnail", 9);
+	archive_repository_t repository = {};
+	char error[512] = {};
+	std::string repo_path = std::string(root.path) + "/repo";
+	REQUIRE(archive_repository_initialize(&repository, repo_path.c_str(), error, sizeof(error)) == ARCHIVE_REPOSITORY_OK);
+	archive_ingest_result_t result = {};
+	REQUIRE_MESSAGE(archive_ingest_path(&repository, folder.c_str(), false, &result, error, sizeof(error)), error);
+	archive_index_t index = {};
+	REQUIRE(archive_index_open(&index, &repository, error, sizeof(error)));
+	REQUIRE(index.instance_count == 1);
+	char owned[ARCHIVE_PATH_CAPACITY];
+	REQUIRE(archive_repository_make_path(&repository, index.instances[0].object_key, owned, sizeof(owned)));
+	auto source = source_fs_open_zip(owned, error, sizeof(error)); REQUIRE_MESSAGE(source, error);
+	source_entry_t entry;
+	REQUIRE(source_fs_stat(source, "slide/empty", &entry)); CHECK(entry.is_directory);
+	for (const char* name : {"slide/.sidecar", "slide.mrxs"}) {
+		source_file_t file; REQUIRE(source_fs_open_file(source, name, &file));
+		char value[16] = {}; REQUIRE(source_file_read(&file, 0, value, (size_t)file.size) == SOURCE_READ_OK);
+		CHECK(strcmp(value, !strcmp(name, "slide.mrxs") ? "thumbnail" : "original") == 0);
+	}
+	source_fs_close(source); archive_index_destroy(&index);
+	// Removing the optional thumbnail leaves a valid directory-only bundle.
+	REQUIRE(remove((folder + ".mrxs").c_str()) == 0);
+	REQUIRE_MESSAGE(archive_ingest_path(&repository, folder.c_str(), false, &result, error, sizeof(error)), error);
+#if !defined(_WIN32)
+	// Link targets must not escape the bundle or silently disappear from preservation.
+	REQUIRE(symlink("Slidedat.ini", (folder + "/linked.ini").c_str()) == 0);
+	CHECK_FALSE(archive_ingest_path(&repository, folder.c_str(), false, &result, error, sizeof(error)));
+	CHECK(strstr(error, "links") != nullptr);
+#endif
+}
+
+static std::vector<u8> source_test_tiff() {
+	// One uncompressed 2x2 RGB tile; extra tag values and pixels are out of line.
+	std::vector<u8> bytes(192);
+	put(bytes, 0, 0x4949, 2); put(bytes, 2, 42, 2); put(bytes, 4, 8, 4);
+	put(bytes, 8, 10, 2);
+	size_t at = 10;
+	auto tag = [&](u16 id, u16 type, u32 count, u32 value) {
+		put(bytes, at, id, 2); put(bytes, at+2, type, 2); put(bytes, at+4, count, 4); put(bytes, at+8, value, 4); at += 12;
+	};
+	tag(256, 4, 1, 2); tag(257, 4, 1, 2); tag(258, 3, 3, 140);
+	tag(259, 3, 1, 1); tag(262, 3, 1, 2); tag(277, 3, 1, 3);
+	tag(322, 4, 1, 2); tag(323, 4, 1, 2); tag(324, 4, 1, 180); tag(325, 4, 1, 12);
+	put(bytes, 140, 8, 2); put(bytes, 142, 8, 2); put(bytes, 144, 8, 2);
+	for (size_t i = 180; i < bytes.size(); i += 3) { bytes[i] = 10; bytes[i+1] = 20; bytes[i+2] = 30; }
+	return bytes;
+}
+
+static std::vector<u8> source_test_dicom(int number) {
+	std::vector<u8> bytes(132); memcpy(bytes.data()+128, "DICM", 4);
+	auto element = [&](u16 group, u16 tag, const char* vr, std::vector<u8> value) {
+		if (value.size() & 1) value.push_back(!strcmp(vr, "UI") || !strcmp(vr, "OB") ? 0 : ' ');
+		size_t at = bytes.size(); put(bytes, at, group, 2); put(bytes, at+2, tag, 2);
+		bytes.push_back(vr[0]); bytes.push_back(vr[1]);
+		if (!strcmp(vr, "OB")) { put(bytes, at+6, 0, 2); put(bytes, at+8, value.size(), 4); }
+		else put(bytes, at+6, value.size(), 2);
+		bytes.insert(bytes.end(), value.begin(), value.end());
+	};
+	auto text = [&](u16 group, u16 tag, const char* vr, std::string value) { element(group, tag, vr, {value.begin(), value.end()}); };
+	auto us = [&](u16 tag, u16 value) { element(0x28, tag, "US", {(u8)value, (u8)(value >> 8)}); };
+	std::string sop = "2.25." + std::to_string(300+number), series = "2.25." + std::to_string(200+number);
+	const char* sop_class = "1.2.840.10008.5.1.4.1.1.77.1.6";
+	text(2, 2, "UI", sop_class); text(2, 3, "UI", sop); text(2, 0x10, "UI", "1.2.840.10008.1.2.1");
+	text(8, 8, "CS", "DERIVED\\PRIMARY\\VOLUME\\RESAMPLED");
+	text(8, 0x16, "UI", sop_class); text(8, 0x18, "UI", sop); text(8, 0x60, "CS", "SM");
+	text(0x20, 0x0d, "UI", "2.25.100"); text(0x20, 0x0e, "UI", series);
+	text(0x20, 0x13, "IS", "1"); text(0x20, 0x9311, "CS", "TILED_FULL");
+	us(2, 3); text(0x28, 4, "CS", "RGB"); us(6, 0); text(0x28, 8, "IS", "1");
+	us(0x10, 2); us(0x11, 2); us(0x100, 8); us(0x101, 8); us(0x102, 7); us(0x103, 0);
+	element(0x48, 6, "UL", {2,0,0,0}); element(0x48, 7, "UL", {2,0,0,0});
+	auto sequence_begin = [&](u16 group, u16 tag) {
+		size_t at = bytes.size(); put(bytes, at, group, 2); put(bytes, at+2, tag, 2);
+		bytes.push_back('S'); bytes.push_back('Q'); put(bytes, at+6, 0, 6);
+		put(bytes, at+12, 0xe000fffe, 4); put(bytes, at+16, 0, 4); return at;
+	};
+	auto sequence_end = [&](size_t at) { put(bytes, at+8, bytes.size()-at-12, 4); put(bytes, at+16, bytes.size()-at-20, 4); };
+	size_t shared = sequence_begin(0x5200, 0x9229), measures = sequence_begin(0x28, 0x9110);
+	text(0x28, 0x30, "DS", "0.00025\\0.00025"); sequence_end(measures); sequence_end(shared);
+	element(0x7fe0, 0x10, "OB", {10,20,30,10,20,30,10,20,30,10,20,30});
+	return bytes;
+}
+
+TEST_CASE("viewer opens nested TIFF and multi-slide DICOM ZIP members through native bounded reads") {
+	init_global_system_info(false);
+	if (!threadlocal_thread_memory) init_thread_memory(&global_system_info);
+	for (bool is_dicom : {false, true}) {
+		CAPTURE(is_dicom);
+		auto first = is_dicom ? source_test_dicom(1) : source_test_tiff();
+		auto second = source_test_dicom(2);
+		auto first_blob = memory_blob(first), second_blob = memory_blob(second);
+		source_zip_input_t members[] = {{"nested/a/slide", entire(first_blob), false}, {"nested/b/slide", entire(second_blob), false}};
+		std::vector<u8> bytes;
+		REQUIRE(source_zip_write(members, is_dicom ? 2 : 1, memory_write, &bytes, nullptr, 0));
+		source_test_file zip(bytes);
+		file_info_t file = viewer_get_file_info(zip.path); file.type = VIEWER_FILE_TYPE_ZIP;
+		for (int selected = 0; selected < (is_dicom ? 2 : 1); ++selected) {
+			if (selected) strcpy(file.zip_member, "nested/b/slide");
+			image_t* image = image_load_from_file(&file, nullptr, nullptr);
+			REQUIRE(image); REQUIRE(image->is_valid);
+			u8* pixels = nullptr;
+			if (is_dicom) {
+				CHECK(image->backend == IMAGE_BACKEND_DICOM);
+				CHECK(arrlen(image->dicom.slides) == 2);
+				CHECK(image->dicom.instances[0].series == &image->dicom);
+				CHECK(image->dicom.selected_slide_index == selected);
+				CHECK(strstr(image->name, selected ? "series-2.25.202.zip" : "series-2.25.201.zip") != nullptr);
+				pixels = dicom_wsi_decode_tile_to_bgra(&image->dicom, 0, 0);
+			} else {
+				CHECK(image->backend == IMAGE_BACKEND_TIFF);
+				pixels = tiff_decode_tile(0, &image->tiff, image->tiff.main_image_ifd, 0, 0, 0, 0);
+			}
+			REQUIRE(pixels);
+			for (int i = 0; i < 4; ++i) {
+				CHECK(pixels[i*4] == 30); CHECK(pixels[i*4+1] == 20); CHECK(pixels[i*4+2] == 10); CHECK(pixels[i*4+3] == 255);
+			}
+			free(pixels); image_destroy(image); free(image);
+		}
+	}
+}
+
+TEST_CASE("viewer rejects ambiguous and invalid TIFF ZIP members without OpenSlide fallback") {
+	for (bool ambiguous : {false, true}) {
+		auto tiff = source_test_tiff();
+		if (!ambiguous) put(tiff, 4, 0, 4); // Header but no image directory.
+		auto blob = memory_blob(tiff);
+		source_zip_input_t members[] = {{"a.tif", entire(blob), false}, {"b.tif", entire(blob), false}};
+		std::vector<u8> bytes;
+		REQUIRE(source_zip_write(members, ambiguous ? 2 : 1, memory_write, &bytes, nullptr, 0));
+		source_test_file temp(bytes);
+		file_info_t file = viewer_get_file_info(temp.path); file.type = VIEWER_FILE_TYPE_ZIP;
+		image_load_options_t options = {}; options.openslide_available = true;
+		image_t* image = image_load_from_file(&file, nullptr, &options);
+		REQUIRE(image); CHECK_FALSE(image->is_valid);
+		free(image); // Failed loaders already released their backend/namespace.
+	}
+}
+
+TEST_CASE("archive rejects damaged ZIP payloads before publishing a bundle") {
+	source_test_directory root;
+	auto bytes = tiny_mrxs_zip(false, false, true);
+	auto blob = memory_blob(bytes); auto view = entire(blob);
+	auto zip = source_zip_open(&view, nullptr, 0); REQUIRE(zip);
+	auto member = source_zip_find(zip, "wrapper/slide/Data0000.dat"); REQUIRE(member);
+	bytes[(size_t)member->file.offset + 3] ^= 1;
+	source_zip_close(zip);
+	std::string original = std::string(root.path) + "/damaged.zip";
+	source_test_write(original, bytes.data(), bytes.size());
+	archive_repository_t repository = {}; char error[512] = {};
+	std::string repo_path = std::string(root.path) + "/repo";
+	REQUIRE(archive_repository_initialize(&repository, repo_path.c_str(), error, sizeof(error)) == ARCHIVE_REPOSITORY_OK);
+	archive_ingest_result_t result = {};
+	CHECK_FALSE(archive_ingest_path(&repository, original.c_str(), false, &result, error, sizeof(error)));
+	CHECK(error[0] != 0);
+	archive_index_t index = {};
+	REQUIRE(archive_index_open(&index, &repository, error, sizeof(error)));
+	CHECK(index.instance_count == 0);
+	archive_index_destroy(&index);
 }

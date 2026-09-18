@@ -610,3 +610,51 @@ const char* archive_object_status_string(archive_object_status_t status) {
 		default: return "unknown object error";
 	}
 }
+
+
+typedef struct archive_zip_sink_t {
+	FILE* file;
+	archive_sha256_t sha;
+} archive_zip_sink_t;
+
+static bool archive_zip_write(void* context, const void* data, size_t size) {
+	archive_zip_sink_t* sink = context;
+	return fwrite(data, 1, size, sink->file) == size && archive_sha256_update(&sink->sha, data, size);
+}
+
+archive_object_status_t archive_object_store_zip(const archive_repository_t* repository,
+		const source_zip_input_t* members, u32 count, archive_object_t* object,
+		char* error, size_t error_capacity) {
+	if (!repository || !object || !members || !count) return ARCHIVE_OBJECT_INVALID_ARGUMENT;
+	memset(object, 0, sizeof(*object));
+	char staging_path[ARCHIVE_PATH_CAPACITY];
+	archive_zip_sink_t sink = {0};
+	if (!archive_object_create_staging_file(repository, staging_path, sizeof(staging_path),
+		&sink.file, error, error_capacity)) return ARCHIVE_OBJECT_STORAGE_ERROR;
+	archive_sha256_initialize(&sink.sha);
+	bool success = source_zip_write(members, count, archive_zip_write, &sink, error, error_capacity);
+	if (success) success = archive_object_finish_staging(sink.file, staging_path, error, error_capacity);
+	else fclose(sink.file);
+	/* Validate the captured bytes, not a second reading of the mutable inputs. */
+	source_blob_t blob = {0};
+	source_file_t file = {0};
+	source_zip_t* zip = NULL;
+	if (success) success = source_blob_open_local(&blob, staging_path) &&
+		source_file_view(&blob, 0, blob.size, &file) &&
+		(zip = source_zip_open(&file, error, error_capacity)) &&
+		source_zip_validate_contents(zip, error, error_capacity);
+	source_zip_close(zip);
+	source_blob_close(&blob);
+	if (!success) { remove(staging_path); return ARCHIVE_OBJECT_INTEGRITY_ERROR; }
+	u64 size = sink.sha.byte_count;
+	u8 digest[32];
+	char hash[65], key[257];
+	archive_sha256_finish(&sink.sha, digest);
+	archive_sha256_hex(digest, hash);
+	bool present = false;
+	archive_object_status_t status = archive_object_install(repository, "objects", staging_path,
+		hash, size, key, &present, error, error_capacity);
+	if (status != ARCHIVE_OBJECT_OK) { remove(staging_path); return status; }
+	return archive_object_register(repository, hash, size, "application/zip", key, present,
+		object, error, error_capacity);
+}

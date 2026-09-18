@@ -727,11 +727,11 @@ static bool archive_shell_build_frame_map(const dicom_instance_t* instance,
 
 static bool archive_shell_find_last_encapsulated_frame_size(
 		const dicom_instance_t* instance, u64 file_offset, u64 source_size, u32* size) {
-	if (!instance || !instance->file_handle || !size || file_offset >= source_size) return false;
+	if (!instance || !instance->file.blob || !size || file_offset >= source_size) return false;
 	u64 cursor = file_offset;
 	while (cursor <= source_size && source_size - cursor >= 8) {
 		u8 header[8];
-		if (file_handle_read_at_offset(header, instance->file_handle, cursor, sizeof(header)) !=
+		if (source_file_read_at_offset(header, &instance->file, cursor, sizeof(header)) !=
 		    sizeof(header)) return false;
 		bool is_item = header[0] == 0xfe && header[1] == 0xff &&
 		               header[2] == 0x00 && header[3] == 0xe0;

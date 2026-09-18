@@ -346,6 +346,83 @@ static bool image_try_load_with_openslide(image_t* image, const char* filename, 
 	return false;
 }
 
+typedef struct image_zip_discovery_t {
+	source_fs_t* source;
+	u32 mrxs_count, tiff_count, dicom_count;
+	char mrxs_directory[SOURCE_PATH_CAPACITY];
+	char tiff_member[SOURCE_PATH_CAPACITY];
+	bool inspect_headers;
+} image_zip_discovery_t;
+
+static bool image_zip_discover(void* context, const source_entry_t* entry) {
+	image_zip_discovery_t* found = context;
+	if (entry->is_directory) return source_fs_list(found->source, entry->path, image_zip_discover, found);
+	const char* name = strrchr(entry->path, '/');
+	name = name ? name + 1 : entry->path;
+	if (!found->inspect_headers) {
+		if (!strcasecmp(name, "Slidedat.ini")) {
+			++found->mrxs_count;
+			size_t length = name == entry->path ? 0 : (size_t)(name - entry->path - 1);
+			memcpy(found->mrxs_directory, entry->path, length);
+			found->mrxs_directory[length] = 0;
+		}
+		return true;
+	}
+	if (entry->size < 4) return true;
+	u8 header[132];
+	size_t size = ATMOST(sizeof(header), entry->size);
+	source_file_t file;
+	if (!source_fs_open_file(found->source, entry->path, &file) ||
+		source_file_read(&file, 0, header, size) != SOURCE_READ_OK) return false;
+	bool tiff = (!memcmp(header, "II", 2) && (header[2] == 42 || header[2] == 43) && !header[3]) ||
+		(!memcmp(header, "MM", 2) && !header[2] && (header[3] == 42 || header[3] == 43));
+	if (tiff) {
+		++found->tiff_count;
+		copy_cstring(found->tiff_member, entry->path, sizeof(found->tiff_member));
+	}
+	if (size == sizeof(header) && !memcmp(header + 128, "DICM", 4)) ++found->dicom_count;
+	return true;
+}
+
+static void image_load_zip(image_t* image, const file_info_t* file, image_load_options_t* options) {
+	char error[256] = {0};
+	source_fs_t* source = source_fs_open_zip(file->full_filename, error, sizeof(error));
+	if (!source) { console_print_error("Could not open ZIP slide: %s\n", error); return; }
+	image_zip_discovery_t found = {.source = source};
+	bool scanned = source_fs_list(source, "", image_zip_discover, &found);
+	/* MRXS sidecars can themselves be images; discover the enclosing slide first. */
+	if (scanned && !found.mrxs_count) {
+		found.inspect_headers = true;
+		scanned = source_fs_list(source, "", image_zip_discover, &found);
+	}
+	if (scanned && found.mrxs_count == 1) {
+		mrxs_t mrxs = {0};
+		mrxs_set_thread_pool(&mrxs, options->thread_pool);
+		if (mrxs_open_from_source(&mrxs, source, found.mrxs_directory))
+			init_image_from_mrxs(image, &mrxs, options->is_overlay);
+		else mrxs_destroy(&mrxs);
+	} else if (scanned && found.dicom_count && !found.tiff_count) {
+		dicom_series_t dicom = {0};
+		if (dicom_open_from_source(&dicom, source, file->full_filename, file->zip_member[0] ? file->zip_member : NULL)) {
+			init_image_from_dicom(image, &dicom, options->is_overlay);
+			/* Keep annotation sidecars distinct when switching slides in one ZIP. */
+			const dicom_ui_t* uid = &dicom.slides[dicom.selected_slide_index].series_instance_uid;
+			char name[sizeof(image->name)];
+			int basename_capacity = (int)(sizeof(name) - sizeof(uid->value) - sizeof("-series-.zip"));
+			snprintf(name, sizeof(name), "%.*s-series-%.*s.zip", basename_capacity, image->name, (int)uid->len, uid->value);
+			copy_cstring(image->name, name, sizeof(image->name));
+		} else dicom_destroy(&dicom);
+	} else if (scanned && found.tiff_count == 1 && !found.dicom_count) {
+		tiff_t tiff = {0};
+		if (open_tiff_from_source(&tiff, source, found.tiff_member))
+			init_image_from_tiff(image, tiff, options->is_overlay, options->parent_image);
+		else tiff_destroy(&tiff);
+	} else {
+		console_print_error("ZIP has no supported slide, or has ambiguous multiple MRXS/TIFF slides or mixed formats\n");
+		source_fs_close(source);
+	}
+}
+
 image_t* image_load_from_file(file_info_t* file, directory_info_t* directory, image_load_options_t* options) {
 	image_load_options_t default_options = {0};
 	default_options.use_builtin_tiff_backend = true;
@@ -372,15 +449,7 @@ image_t* image_load_from_file(file_info_t* file, directory_info_t* directory, im
 	}
 
 	if (file->type == VIEWER_FILE_TYPE_ZIP) {
-		mrxs_t mrxs = {0};
-		mrxs_set_thread_pool(&mrxs, options->thread_pool);
-		char error[256] = {0};
-		if (mrxs_open_from_zip(&mrxs, filename, error, sizeof(error))) {
-			init_image_from_mrxs(image, &mrxs, is_overlay);
-		} else {
-			mrxs_destroy(&mrxs);
-			console_print_error("Could not open ZIP slide: %s\n", error);
-		}
+		image_load_zip(image, file, options);
 	} else if (file->type == VIEWER_FILE_TYPE_SIMPLE_IMAGE) {
 		// Load using stb_image
 		image->type = IMAGE_TYPE_WSI;

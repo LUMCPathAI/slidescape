@@ -40,6 +40,11 @@ void source_blob_close(source_blob_t* blob);
 bool source_file_view(source_blob_t* blob, u64 offset, u64 size, source_file_t* file);
 source_read_result_t source_file_read(const source_file_t* file, u64 offset, void* dest, size_t size);
 
+/* Compatibility helper for parsers that compare byte counts. Reads remain exact. */
+static inline size_t source_file_read_at_offset(void* dest, const source_file_t* file, u64 offset, size_t size) {
+	return source_file_read(file, offset, dest, size) == SOURCE_READ_OK ? size : 0;
+}
+
 #ifdef __cplusplus
 }
 #endif

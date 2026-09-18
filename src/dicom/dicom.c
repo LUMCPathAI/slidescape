@@ -1163,7 +1163,7 @@ bool dicom_instance_index_pixel_data(dicom_instance_t* instance) {
             ASSERT(bytes_left_in_file >= 0);
             size_t bytes_to_read = MIN(chunk_size, bytes_left_in_file);
 
-            size_t bytes_read = file_handle_read_at_offset(chunk, instance->file_handle, file_offset, bytes_to_read);
+            size_t bytes_read = source_file_read_at_offset(chunk, &instance->file, file_offset, bytes_to_read);
 
             if (bytes_read == bytes_to_read) {
                 // Hack: trick the parser into thinking the data buffer actually starts at the start of the DICOM stream,
@@ -1191,8 +1191,8 @@ bool dicom_instance_index_pixel_data(dicom_instance_t* instance) {
         success = false;
     }
 
-    // update tiles
-    if (success) {
+    // Encapsulated frames use an offset table; native offsets were set above.
+    if (success && instance->is_pixel_data_encapsulated) {
         for (i32 i = 0; i < instance->tile_count; ++i) {
             dicom_tile_t* tile = instance->tiles + i;
             tile->data_offset_in_file = sizeof(dicom_header_t) + instance->pixel_data_start_offset + instance->pixel_data_offsets[tile->frame_index];
@@ -1204,40 +1204,40 @@ bool dicom_instance_index_pixel_data(dicom_instance_t* instance) {
     return success;
 }
 
-dicom_instance_t dicom_load_file(dicom_series_t* dicom_series, file_info_t* file) {
+static dicom_instance_t dicom_load_view(dicom_series_t* dicom_series, const source_file_t* source, const char* filename) {
 
 	dicom_instance_t instance = {};
 	instance.series = dicom_series;
 
 	// TODO: pipe all debug output to private memrw_t for dumping it onto the console later (enable concurrent loading?)
 
-	file_stream_t fp = file_stream_open_for_reading(file->full_filename);
-	if (fp) {
-		copy_cstring(instance.filename, file->full_filename, sizeof(instance.filename));
+	instance.file = *source;
+	if (source->blob && source->size <= INT64_MAX) {
+		copy_cstring(instance.filename, filename, sizeof(instance.filename));
 		size_t chunk_size = KILOBYTES(64);
-		size_t bytes_to_read = MIN(chunk_size, file->filesize);
+		size_t bytes_to_read = MIN(chunk_size, source->size);
 
-		if (file->filesize > sizeof(dicom_header_t)) {
+		if (source->size > sizeof(dicom_header_t)) {
 			memrw_t buffer = memrw_create(bytes_to_read);
-			i64 bytes_read = file_stream_read(buffer.data, (size_t)bytes_to_read, fp);
+			i64 bytes_read = source_file_read_at_offset(buffer.data, source, 0, bytes_to_read);
 			buffer.used_size = bytes_read;
 
 			if (bytes_read == bytes_to_read) {
 				if (is_file_a_dicom_file(buffer.data, bytes_read)) {
-					console_print_verbose("Found DICOM file: '%s'\n", file->full_filename);
+					console_print_verbose("Found DICOM file: '%s'\n", filename);
 					i64 payload_offset = sizeof(dicom_header_t);
 					if (dicom_series->debug_output_file) {
-						fprintf(dicom_series->debug_output_file, "\nFile: %s\n\n", file->full_filename);
+						fprintf(dicom_series->debug_output_file, "\nFile: %s\n\n", filename);
 					}
 					i64 payload_bytes = ((i64)buffer.used_size - payload_offset);
 					ASSERT(payload_bytes > 0);
-					i64 total_bytes_in_stream = file->filesize - payload_offset;
+					i64 total_bytes_in_stream = source->size - payload_offset;
 					ASSERT(total_bytes_in_stream >= payload_bytes);
 
 					instance.encoding = DICOM_TRANSFER_SYNTAX_EXPLICIT_VR_LITTLE_ENDIAN;
 					instance.data = buffer.data + payload_offset;
 					instance.bytes_read_from_file = bytes_read - payload_offset;
-					instance.total_bytes_in_stream = file->filesize - payload_offset;
+					instance.total_bytes_in_stream = source->size - payload_offset;
 
 					// Read the DICOM file in chunks, until we hit the PixelData tag (which should hopefully have a
 					// basic offset table as well for seeking/random access).
@@ -1277,12 +1277,14 @@ dicom_instance_t dicom_load_file(dicom_series_t* dicom_series, file_info_t* file
 						// Read an additional chunk
 						i64 bytes_left_in_file = instance.total_bytes_in_stream - instance.bytes_read_from_file;
 						if (bytes_left_in_file <= 0) {
-							// TODO: handle error condition
+							instance.is_image_invalid = true;
+							break;
 						}
 						ASSERT(bytes_left_in_file > 0 && bytes_left_in_file < instance.total_bytes_in_stream);
 						bytes_to_read = MIN(chunk_size, bytes_left_in_file);
 						memrw_maybe_grow(&buffer, buffer.used_size + bytes_to_read);
-						bytes_read = file_stream_read(buffer.data + buffer.used_size, (size_t)bytes_to_read, fp);
+						bytes_read = source_file_read_at_offset(buffer.data + buffer.used_size, source, buffer.used_size, bytes_to_read);
+						if (bytes_read != bytes_to_read) { instance.is_image_invalid = true; break; }
 						buffer.used_size += bytes_read;
 						buffer.cursor += bytes_read;
 						instance.data = buffer.data + payload_offset; // need to update the pointer, maybe it moved due to resizing
@@ -1304,7 +1306,16 @@ dicom_instance_t dicom_load_file(dicom_series_t* dicom_series, file_info_t* file
 			instance.data = NULL;
 		}
 	}
-	file_stream_close(fp);
+	return instance;
+}
+
+static dicom_instance_t dicom_load_file(dicom_series_t* dicom, const char* filename) {
+	dicom_instance_t instance = {0};
+	source_blob_t* blob = calloc(1, sizeof(*blob));
+	source_file_t file;
+	if (blob && source_blob_open_local(blob, filename) && source_file_view(blob, 0, blob->size, &file))
+		instance = dicom_load_view(dicom, &file, filename);
+	instance.owned_blob = blob;
 	return instance;
 }
 
@@ -1366,14 +1377,42 @@ static bool dicom_paths_equal(const char* a, const char* b) {
 
 static void dicom_load_instances_from_directory_tree(dicom_series_t* dicom, directory_info_t* directory) {
 	for (i32 i = 0; i < arrlen(directory->dicom_files); ++i) {
-		dicom_instance_t instance = dicom_load_file(dicom, directory->dicom_files + i);
+		dicom_instance_t instance = dicom_load_file(dicom, directory->dicom_files[i].full_filename);
 		if (instance.is_valid) {
 			arrput(dicom->instances, instance);
+		} else {
+			dicom_instance_destroy(&instance);
 		}
 	}
 	for (i32 i = 0; i < arrlen(directory->directories); ++i) {
 		dicom_load_instances_from_directory_tree(dicom, directory->directories + i);
 	}
+}
+
+static bool dicom_load_source_entry(void* context, const source_entry_t* entry) {
+	dicom_series_t* dicom = context;
+	if (entry->is_directory) return source_fs_list(dicom->source, entry->path, dicom_load_source_entry, dicom);
+	if (entry->size <= sizeof(dicom_header_t)) return true;
+	source_file_t file;
+	u8 header[sizeof(dicom_header_t)];
+	if (!source_fs_open_file(dicom->source, entry->path, &file) ||
+		source_file_read(&file, 0, header, sizeof(header)) != SOURCE_READ_OK) return false;
+	if (memcmp(header + 128, "DICM", 4)) return true;
+	dicom_instance_t instance = dicom_load_view(dicom, &file, entry->path);
+	if (!instance.is_valid) { dicom_instance_destroy(&instance); return false; }
+	arrput(dicom->instances, instance);
+	return true;
+}
+
+bool dicom_open_from_source(dicom_series_t* dicom, source_fs_t* source,
+		const char* container_path, const char* selected_member) {
+	dicom->source = source;
+	if (!source) return false;
+	directory_info_t directory = {0};
+	copy_cstring(directory.path, container_path, sizeof(directory.path));
+	file_info_t selected = {0};
+	if (selected_member) copy_cstring(selected.full_filename, selected_member, sizeof(selected.full_filename));
+	return dicom_open_from_directory(dicom, &directory, selected_member ? &selected : NULL);
 }
 
 bool dicom_open_from_directory(dicom_series_t* dicom, directory_info_t* directory, const file_info_t* selected_file) {
@@ -1388,11 +1427,14 @@ bool dicom_open_from_directory(dicom_series_t* dicom, directory_info_t* director
 	dicom->tag_handler_func = is_verbose_mode ? handle_dicom_tag_for_tag_dumping : NULL;
 
 	bool success = true;
-	dicom_load_instances_from_directory_tree(dicom, directory);
+	if (dicom->source) success = source_fs_list(dicom->source, "", dicom_load_source_entry, dicom);
+	else dicom_load_instances_from_directory_tree(dicom, directory);
 
 	if (dicom->debug_output_file) {
 		fclose(dicom->debug_output_file);
+		dicom->debug_output_file = NULL;
 	}
+	if (!success) return false;
 
 	console_print("DICOM: series has %d instances\n", arrlen(dicom->instances));
 
@@ -1632,67 +1674,15 @@ bool dicom_open_from_directory(dicom_series_t* dicom, directory_info_t* director
 		dicom->wsi.max_downsample_level = MAX(instance->downsample_level, dicom->wsi.max_downsample_level);
 	}
 
-	// Reopen files for simultaneous access
-	for (i32 i = 0; i < arrlen(dicom->instances); ++i) {
-		dicom_instance_t* instance = dicom->instances + i;
-		instance->file_handle = open_file_handle_for_simultaneous_access(instance->filename);
-		if (!instance->file_handle) {
-			console_print_error("Error: Could not reopen file for asynchronous I/O: '%s'\n", instance->filename);
-			success = false;
-		}
-	}
 
 	console_print("DICOM parsing took %g seconds\n", get_seconds_elapsed(start, get_clock()));
 	return success;
 }
 
-bool dicom_open_from_file(dicom_series_t* dicom, file_info_t* file) {
-	i64 start = get_clock();
-
-	#if DO_DEBUG
-	if (is_verbose_mode) {
-		dicom->debug_output_file = fopen("dicom_dump.txt", "wb");
-	}
-	#endif
-	dicom->tag_handler_func = is_verbose_mode ? handle_dicom_tag_for_tag_dumping : NULL;
-
-	dicom_load_file(dicom, file);
-
-	if (dicom->debug_output_file) {
-		fclose(dicom->debug_output_file);
-	}
-
-	console_print("DICOM parsing took %g seconds\n", get_seconds_elapsed(start, get_clock()));
-	return true;
-}
-
 bool dicom_open_single_instance_from_path(dicom_series_t* dicom, const char* filename) {
-	if (!dicom || !filename || !filename[0] || strlen(filename) >= sizeof(((file_info_t*)0)->full_filename)) {
-		return false;
-	}
-	file_stream_t stream = file_stream_open_for_reading(filename);
-	if (!stream) return false;
-	i64 filesize = file_stream_get_filesize(stream);
-	file_stream_close(stream);
-	if (filesize <= (i64)sizeof(dicom_header_t)) return false;
-
-	file_info_t file = {0};
-	copy_cstring(file.full_filename, filename, sizeof(file.full_filename));
-	file.filesize = filesize;
-	file.is_valid = true;
-	file.is_regular_file = true;
-	file.type = VIEWER_FILE_TYPE_DICOM;
-
-	dicom_instance_t instance = dicom_load_file(dicom, &file);
-	if (!instance.is_valid) {
-		dicom_instance_destroy(&instance);
-		return false;
-	}
-	instance.file_handle = open_file_handle_for_simultaneous_access(filename);
-	if (!instance.file_handle) {
-		dicom_instance_destroy(&instance);
-		return false;
-	}
+	if (!dicom || !filename || !filename[0] || strlen(filename) >= sizeof(((dicom_instance_t*)0)->filename)) return false;
+	dicom_instance_t instance = dicom_load_file(dicom, filename);
+	if (!instance.is_valid) { dicom_instance_destroy(&instance); return false; }
 	arrput(dicom->instances, instance);
 	return true;
 }
@@ -1892,7 +1882,10 @@ void dicom_instance_destroy(dicom_instance_t* instance) {
 		arrfree(specimen->preparation_steps);
 	}
     arrfree(instance->specimens);
-	if (instance->file_handle) file_handle_close(instance->file_handle);
+	if (instance->owned_blob) {
+		source_blob_close(instance->owned_blob); free(instance->owned_blob); instance->owned_blob = NULL;
+	}
+	instance->file = (source_file_t){0};
 }
 
 void dicom_destroy(dicom_series_t* dicom_series) {
@@ -1902,6 +1895,7 @@ void dicom_destroy(dicom_series_t* dicom_series) {
 	}
     arrfree(dicom_series->instances);
     arrfree(dicom_series->slides);
+	source_fs_close(dicom_series->source); dicom_series->source = NULL;
 }
 
 // Undo the encapsulation of encoded pixel data
@@ -1940,7 +1934,7 @@ i64 dicom_defragment_encapsulated_pixel_data_frame(u8* data, i64 len) {
 
 bool dicom_instance_read_encoded_frame(dicom_instance_t* instance, u32 frame_index,
 		u8** data, size_t* size, size_t maximum_size) {
-	if (!instance || !data || !size || !maximum_size || !instance->file_handle ||
+	if (!instance || !data || !size || !maximum_size || !instance->file.blob ||
 	    frame_index >= (u64)instance->number_of_frames) return false;
 	*data = NULL;
 	*size = 0;
@@ -1972,7 +1966,7 @@ bool dicom_instance_read_encoded_frame(dicom_instance_t* instance, u32 frame_ind
 
 	u8* result = (u8*)malloc((size_t)read_size);
 	if (!result) return false;
-	size_t bytes_read = file_handle_read_at_offset(result, instance->file_handle, file_offset, (size_t)read_size);
+	size_t bytes_read = source_file_read_at_offset(result, &instance->file, file_offset, (size_t)read_size);
 	if (bytes_read != (size_t)read_size) {
 		free(result);
 		return false;
@@ -1994,12 +1988,12 @@ bool dicom_instance_read_encoded_frame(dicom_instance_t* instance, u32 frame_ind
 void dicom_read_pixel_data_offsets(dicom_instance_t* instance) {
 	if (instance->is_pixel_data_encapsulated && instance->found_pixel_data) {
 
-		if (instance->file_handle) {
+		if (instance->file.blob) {
 			i64 chunk_size = MEGABYTES(4);
 			temp_memory_t temp = begin_temp_memory_on_local_thread();
 
 			size_t bytes_to_read = MIN(bytes_left_in_file, chunk_size);
-			file_handle_read_at_offset(chunk, instance->file_handle, offset, bytes_to_read);
+			source_file_read_at_offset(chunk, &instance->file, offset, bytes_to_read);
 
 			release_temp_memory(&temp);
 		}

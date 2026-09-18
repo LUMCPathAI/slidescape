@@ -1147,9 +1147,9 @@ archive_database_status_t archive_database_register_part10_bundle(
 	return status;
 }
 
-archive_database_status_t archive_database_register_mrxs_bundle(
+static archive_database_status_t archive_database_register_native_bundle(
 		const archive_repository_t* repository, const char* bundle_digest,
-		i64 descriptor_object_id, archive_database_bundle_t* bundle,
+		i64 descriptor_object_id, bool zip, archive_database_bundle_t* bundle,
 		char* error, size_t error_capacity) {
 	if (bundle) memset(bundle, 0, sizeof(*bundle));
 	if (!repository || !repository->root[0] ||
@@ -1178,12 +1178,13 @@ archive_database_status_t archive_database_register_mrxs_bundle(
 		const char* sql =
 			"INSERT INTO bundle(bundle_digest,source_format,adapter_name,"
 			"adapter_version,descriptor_object_id,state)"
-			" SELECT ?1,'mrxs','slidescape-mrxs','" ARCHIVE_MRXS_BUNDLE_ADAPTER_VERSION "',id,'STAGED'"
+			" SELECT ?1,?3,'slidescape-mrxs','" ARCHIVE_MRXS_BUNDLE_ADAPTER_VERSION "',id,'STAGED'"
 			" FROM object WHERE id=?2 AND sha256=?1"
 			" ON CONFLICT(bundle_digest) DO NOTHING;";
 		if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK ||
 		    sqlite3_bind_text(statement, 1, bundle_digest, -1, SQLITE_STATIC) != SQLITE_OK ||
 		    sqlite3_bind_int64(statement, 2, descriptor_object_id) != SQLITE_OK ||
+		    sqlite3_bind_text(statement, 3, zip ? "mrxs-zip" : "mrxs", -1, SQLITE_STATIC) != SQLITE_OK ||
 		    sqlite3_step(statement) != SQLITE_DONE)
 			status = ARCHIVE_DATABASE_IO_ERROR;
 		else
@@ -1204,7 +1205,7 @@ archive_database_status_t archive_database_register_mrxs_bundle(
 			const char* adapter = (const char*)sqlite3_column_text(statement, 3);
 			const char* version = (const char*)sqlite3_column_text(statement, 4);
 			if (sqlite3_column_int64(statement, 1) != descriptor_object_id ||
-			    !format || strcmp(format, "mrxs") != 0 ||
+			    !format || strcmp(format, zip ? "mrxs-zip" : "mrxs") != 0 ||
 			    !adapter || strcmp(adapter, "slidescape-mrxs") != 0 ||
 			    !version || strcmp(version, ARCHIVE_MRXS_BUNDLE_ADAPTER_VERSION) != 0) {
 				status = ARCHIVE_DATABASE_CONFLICT;
@@ -1221,11 +1222,13 @@ archive_database_status_t archive_database_register_mrxs_bundle(
 	if (status == ARCHIVE_DATABASE_OK) {
 		const char* sql =
 			"INSERT INTO bundle_object(bundle_id,object_id,logical_name,role,ordinal)"
-			" VALUES(?1,?2,'bundle.mrxs.manifest','bundle-descriptor',0)"
+			" VALUES(?1,?2,?3,?4,0)"
 			" ON CONFLICT(bundle_id,logical_name) DO NOTHING;";
 		if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK ||
 		    sqlite3_bind_int64(statement, 1, bundle->id) != SQLITE_OK ||
 		    sqlite3_bind_int64(statement, 2, descriptor_object_id) != SQLITE_OK ||
+		    sqlite3_bind_text(statement, 3, zip ? "bundle.zip" : "bundle.mrxs.manifest", -1, SQLITE_STATIC) != SQLITE_OK ||
+		    sqlite3_bind_text(statement, 4, zip ? "source-bundle" : "bundle-descriptor", -1, SQLITE_STATIC) != SQLITE_OK ||
 		    sqlite3_step(statement) != SQLITE_DONE)
 			status = ARCHIVE_DATABASE_IO_ERROR;
 		sqlite3_finalize(statement);
@@ -1234,15 +1237,16 @@ archive_database_status_t archive_database_register_mrxs_bundle(
 	if (status == ARCHIVE_DATABASE_OK) {
 		const char* sql =
 			"SELECT object_id,role,ordinal FROM bundle_object "
-			"WHERE bundle_id=?1 AND logical_name='bundle.mrxs.manifest';";
+			"WHERE bundle_id=?1 AND logical_name=?2;";
 		if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK ||
 		    sqlite3_bind_int64(statement, 1, bundle->id) != SQLITE_OK ||
+		    sqlite3_bind_text(statement, 2, zip ? "bundle.zip" : "bundle.mrxs.manifest", -1, SQLITE_STATIC) != SQLITE_OK ||
 		    sqlite3_step(statement) != SQLITE_ROW) {
 			status = ARCHIVE_DATABASE_IO_ERROR;
 		} else {
 			const char* role = (const char*)sqlite3_column_text(statement, 1);
 			if (sqlite3_column_int64(statement, 0) != descriptor_object_id ||
-			    !role || strcmp(role, "bundle-descriptor") != 0 ||
+			    !role || strcmp(role, zip ? "source-bundle" : "bundle-descriptor") != 0 ||
 			    sqlite3_column_int(statement, 2) != 0)
 				status = ARCHIVE_DATABASE_CONFLICT;
 		}
@@ -1275,6 +1279,15 @@ archive_database_status_t archive_database_register_mrxs_bundle(
 	return status;
 }
 
+
+archive_database_status_t archive_database_register_mrxs_bundle(const archive_repository_t* repository,
+		const char* digest, i64 object, archive_database_bundle_t* bundle, char* error, size_t capacity) {
+	return archive_database_register_native_bundle(repository, digest, object, false, bundle, error, capacity);
+}
+archive_database_status_t archive_database_register_mrxs_zip_bundle(const archive_repository_t* repository,
+		const char* digest, i64 object, archive_database_bundle_t* bundle, char* error, size_t capacity) {
+	return archive_database_register_native_bundle(repository, digest, object, true, bundle, error, capacity);
+}
 
 archive_database_status_t archive_database_publish_shells(
 		const archive_repository_t* repository,
