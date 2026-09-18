@@ -10,6 +10,7 @@
 
 #include "archive_ingest.h"
 #include "archive_zip.h"
+#include "archive_dicom_zip.h"
 
 #include "archive_database.h"
 #include "archive_representation.h"
@@ -219,12 +220,16 @@ static int archive_ingest_compare_members(const void* a, const void* b) {
 	return strcmp(left->database.sop_instance_uid, right->database.sop_instance_uid);
 }
 
-static bool archive_ingest_build_member(archive_ingest_member_t* member,
-		const archive_object_t* object, const dicom_instance_t* instance) {
-	memset(member, 0, sizeof(*member));
-	member->object = *object;
-	archive_database_instance_t* record = &member->database;
-	record->object_id = object->id;
+bool archive_ingest_build_part10_record(archive_database_instance_t* record,
+		i64 object_id, const dicom_instance_t* instance) {
+	if (!record || !instance || !instance->has_valid_wsi_image_type ||
+		!instance->general_study.StudyInstanceUID.len || !instance->general_series.SeriesInstanceUID.len ||
+		!instance->sop_instance_uid.len || !instance->sop_class_uid.len ||
+		!archive_frame_media_type_for_transfer_syntax(instance->transfer_syntax_uid.value) ||
+		instance->number_of_frames <= 0 || !instance->rows || !instance->columns ||
+		!instance->total_pixel_matrix_columns || !instance->total_pixel_matrix_rows) return false;
+	memset(record, 0, sizeof(*record));
+	record->object_id = object_id;
 	if (!archive_ingest_copy(record->sop_instance_uid, sizeof(record->sop_instance_uid),
 	                         instance->sop_instance_uid.value) ||
 	    !archive_ingest_copy(record->sop_class_uid, sizeof(record->sop_class_uid),
@@ -255,6 +260,13 @@ static bool archive_ingest_build_member(archive_ingest_member_t* member,
 	record->total_pixel_matrix_rows = instance->total_pixel_matrix_rows;
 	record->total_pixel_matrix_columns = instance->total_pixel_matrix_columns;
 	return true;
+}
+
+static bool archive_ingest_build_member(archive_ingest_member_t* member,
+		const archive_object_t* object, const dicom_instance_t* instance) {
+	memset(member, 0, sizeof(*member));
+	member->object = *object;
+	return archive_ingest_build_part10_record(&member->database, object->id, instance);
 }
 
 static bool archive_ingest_build_descriptor(const archive_ingest_member_t* members, i32 count,
@@ -935,8 +947,11 @@ bool archive_ingest_path(const archive_repository_t* repository,
 			archive_zip_capture_mrxs(repository, source_path, &object, error, error_capacity);
 		char owned_path[ARCHIVE_PATH_CAPACITY];
 		if (success) success = archive_ingest_object_path(repository, &object, owned_path, sizeof(owned_path));
-		if (success && is_zip) success = archive_zip_validate(owned_path, error, error_capacity);
-		if (success) success = archive_ingest_mrxs(repository, owned_path, &object, result, error, error_capacity);
+		archive_zip_kind_t kind = ARCHIVE_ZIP_MRXS;
+		if (success && is_zip) success = archive_zip_validate(owned_path, &kind, error, error_capacity);
+		if (success) success = kind == ARCHIVE_ZIP_MRXS ?
+			archive_ingest_mrxs(repository, owned_path, &object, result, error, error_capacity) :
+			archive_dicom_zip_ingest(repository, &object, owned_path, result, error, error_capacity);
 		return success;
 	}
 	return archive_ingest_part10_path(repository, source_path, reference_source, result, error, error_capacity);

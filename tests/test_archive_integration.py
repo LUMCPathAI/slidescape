@@ -2,6 +2,7 @@
 """Public synthetic Part 10 / CLI / HTTP regression tests; standard library only."""
 import concurrent.futures
 import http.client
+import hashlib
 import json
 from pathlib import Path
 import socket
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 
 SOP_CLASS = '1.2.840.10008.5.1.4.1.1.77.1.6'
 TRANSFER_SYNTAX = '1.2.840.10008.1.2.1'
@@ -230,5 +232,131 @@ def main(binary, exercise_deadline=False):
         print('Synthetic archive ingest/publication/HTTP regressions passed.')
 
 
+def test_dicom_zip(binary):
+    with tempfile.TemporaryDirectory(prefix='slidescape-dicom-zip-') as temp:
+        root = Path(temp)
+        repository = root / 'repository'
+        a_path, b_path, c_path = [root / name for name in ('a.dcm', 'b.dcm', 'c.dcm')]
+        a = write_slide(a_path, 1)
+        b = write_slide(b_path, 2, series=201, sparse=True)
+        c = write_slide(c_path, 3)
+        b_pixels = bytes(range(100, 124))
+        b_path.write_bytes(b_path.read_bytes()[:-24] + b_pixels)
+        source = root / 'study.zip'
+        with zipfile.ZipFile(source, 'w', compression=zipfile.ZIP_STORED) as bundle:
+            # Force ZIP64 local headers on tiny members, with nested extensionless names.
+            for name, path in [('nested/a', a_path), ('nested/b', b_path), ('other/c', c_path)]:
+                with bundle.open(name, 'w', force_zip64=True) as member:
+                    member.write(path.read_bytes())
+            bundle.writestr('.sidecar', b'original metadata')
+            bundle.writestr('empty/', b'')
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        run(binary, 'init', repository)
+        run(binary, 'ingest', repository, '--source', source)
+        run(binary, 'ingest', repository, '--source', source)
+        with sqlite3.connect(repository / 'archive.sqlite3') as database:
+            scalar = lambda sql: database.execute(sql).fetchone()[0]
+            assert scalar('SELECT COUNT(*) FROM publication') == 2
+            assert scalar('SELECT COUNT(*) FROM instance') == 3
+            assert scalar('SELECT COUNT(*) FROM bundle') == 1
+            assert scalar('SELECT COUNT(*) FROM bundle_object') == 1
+            assert scalar("SELECT COUNT(*) FROM object WHERE media_type='application/dicom'") == 0
+            assert scalar('SELECT bundle_digest FROM bundle') == digest
+            key = scalar("SELECT storage_key FROM object WHERE media_type='application/zip'")
+            shells = [repository / row[0] for row in database.execute(
+                "SELECT storage_key FROM object WHERE media_type='application/vnd.slidescape.virtual-dicom-shell'")]
+            # Reject incomplete member payloads even when later ZIP bytes are available.
+            write_slide(c_path, 4, truncated=True)
+            damaged = root / 'damaged.zip'
+            with zipfile.ZipFile(damaged, 'w') as bundle:
+                bundle.write(c_path, 'bad.dcm')
+                bundle.writestr('padding', bytes(4096))
+            run(binary, 'ingest', repository, '--source', damaged, success=False)
+            # A header-only Part 10 member is malformed, not an ignorable sidecar.
+            with zipfile.ZipFile(damaged, 'w') as bundle:
+                bundle.write(a_path, 'valid')
+                bundle.writestr('incomplete', bytes(128) + b'DICM')
+            run(binary, 'ingest', repository, '--source', damaged, success=False)
+            # Reject ambiguous SOP identities without requiring per-member hashes.
+            with zipfile.ZipFile(damaged, 'w') as bundle:
+                bundle.write(a_path, 'one')
+                bundle.write(a_path, 'two')
+            run(binary, 'ingest', repository, '--source', damaged, success=False)
+            # A later series conflict rolls back an earlier new series in the same ZIP.
+            write_slide(c_path, 5, series=200)
+            with zipfile.ZipFile(damaged, 'w') as bundle:
+                bundle.write(c_path, 'new')
+                bundle.write(a_path, 'conflicting')
+            run(binary, 'ingest', repository, '--source', damaged, success=False)
+            assert scalar('SELECT COUNT(*) FROM publication') == 2
+            assert scalar('SELECT COUNT(*) FROM instance') == 3
+        source.unlink()
+        for path in (a_path, b_path, c_path):
+            path.unlink()
+        owned = repository / key
+        hidden = owned.with_suffix('.hidden')
+        owned.rename(hidden)
+        with socket.socket() as reservation:
+            reservation.bind(('127.0.0.1', 0))
+            port = reservation.getsockname()[1]
+        log = root / 'server.log'
+        with log.open('w+') as output:
+            server = subprocess.Popen([binary, 'serve', str(repository), '--port', str(port)], stdout=output, stderr=output)
+            try:
+                deadline = time.monotonic() + 10
+                while 'listening on' not in log.read_text():
+                    assert server.poll() is None, log.read_text()
+                    assert time.monotonic() < deadline, log.read_text()
+                    time.sleep(.02)
+                for path in (a, b, c):
+                    assert request(port, path + '/metadata')[0] == 200
+                status, _, body = request(port, a.rsplit('/instances/', 1)[0] + '/metadata')
+                assert status == 200 and len(json.loads(body)) == 2
+                hidden.rename(owned)
+                accept = 'multipart/related; type="application/octet-stream"; transfer-syntax=' + TRANSFER_SYNTAX
+                def check_frames(path):
+                    status, headers, body = request(port, path + '/frames/2,1,2', accept)
+                    assert status == 200, body
+                    boundary = headers['Content-Type'].split('boundary=')[1].encode()
+                    parts = body.split(b'--' + boundary)[1:-1]
+                    pixels = b_pixels if path == b else bytes(range(24))
+                    assert [part.split(b'\r\n\r\n', 1)[1][:-2] for part in parts] == [pixels[12:], pixels[:12], pixels[12:]]
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                    list(pool.map(check_frames, [a, b, c] * 8))
+            finally:
+                server.terminate()
+                try:
+                    server.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+        # Cold-process repair must produce byte-identical published shells.
+        shell_digests = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in shells}
+        for path in shells:
+            path.unlink()
+        with log.open('w+') as output:
+            server = subprocess.Popen([binary, 'serve', str(repository), '--port', str(port)], stdout=output, stderr=output)
+            try:
+                deadline = time.monotonic() + 10
+                while 'listening on' not in log.read_text():
+                    assert server.poll() is None, log.read_text()
+                    assert time.monotonic() < deadline, log.read_text()
+                    time.sleep(.02)
+                for path in (a, b, c):
+                    status, _, body = request(port, path + '/metadata')
+                    assert status == 200, body
+                for path, expected in shell_digests.items():
+                    assert hashlib.sha256(path.read_bytes()).hexdigest() == expected
+            finally:
+                server.terminate()
+                try:
+                    server.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+        print('DICOM ZIP ownership, publication, ordered frames, concurrency, and shell repair passed.')
+
+
 if __name__ == '__main__':
     main(str(Path(sys.argv[1]).resolve()), '--slow' in sys.argv[2:])
+    test_dicom_zip(str(Path(sys.argv[1]).resolve()))

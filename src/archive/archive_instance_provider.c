@@ -14,6 +14,7 @@
 #include "archive_metadata.h"
 #include "archive_object.h"
 #include "archive_mrxs_adapter.h"
+#include "archive_dicom_zip.h"
 #include "archive_sha256.h"
 #include "archive_shell.h"
 #include "archive_shell_recipe.h"
@@ -600,6 +601,31 @@ static bool archive_provider_load_published_shell(
 	return true;
 }
 
+static bool archive_provider_regenerate_dicom_zip(const archive_repository_t* repository,
+		const archive_instance_record_t* record, const u8* retained, size_t retained_size,
+		char* error, size_t capacity) {
+	char recipe[512], fingerprint[65], path[ARCHIVE_PATH_CAPACITY], hash[65];
+	size_t recipe_size = 0;
+	u64 size = 0;
+	bool success = !strcmp(record->object_sha256, record->bundle_sha256) &&
+		archive_dicom_zip_recipe(record->object_sha256, record->object_byte_size,
+			record->study_instance_uid, record->series_instance_uid, recipe, &recipe_size, fingerprint) &&
+		recipe_size == retained_size && !memcmp(recipe, retained, recipe_size) &&
+		!strcmp(fingerprint, record->representation_fingerprint) &&
+		archive_provider_source_path(repository, record, path) && archive_sha256_file(path, hash, &size) &&
+		size == record->object_byte_size && !strcmp(hash, record->object_sha256);
+	archive_dicom_zip_t zip = {0};
+	archive_shell_buffer_t shell = {0};
+	if (success) success = archive_dicom_zip_open(&zip, path, error, capacity) &&
+		archive_dicom_zip_build_series(&zip, record->study_instance_uid, record->series_instance_uid,
+			hash, size, fingerprint, &shell, error, capacity) &&
+		archive_object_repair_shell_bytes(repository, shell.data, shell.size, record->shell_sha256,
+			record->shell_key, error, capacity) == ARCHIVE_OBJECT_OK;
+	archive_shell_buffer_destroy(&shell);
+	archive_dicom_zip_close(&zip);
+	return success;
+}
+
 static bool archive_provider_regenerate_shell(
 		const archive_repository_t* repository, const archive_instance_record_t* record,
 		char* error, size_t error_capacity) {
@@ -635,6 +661,12 @@ static bool archive_provider_regenerate_shell(
 		archive_sha256_bytes(retained_recipe, (size_t)record->recipe_byte_size,
 		                     retained_recipe_sha256) &&
 		strcmp(retained_recipe_sha256, record->recipe_sha256) == 0;
+	if (success && retained_recipe_size >= strlen(ARCHIVE_DICOM_ZIP_RECIPE_MAGIC "\n") &&
+		!memcmp(retained_recipe, ARCHIVE_DICOM_ZIP_RECIPE_MAGIC "\n", strlen(ARCHIVE_DICOM_ZIP_RECIPE_MAGIC "\n"))) {
+		success = archive_provider_regenerate_dicom_zip(repository, record, retained_recipe, retained_recipe_size, error, error_capacity);
+		free(retained_recipe);
+		return success;
+	}
 	if (success && retained_recipe_size >=
 	    strlen(ARCHIVE_PART10_RECIPE_MAGIC "\n") &&
 	    memcmp(retained_recipe, ARCHIVE_PART10_RECIPE_MAGIC "\n",
@@ -1022,7 +1054,8 @@ archive_provider_shared_shell_acquire_locked(
 		}
 		platform_mutex_unlock(&archive_provider_regeneration_mutex);
 	}
-	bool is_zip = success && is_mrxs && instance.provider_parameter_version == ARCHIVE_MRXS_ZIP_ADAPTER_VERSION;
+	bool is_zip = success && ((is_mrxs && instance.provider_parameter_version == ARCHIVE_MRXS_ZIP_ADAPTER_VERSION) ||
+		(is_part10 && instance.provider_parameter_version == ARCHIVE_DICOM_ZIP_PARAMETER_VERSION));
 	char blob_path[ARCHIVE_PATH_CAPACITY] = {0};
 	if (is_zip) success = archive_provider_source_path(repository, record, blob_path);
 	archive_provider_mrxs_sources_t* mrxs_sources =
@@ -1180,7 +1213,7 @@ static archive_provider_cache_entry_t* archive_provider_instance_cache_acquire_l
 				"externally referenced Part 10 source size changed "
 				"or is unavailable");
 	}
-	if (success && is_part10) {
+	if (success && is_part10 && !shared_shell->blob_path[0]) {
 		source_file = open_file_handle_for_simultaneous_access(source_path);
 		success = source_file != 0;
 	}
@@ -1497,6 +1530,20 @@ i32 archive_instance_provider_get_frame_representations(
 	return count;
 }
 
+/* Cache references pin the blob lifetime. Opening is serialized; positional reads are concurrent. */
+static bool archive_provider_read_blob(archive_provider_shell_cache_entry_t* shared,
+		u64 offset, void* data, size_t size) {
+	platform_mutex_lock(&archive_provider_cache_mutex);
+	if (!shared->blob.read && shared->blob_path[0]) {
+		if (source_blob_open_local(&shared->blob, shared->blob_path) && shared->blob.size != shared->blob_size)
+			source_blob_close(&shared->blob);
+	}
+	source_file_t view = {0};
+	bool success = source_file_view(&shared->blob, 0, shared->blob_size, &view);
+	platform_mutex_unlock(&archive_provider_cache_mutex);
+	return success && source_file_read(&view, offset, data, size) == SOURCE_READ_OK;
+}
+
 static bool archive_provider_read_shell_frame(
 		const archive_provider_cache_entry_t* entry, u32 frame_index,
 		u8** data, size_t* size) {
@@ -1517,8 +1564,10 @@ static bool archive_provider_read_shell_frame(
 	    range.size > ARCHIVE_PROVIDER_MAX_FRAME_SIZE) return false;
 	u8* encoded = malloc(range.size);
 	if (!encoded) return false;
-	if (file_handle_read_at_offset(encoded, entry->source_file, range.offset, range.size) !=
-	    range.size) {
+	bool read = entry->shared_shell->blob_path[0] ?
+		archive_provider_read_blob(entry->shared_shell, range.offset, encoded, range.size) :
+		file_handle_read_at_offset(encoded, entry->source_file, range.offset, range.size) == range.size;
+	if (!read) {
 		free(encoded);
 		return false;
 	}
@@ -1549,17 +1598,7 @@ static bool archive_provider_read_mrxs_frame(
 	if (!jpeg) return false;
 	bool success = false;
 	if (entry->instance.provider_parameter_version == ARCHIVE_MRXS_ZIP_ADAPTER_VERSION) {
-		/* Lazy handle initialization is synchronized; subsequent pread calls are
-		   concurrent and the held cache reference pins the shared blob lifetime. */
-		platform_mutex_lock(&archive_provider_cache_mutex);
-		if (!shared->blob.read && shared->blob_path[0]) {
-			if (source_blob_open_local(&shared->blob, shared->blob_path) && shared->blob.size != shared->blob_size)
-				source_blob_close(&shared->blob);
-		}
-		source_file_t view = {0};
-		success = payload.file_index == 0 && source_file_view(&shared->blob, 0, shared->blob_size, &view);
-		platform_mutex_unlock(&archive_provider_cache_mutex);
-		if (success) success = source_file_read(&view, payload.offset, jpeg, payload.size) == SOURCE_READ_OK;
+		success = payload.file_index == 0 && archive_provider_read_blob(shared, payload.offset, jpeg, payload.size);
 	} else {
 		archive_provider_mrxs_sources_t* sources = shared->mrxs_sources;
 		success = sources && payload.file_index < sources->count && payload.offset <= sources->sizes[payload.file_index] &&

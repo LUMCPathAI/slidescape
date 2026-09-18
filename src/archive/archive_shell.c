@@ -823,7 +823,7 @@ static bool archive_shell_build_native_payload_map(
 	return true;
 }
 
-static bool archive_shell_build_payload_map(dicom_instance_t* instance, u64 source_size,
+static bool archive_shell_build_payload_map(dicom_instance_t* instance, u64 source_size, u64 source_offset,
 		archive_shell_section_t* section, archive_shell_payload_map_kind_t* kind,
 		char* error, size_t error_capacity) {
 	if (!dicom_instance_index_pixel_data(instance) ||
@@ -853,7 +853,7 @@ static bool archive_shell_build_payload_map(dicom_instance_t* instance, u64 sour
 		*kind = ARCHIVE_SHELL_PAYLOAD_FIXED_STRIDE;
 		archive_shell_write_u32(section->data, *kind);
 		archive_shell_write_u32(section->data + 4, frame_count);
-		archive_shell_write_u64(section->data + 16, base);
+		archive_shell_write_u64(section->data + 16, source_offset + base);
 		archive_shell_write_u64(section->data + 24, frame_size);
 		return true;
 	}
@@ -903,7 +903,7 @@ static bool archive_shell_build_payload_map(dicom_instance_t* instance, u64 sour
 			valid = false;
 			break;
 		}
-		offsets[frame] = offset;
+		offsets[frame] = source_offset + offset;
 		sizes[frame] = size;
 	}
 	if (!valid) {
@@ -1111,6 +1111,11 @@ bool archive_shell_build_part10(const archive_shell_build_part10_input_t* input,
 	    !archive_shell_hex_digest(input->representation_fingerprint, fingerprint)) {
 		return false;
 	}
+	u64 member_size = input->member_size ? input->member_size : input->source_byte_size;
+	if (input->member_offset > input->source_byte_size || member_size > input->source_byte_size - input->member_offset) {
+		archive_shell_set_error(error, error_capacity, "Part 10 member placement is outside its source blob");
+		return false;
+	}
 	dicom_instance_t* instance = input->instance;
 	if (instance->number_of_frames <= 0 || instance->number_of_frames > UINT32_MAX ||
 	    !instance->rows || !instance->columns ||
@@ -1300,7 +1305,7 @@ bool archive_shell_build_part10(const archive_shell_build_part10_input_t* input,
 			    payload_section, &payload_kind))
 			success = false;
 	} else if (success && !archive_shell_build_payload_map(
-			instance, input->source_byte_size, payload_section,
+			instance, member_size, input->member_offset, payload_section,
 			&payload_kind, error, error_capacity)) {
 		success = false;
 	}

@@ -1679,6 +1679,14 @@ bool dicom_open_from_directory(dicom_series_t* dicom, directory_info_t* director
 	return success;
 }
 
+bool dicom_open_single_instance_from_source(dicom_series_t* dicom, const source_file_t* file, const char* name) {
+	if (!dicom || !file || !name || strlen(name) >= sizeof(((dicom_instance_t*)0)->filename)) return false;
+	dicom_instance_t instance = dicom_load_view(dicom, file, name);
+	if (!instance.is_valid) { dicom_instance_destroy(&instance); return false; }
+	arrput(dicom->instances, instance);
+	return true;
+}
+
 bool dicom_open_single_instance_from_path(dicom_series_t* dicom, const char* filename) {
 	if (!dicom || !filename || !filename[0] || strlen(filename) >= sizeof(((dicom_instance_t*)0)->filename)) return false;
 	dicom_instance_t instance = dicom_load_file(dicom, filename);
@@ -1902,10 +1910,12 @@ void dicom_destroy(dicom_series_t* dicom_series) {
 // See: https://dicom.nema.org/medical/dicom/current/output/html/part05.html#sect_A.4
 
 i64 dicom_defragment_encapsulated_pixel_data_frame(u8* data, i64 len) {
+	if (!data || len <= 0) return -1;
 	i64 current_src_offset = 0;
 	i64 current_dest_offset = 0;
 	for(;;) {
 		i64 bytes_available = len - current_src_offset;
+		if (bytes_available < 8) return -1;
 		dicom_data_element_t element = dicom_read_data_element(data, current_src_offset, DICOM_TRANSFER_SYNTAX_IMPLICIT_VR_LITTLE_ENDIAN, bytes_available);
 		if (element.tag.as_u32 != DICOM_Item) {
 			if (element.tag.as_u32 == DICOM_SequenceDelimitationItem) {
@@ -1914,7 +1924,8 @@ i64 dicom_defragment_encapsulated_pixel_data_frame(u8* data, i64 len) {
 				return -1; // invalid tag
 			}
 		}
-		i64 data_offset = current_src_offset + element.data_offset;
+		// The parser already reports an absolute offset within this buffer.
+		i64 data_offset = element.data_offset;
 		i64 data_bytes_available = len - data_offset;
 		if (element.length > data_bytes_available) {
 			return -1;

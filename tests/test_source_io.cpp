@@ -7,6 +7,7 @@
 #include "archive_ingest.h"
 #include "archive_instance_provider.h"
 #include "archive_object.h"
+#include "archive_dicom_zip.h"
 #include "jpeg_decoder.h"
 #include "dicom_wsi.h"
 
@@ -676,7 +677,7 @@ static std::vector<u8> source_test_tiff() {
 	return bytes;
 }
 
-static std::vector<u8> source_test_dicom(int number) {
+static std::vector<u8> source_test_dicom(int number, bool compressed = false, std::vector<u8>* encoded_frame = nullptr) {
 	std::vector<u8> bytes(132); memcpy(bytes.data()+128, "DICM", 4);
 	auto element = [&](u16 group, u16 tag, const char* vr, std::vector<u8> value) {
 		if (value.size() & 1) value.push_back(!strcmp(vr, "UI") || !strcmp(vr, "OB") ? 0 : ' ');
@@ -690,7 +691,7 @@ static std::vector<u8> source_test_dicom(int number) {
 	auto us = [&](u16 tag, u16 value) { element(0x28, tag, "US", {(u8)value, (u8)(value >> 8)}); };
 	std::string sop = "2.25." + std::to_string(300+number), series = "2.25." + std::to_string(200+number);
 	const char* sop_class = "1.2.840.10008.5.1.4.1.1.77.1.6";
-	text(2, 2, "UI", sop_class); text(2, 3, "UI", sop); text(2, 0x10, "UI", "1.2.840.10008.1.2.1");
+	text(2, 2, "UI", sop_class); text(2, 3, "UI", sop); text(2, 0x10, "UI", compressed ? "1.2.840.10008.1.2.4.50" : "1.2.840.10008.1.2.1");
 	text(8, 8, "CS", "DERIVED\\PRIMARY\\VOLUME\\RESAMPLED");
 	text(8, 0x16, "UI", sop_class); text(8, 0x18, "UI", sop); text(8, 0x60, "CS", "SM");
 	text(0x20, 0x0d, "UI", "2.25.100"); text(0x20, 0x0e, "UI", series);
@@ -706,7 +707,25 @@ static std::vector<u8> source_test_dicom(int number) {
 	auto sequence_end = [&](size_t at) { put(bytes, at+8, bytes.size()-at-12, 4); put(bytes, at+16, bytes.size()-at-20, 4); };
 	size_t shared = sequence_begin(0x5200, 0x9229), measures = sequence_begin(0x28, 0x9110);
 	text(0x28, 0x30, "DS", "0.00025\\0.00025"); sequence_end(measures); sequence_end(shared);
-	element(0x7fe0, 0x10, "OB", {10,20,30,10,20,30,10,20,30,10,20,30});
+	if (!compressed) element(0x7fe0, 0x10, "OB", {10,20,30,10,20,30,10,20,30,10,20,30});
+	else {
+		u8 pixels[16] = {30,20,10,255,30,20,10,255,30,20,10,255,30,20,10,255};
+		u8* jpeg = nullptr; u64 jpeg_size = 0;
+		jpeg_encode_image(pixels, 2, 2, 90, &jpeg, &jpeg_size); REQUIRE(jpeg);
+		std::vector<u8> payload(jpeg, jpeg + jpeg_size); free(jpeg);
+		if (payload.size() & 1) payload.push_back(0);
+		if (encoded_frame) *encoded_frame = payload;
+		size_t at = bytes.size();
+		put(bytes, at, 0x00107fe0, 4); put(bytes, at+4, 'O' | ('B' << 8), 4); put(bytes, at+8, UINT32_MAX, 4);
+		put(bytes, at+12, 0xe000fffe, 4); put(bytes, at+16, 4, 4); put(bytes, at+20, 0, 4); // BOT
+		size_t split = (payload.size() / 2) & ~(size_t)1;
+		for (int fragment = 0; fragment < 2; ++fragment) {
+			size_t start = fragment ? split : 0, end = fragment ? payload.size() : split;
+			at = bytes.size(); put(bytes, at, 0xe000fffe, 4); put(bytes, at+4, end-start, 4);
+			bytes.insert(bytes.end(), payload.begin()+start, payload.begin()+end);
+		}
+		at = bytes.size(); put(bytes, at, 0xe0ddfffe, 4); put(bytes, at+4, 0, 4);
+	}
 	return bytes;
 }
 
@@ -785,4 +804,111 @@ TEST_CASE("archive rejects damaged ZIP payloads before publishing a bundle") {
 	REQUIRE(archive_index_open(&index, &repository, error, sizeof(error)));
 	CHECK(index.instance_count == 0);
 	archive_index_destroy(&index);
+}
+
+TEST_CASE("DICOM ZIP archive publishes series atomically and reads shell ranges without a ZIP directory") {
+	source_test_directory root;
+	std::vector<u8> jpeg;
+	auto first = source_test_dicom(1), second = source_test_dicom(2, true, &jpeg), third = source_test_dicom(3);
+	// Two instances in one series; the third represents a second slide in another study.
+	std::string series_old = "2.25.202", series_new = "2.25.201";
+	auto found = std::search(second.begin(), second.end(), series_old.begin(), series_old.end());
+	REQUIRE(found != second.end()); std::copy(series_new.begin(), series_new.end(), found);
+	std::string study_old = "2.25.100", study_new = "2.25.101";
+	found = std::search(third.begin(), third.end(), study_old.begin(), study_old.end());
+	REQUIRE(found != third.end()); std::copy(study_new.begin(), study_new.end(), found);
+	auto a = memory_blob(first), b = memory_blob(second), c = memory_blob(third);
+	source_zip_input_t members[] = {{"nested/one/a", entire(a), false}, {"nested/one/b", entire(b), false}, {"two/c", entire(c), false}};
+	std::vector<u8> bytes;
+	REQUIRE(source_zip_write(members, 3, memory_write, &bytes, nullptr, 0));
+	std::string original = std::string(root.path) + "/study.zip";
+	source_test_write(original, bytes.data(), bytes.size());
+	archive_repository_t repository = {}; char error[512] = {};
+	std::string repo_path = std::string(root.path) + "/repo";
+	REQUIRE(archive_repository_initialize(&repository, repo_path.c_str(), error, sizeof(error)) == ARCHIVE_REPOSITORY_OK);
+	archive_ingest_result_t result = {};
+	REQUIRE_MESSAGE(archive_ingest_path(&repository, original.c_str(), false, &result, error, sizeof(error)), error);
+	CHECK(result.instance_count == 3); CHECK(result.series_count == 2); CHECK(result.study_count == 2);
+	REQUIRE_MESSAGE(archive_ingest_path(&repository, original.c_str(), false, &result, error, sizeof(error)), error);
+	REQUIRE(remove(original.c_str()) == 0);
+	archive_index_t index = {};
+	REQUIRE_MESSAGE(archive_index_open(&index, &repository, error, sizeof(error)), error);
+	REQUIRE(index.instance_count == 3);
+	char owned[ARCHIVE_PATH_CAPACITY];
+	REQUIRE(archive_repository_make_path(&repository, index.instances[0].object_key, owned, sizeof(owned)));
+	std::string hidden = std::string(owned) + ".hidden";
+	REQUIRE(rename(owned, hidden.c_str()) == 0);
+	REQUIRE(archive_instance_provider_initialize());
+	for (i32 i = 0; i < index.instance_count; ++i) {
+		const auto& record = index.instances[i];
+		CHECK(strcmp(record.object_sha256, index.instances[0].object_sha256) == 0);
+		CHECK(strcmp(record.object_sha256, record.bundle_sha256) == 0);
+		char* json = nullptr; size_t size = 0;
+		REQUIRE_MESSAGE(archive_instance_provider_get_metadata(&repository, &record, &json, &size, error, sizeof(error)), error);
+		CHECK(size > 0); free(json);
+	}
+	REQUIRE(rename(hidden.c_str(), owned) == 0);
+	size_t central = signature(bytes, 0x02014b50); REQUIRE(central < bytes.size());
+	FILE* fp = fopen(owned, "r+b"); REQUIRE(fp);
+	REQUIRE(fseek(fp, (long)central, SEEK_SET) == 0); REQUIRE(fputc(0, fp) != EOF); REQUIRE(fclose(fp) == 0);
+	for (i32 i = 0; i < index.instance_count; ++i) {
+		const auto& record = index.instances[i];
+		CAPTURE(record.sop_instance_uid);
+		archive_frame_representation_t representations[2] = {};
+		i32 count = archive_instance_provider_get_frame_representations(&repository, &record, representations, 2, error, sizeof(error));
+		REQUIRE(count >= 1);
+		archive_instance_frame_t frame = {};
+		REQUIRE_MESSAGE(archive_instance_provider_get_frame(&repository, &record, 1, &representations[0], &frame, error, sizeof(error)), error);
+		if (!strcmp(record.sop_instance_uid, "2.25.302")) {
+			CHECK(frame.size == jpeg.size()); CHECK(memcmp(frame.data, jpeg.data(), jpeg.size()) == 0);
+		} else {
+			REQUIRE(frame.size == 12); CHECK(frame.data[0] == 10); CHECK(frame.data[11] == 30);
+		}
+		archive_instance_frame_destroy(&frame);
+	}
+	archive_instance_provider_shutdown();
+	fp = fopen(owned, "r+b"); REQUIRE(fp);
+	REQUIRE(fseek(fp, (long)central, SEEK_SET) == 0); REQUIRE(fputc(bytes[central], fp) != EOF); REQUIRE(fclose(fp) == 0);
+	// Rebuild every series from the same blob; no original paths or member hashes are needed.
+	for (i32 i = 0; i < index.instance_count; ++i) {
+		char shell_path[ARCHIVE_PATH_CAPACITY];
+		REQUIRE(archive_repository_make_path(&repository, index.instances[i].shell_key, shell_path, sizeof(shell_path)));
+		remove(shell_path); // Two records intentionally share a shell.
+	}
+	REQUIRE(archive_instance_provider_initialize());
+	for (i32 i = 0; i < index.instance_count; ++i) {
+		char* json = nullptr; size_t size = 0;
+		REQUIRE_MESSAGE(archive_instance_provider_get_metadata(&repository, &index.instances[i], &json, &size, error, sizeof(error)), error);
+		free(json);
+	}
+	archive_instance_provider_shutdown(); archive_index_destroy(&index);
+}
+
+TEST_CASE("Part 10 shell translates 64-bit member offsets only after member-bounded validation") {
+	auto bytes = source_test_dicom(1);
+	auto blob = memory_blob(bytes); auto file = entire(blob);
+	dicom_series_t dicom = {};
+	REQUIRE(dicom_open_single_instance_from_source(&dicom, &file, "member"));
+	const u64 offset = (u64)UINT32_MAX + 4096;
+	archive_shell_build_part10_input_t input = {};
+	input.instance = dicom.instances;
+	input.source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+	input.representation_fingerprint = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+	input.source_byte_size = offset + bytes.size() + 4096;
+	input.member_offset = offset; input.member_size = bytes.size();
+	archive_shell_buffer_t output = {}; char error[512] = {};
+	REQUIRE_MESSAGE(archive_shell_build_part10(&input, &output, error, sizeof(error)), error);
+	archive_shell_view_t shell = {}; archive_shell_instance_t instance = {}; archive_shell_payload_range_t range = {};
+	REQUIRE(archive_shell_open(&shell, output.data, output.size, error, sizeof(error)));
+	REQUIRE(archive_shell_get_instance(&shell, 0, &instance));
+	REQUIRE(archive_shell_get_payload_range(&shell, &instance, 0, &range));
+	CHECK(range.offset == offset + bytes.size() - 12); CHECK(range.size == 12);
+	archive_shell_buffer_destroy(&output);
+	// Adjacent ZIP bytes cannot make a truncated member look like a complete frame.
+	input.member_size -= 1;
+	CHECK_FALSE(archive_shell_build_part10(&input, &output, error, sizeof(error)));
+	archive_shell_buffer_destroy(&output);
+	input.member_offset = UINT64_MAX;
+	CHECK_FALSE(archive_shell_build_part10(&input, &output, error, sizeof(error)));
+	archive_shell_buffer_destroy(&output); dicom_destroy(&dicom);
 }

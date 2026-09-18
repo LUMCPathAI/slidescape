@@ -1,4 +1,4 @@
-# Stored ZIP sources and owned MRXS ingestion
+# Stored ZIP sources and owned archive ingestion
 
 The viewer opens stored ZIP/ZIP64 bundles through the native MRXS, DICOM, and TIFF
 backends, without extraction or OpenSlide. No entry-point manifest is needed:
@@ -82,14 +82,16 @@ entry itself. Miniz still parses the ZIP directory and writes the container.
 
 ## Archive ingestion
 
-Build with `BUILD_SLIDESCAPE_ARCHIVE=ON`. Owned MRXS ingestion now accepts a thumbnail,
-its companion directory alone, or an already-created stored ZIP:
+Build with `BUILD_SLIDESCAPE_ARCHIVE=ON`. Owned MRXS ingestion accepts a thumbnail,
+its companion directory alone, or an already-created stored ZIP. DICOM ingestion
+also accepts an existing stored ZIP, with nested Part 10 members:
 
 ```sh
 ./slidescape_archive init data/archive_repo
 ./slidescape_archive ingest data/archive_repo --source /slides/example.mrxs
 ./slidescape_archive ingest data/archive_repo --source /slides/example
 ./slidescape_archive ingest data/archive_repo --source /slides/example.zip
+./slidescape_archive ingest data/archive_repo --source /slides/dicom-study.zip
 ```
 
 For a directory/thumbnail, capture includes the entire companion tree, hidden
@@ -100,8 +102,8 @@ member CRC. Capture keeps one input data handle open at a time and bounds its me
 list to 64 MiB. An existing ZIP is imported byte-for-byte and fully validated from
 the owned copy. Neither route creates persistent per-member content hashes.
 
-The ZIP hash is the bundle identity and the input to generated DICOM UIDs. Admission
-uses the same supported JPEG MRXS profile as reference ingestion. Only complete,
+The ZIP hash is the bundle identity. For MRXS it is also the input to generated
+DICOM UIDs; admission uses the same supported JPEG MRXS profile as reference ingestion. Only complete,
 validated output can be published. Failures can leave an unreferenced immutable
 object for future garbage collection, but never a partial publication.
 
@@ -114,10 +116,33 @@ Repository/schema versions are unchanged, and legacy MRXS v5/v6 reference public
 remain readable. Re-ingesting legacy sources as owned ZIPs gives them new identities;
 there is no silent replacement or migration.
 
+DICOM ZIP admission preserves the original Study, Series, and SOP Instance UIDs.
+It recursively recognizes Part 10 headers, including extensionless members, and
+groups instances by Study/Series. One ZIP can contain multiple studies and series;
+each series gets its own shell, all referencing the same immutable ZIP object.
+Publication of all groups is atomic. Exact replay is idempotent; duplicate SOP
+identities inside a ZIP, a Series UID reused across studies, and conflicts with
+already-published instances/series are rejected. Repacking an existing publication
+does not silently replace its source object.
+
+The initial DICOM ZIP profile allows at most 4096 Part 10 members and requires every
+recognized Part 10 member to satisfy the archive's supported WSI profile. Non-WSI
+Part 10 objects, including DICOMDIR, are not currently admitted. Other sidecars and
+empty directories are preserved but are not published as DICOM instances. Loose
+DICOM files/directories retain their existing ingestion behavior; automatic ZIP
+packaging of DICOM directories is not yet implemented.
+
+DICOM ZIP recipe v1 records only the blob hash/size and selected Study/Series UIDs.
+Its Part 10 shell parameter version is 2. Native and encapsulated frame ranges are
+validated against their member bounds before adding the member's 64-bit blob offset.
+Metadata uses only the shell, and frames use lazy direct blob reads, including
+fragment reassembly when needed. Shell repair verifies the whole ZIP hash and
+rebuilds the selected series deterministically. Neither recipes nor database rows
+retain member hashes, and there is no separate stored object for each Part 10 member.
+
 `--reference` remains a development option for ordinary `.mrxs` and Part 10 paths.
-It is not accepted for ZIP ingestion. The archive currently admits **MRXS ZIPs only**;
-DICOM ZIP publication and native TIFF archive admission are subsequent adapter work.
-Viewer support is broader than archive admission. S3 range storage and a source-download
+It is not accepted for ZIP ingestion. The archive currently admits **MRXS and DICOM ZIPs**;
+native TIFF archive admission is subsequent adapter work. S3 range storage and a source-download
 endpoint are also still pending; the retained ZIP itself already preserves the original
 member bytes and tree for standard ZIP tools to restore.
 
@@ -137,8 +162,13 @@ writes, and native MRXS discovery/decoding through the viewer's image-loading pa
 Tests additionally cover owned MRXS capture (including hidden sidecars, an optional
 thumbnail, and empty directories), idempotent ingestion, metadata with the blob
 unavailable, frame reads with an unusable ZIP directory, shell regeneration, and
-nested TIFF/DICOM ZIP tile decoding and DICOM slide selection. All new disk fixtures
-are tiny; no multi-gigabyte files are written. Verified on macOS arm64: Debug and RelWithDebInfo viewer/archive builds; 131 passing
-unit cases (428,789 assertions, two skips); the archive loopback integration test;
-and 18 targeted AddressSanitizer cases (473 assertions). Windows and Linux still
+nested TIFF/DICOM ZIP tile decoding and DICOM slide selection. DICOM archive coverage
+includes multi-study/series publication, native and fragmented-JPEG frames, concurrent
+ordered HTTP frame requests, replay/conflict rollback, malformed members, metadata
+without the source blob, and deterministic shell repair. A virtual member placement
+tests offsets beyond 4 GiB and prevents truncated members from reading into adjacent
+ZIP data. All new disk fixtures are tiny; no multi-gigabyte files are written.
+Verified on macOS arm64: Debug and RelWithDebInfo viewer/archive builds; 133 passing
+unit cases (428,865 assertions, two skips); the archive loopback integration test;
+and 20 targeted AddressSanitizer cases (549 assertions). Windows and Linux still
 need runtime verification.

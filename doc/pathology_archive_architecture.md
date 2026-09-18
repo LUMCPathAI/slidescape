@@ -127,21 +127,23 @@ it requires and preserves every per-frame Plane Position (Slide) and Optical Pat
 Identification value. It refuses inconsistent counts, unknown optical paths, invalid
 positions, malformed lengths, unsupported versions, and out-of-range assignments.
 
-Frame maps live inside the immutable content-addressed shell. Each Study/Series group
-has its own canonical source bundle, so replaying it in a larger discovery batch does
-not change its identity. Registration stages bundles; one final transaction publishes
+Frame maps live inside the immutable content-addressed shell. For loose Part 10 input,
+each Study/Series group has its own canonical source bundle, so replaying it in a larger
+discovery batch does not change its identity. For DICOM ZIP input, the complete ZIP is
+one bundle shared by all its Study/Series groups. Registration stages bundles; one final transaction publishes
 all prepared bundles, representations, provider/index rows, and outbox events together.
 Failed admission may leave unreferenced objects or staged bundles, which remain
 invisible to QIDO. Exact replay is idempotent. Adding instances to an already published
 series or replacing it is deliberately rejected until explicit versioning exists.
 
 The current shell writer is v3, the Part 10 recipe/adapter is v10, and the native MRXS
-reference recipe/adapter is v6; owned ZIP MRXS uses v7. Binary v2 remains readable.
+reference recipe/adapter is v6; owned ZIP MRXS uses v7. DICOM ZIP uses recipe/adapter
+v1 and Part 10 shell parameter v2 for absolute blob ranges. Binary v2 remains readable.
 Its absent ImageType provenance is omitted from JSON rather than inferred. Current
-Part 10 and MRXS ZIP recipes can regenerate shells; older intact shells remain usable, but applying the corrected metadata/profile
+Part 10, DICOM ZIP, and MRXS ZIP recipes can regenerate shells; older intact shells remain usable, but applying the corrected metadata/profile
 to old publications requires a fresh development repository. No in-place migration or
 silent publication replacement is performed. Repository layout v2 and SQLite schema
-v5 are unchanged. Bundle registration adapter versions (Part 10: 1, MRXS: 2) describe
+v5 are unchanged. Bundle registration adapter versions (Part 10: 1, DICOM ZIP: 1, MRXS: 2) describe
 the descriptor/member contract, independently of shell-generation versions.
 
 MRXS supports owned ZIP ingestion as well as legacy development references. Every
@@ -404,7 +406,7 @@ External development ingestion uses one command for all detected formats:
 stored in SQLite rather than copied into `objects/`; MRXS retains its bundle path in
 the inline provider recipe. Provider-cache admission avoids rehashing the WSI.
 This option is explicitly external ownership, not durable archive storage. Omit
-`--reference` for owned MRXS ZIP preservation.
+`--reference` for owned MRXS ZIP preservation or to import an existing MRXS/DICOM ZIP.
 
 The viewer tile-cache locking/lifetime prerequisite and bounded four-frame DICOMweb
 batching are complete. The next implementation slices are:
@@ -416,8 +418,8 @@ batching are complete. The next implementation slices are:
    failing repair jobs, and fail-fast adapter-version validation. Keep request-local
    coalescing bounded; implement cross-process cloud repair through durable jobs and
    telemetry.
-3. Extend owned ZIP publication beyond MRXS to DICOM bundles and add native TIFF
-   archive admission. Add S3-compatible range storage and original-bundle downloads.
+3. Add native TIFF archive admission, S3-compatible range storage, and original-bundle
+   downloads. Owned MRXS and DICOM ZIP publication are implemented.
 4. Add STOW and source-bundle admission only after publication failure semantics are
    established.
 5. Expand pinned native profiles and the normalized viewer WSI model after associated

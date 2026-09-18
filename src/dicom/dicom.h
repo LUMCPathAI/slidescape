@@ -576,6 +576,8 @@ bool dicom_open_from_source(dicom_series_t* dicom, source_fs_t* source,
  * dicom_destroy().
  */
 bool dicom_open_single_instance_from_path(dicom_series_t* dicom, const char* filename);
+/* Borrows a bounded member view; keep its owner alive until dicom_destroy(). */
+bool dicom_open_single_instance_from_source(dicom_series_t* dicom, const source_file_t* file, const char* name);
 dicom_data_element_t dicom_read_data_element(u8* data_start, i64 data_offset, dicom_transfer_syntax_enum encoding, i64 bytes_available);
 dicom_ui_t dicom_parse_uid(str_t s);
 dicom_lo_t dicom_parse_long_string(str_t s);

@@ -82,6 +82,10 @@ typedef struct archive_shell_build_part10_input_t {
 	dicom_instance_t* instance;
 	const char* source_sha256;
 	u64 source_byte_size;
+	/* Optional Part 10 member placement in that source; zero length means the whole file.
+	   Validate member-relative ranges first, then emit absolute source offsets. */
+	u64 member_offset;
+	u64 member_size;
 	const char* representation_fingerprint;
 	archive_shell_provider_kind_t provider_kind;
 	u32 provider_parameter_version;

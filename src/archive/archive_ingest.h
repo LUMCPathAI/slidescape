@@ -11,6 +11,7 @@
 #pragma once
 
 #include "archive_repository.h"
+#include "archive_database.h"
 #include "common.h"
 
 #ifdef __cplusplus
@@ -23,6 +24,11 @@ typedef struct archive_ingest_result_t {
 	i32 instance_count;
 } archive_ingest_result_t;
 
+/* Shared admission metadata for loose and ZIP-contained Part 10 objects. */
+struct dicom_instance_t;
+bool archive_ingest_build_part10_record(archive_database_instance_t* record,
+		i64 object_id, const struct dicom_instance_t* instance);
+
 /* Discover Part 10 .dcm sources recursively below objects/, import immutable
  * content-addressed copies, and atomically publish their metadata in SQLite. */
 bool archive_ingest_part10_objects(const archive_repository_t* repository,
@@ -33,8 +39,8 @@ bool archive_ingest_part10_path(const archive_repository_t* repository,
 
 /*
  * Dispatch an explicit source path to the supported adapter. MRXS directories
- * and thumbnails are preserved as owned stored ZIP bundles; existing MRXS ZIPs
- * are imported byte-for-byte. Legacy .mrxs reference ingestion remains available.
+ * and thumbnails are preserved as owned stored ZIP bundles; existing MRXS and
+ * DICOM ZIPs are imported byte-for-byte. Legacy reference ingestion remains available.
  */
 bool archive_ingest_path(const archive_repository_t* repository,
 		const char* source_path, bool reference_source,

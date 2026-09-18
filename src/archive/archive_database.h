@@ -127,6 +127,8 @@ archive_database_status_t archive_database_register_mrxs_bundle(
 		char* error, size_t error_capacity);
 archive_database_status_t archive_database_register_mrxs_zip_bundle(const archive_repository_t* repository,
 		const char* digest, i64 object, archive_database_bundle_t* bundle, char* error, size_t capacity);
+archive_database_status_t archive_database_register_dicom_zip_bundle(const archive_repository_t* repository,
+		const char* digest, i64 object, archive_database_bundle_t* bundle, char* error, size_t capacity);
 archive_database_status_t archive_database_publish_shells(
 		const archive_repository_t* repository,
 		const archive_database_shell_publication_t* publications,

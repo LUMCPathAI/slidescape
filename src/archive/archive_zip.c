@@ -151,10 +151,19 @@ bool archive_zip_capture_mrxs(const archive_repository_t* repository, const char
 	return success;
 }
 
-bool archive_zip_validate(const char* path, char* error, size_t capacity) {
+bool archive_zip_validate(const char* path, archive_zip_kind_t* kind, char* error, size_t capacity) {
 	source_blob_t blob = {0}; source_file_t file = {0}; source_zip_t* zip = NULL;
 	bool success = source_blob_open_local(&blob, path) && source_file_view(&blob, 0, blob.size, &file) &&
 		(zip = source_zip_open(&file, error, capacity)) && source_zip_validate_contents(zip, error, capacity);
+	if (success && kind) {
+		*kind = ARCHIVE_ZIP_DICOM;
+		for (u32 i = 0; i < source_zip_count(zip); ++i) {
+			const source_zip_member_t* member = source_zip_member(zip, i);
+			const char* leaf = strrchr(member->path, '/');
+			if (!member->is_directory && !strcasecmp(leaf ? leaf + 1 : member->path, "Slidedat.ini"))
+				*kind = ARCHIVE_ZIP_MRXS;
+		}
+	}
 	source_zip_close(zip); source_blob_close(&blob);
 	if (!success && error && capacity && !error[0]) snprintf(error, capacity, "Could not validate ZIP source");
 	return success;

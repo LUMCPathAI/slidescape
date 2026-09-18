@@ -18,6 +18,7 @@
  * the independently versioned virtual-shell adapters. */
 #define ARCHIVE_PART10_BUNDLE_ADAPTER_VERSION "1"
 #define ARCHIVE_MRXS_BUNDLE_ADAPTER_VERSION "2"
+#define ARCHIVE_DICOM_ZIP_BUNDLE_ADAPTER_VERSION "1"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -1147,9 +1148,10 @@ archive_database_status_t archive_database_register_part10_bundle(
 	return status;
 }
 
-static archive_database_status_t archive_database_register_native_bundle(
+static archive_database_status_t archive_database_register_single_object_bundle(
 		const archive_repository_t* repository, const char* bundle_digest,
-		i64 descriptor_object_id, bool zip, archive_database_bundle_t* bundle,
+		i64 descriptor_object_id, const char* source_format, const char* adapter_name,
+		const char* adapter_version, bool zip, archive_database_bundle_t* bundle,
 		char* error, size_t error_capacity) {
 	if (bundle) memset(bundle, 0, sizeof(*bundle));
 	if (!repository || !repository->root[0] ||
@@ -1178,13 +1180,15 @@ static archive_database_status_t archive_database_register_native_bundle(
 		const char* sql =
 			"INSERT INTO bundle(bundle_digest,source_format,adapter_name,"
 			"adapter_version,descriptor_object_id,state)"
-			" SELECT ?1,?3,'slidescape-mrxs','" ARCHIVE_MRXS_BUNDLE_ADAPTER_VERSION "',id,'STAGED'"
+			" SELECT ?1,?3,?4,?5,id,'STAGED'"
 			" FROM object WHERE id=?2 AND sha256=?1"
 			" ON CONFLICT(bundle_digest) DO NOTHING;";
 		if (sqlite3_prepare_v2(database, sql, -1, &statement, NULL) != SQLITE_OK ||
 		    sqlite3_bind_text(statement, 1, bundle_digest, -1, SQLITE_STATIC) != SQLITE_OK ||
 		    sqlite3_bind_int64(statement, 2, descriptor_object_id) != SQLITE_OK ||
-		    sqlite3_bind_text(statement, 3, zip ? "mrxs-zip" : "mrxs", -1, SQLITE_STATIC) != SQLITE_OK ||
+		    sqlite3_bind_text(statement, 3, source_format, -1, SQLITE_STATIC) != SQLITE_OK ||
+		    sqlite3_bind_text(statement, 4, adapter_name, -1, SQLITE_STATIC) != SQLITE_OK ||
+		    sqlite3_bind_text(statement, 5, adapter_version, -1, SQLITE_STATIC) != SQLITE_OK ||
 		    sqlite3_step(statement) != SQLITE_DONE)
 			status = ARCHIVE_DATABASE_IO_ERROR;
 		else
@@ -1205,9 +1209,9 @@ static archive_database_status_t archive_database_register_native_bundle(
 			const char* adapter = (const char*)sqlite3_column_text(statement, 3);
 			const char* version = (const char*)sqlite3_column_text(statement, 4);
 			if (sqlite3_column_int64(statement, 1) != descriptor_object_id ||
-			    !format || strcmp(format, zip ? "mrxs-zip" : "mrxs") != 0 ||
-			    !adapter || strcmp(adapter, "slidescape-mrxs") != 0 ||
-			    !version || strcmp(version, ARCHIVE_MRXS_BUNDLE_ADAPTER_VERSION) != 0) {
+			    !format || strcmp(format, source_format) != 0 ||
+			    !adapter || strcmp(adapter, adapter_name) != 0 ||
+			    !version || strcmp(version, adapter_version) != 0) {
 				status = ARCHIVE_DATABASE_CONFLICT;
 			} else {
 				bundle->id = sqlite3_column_int64(statement, 0);
@@ -1273,7 +1277,7 @@ static archive_database_status_t archive_database_register_native_bundle(
 		sqlite3_exec(database, "ROLLBACK;", NULL, NULL, NULL);
 	if (status != ARCHIVE_DATABASE_OK && (!error || !error[0]))
 		archive_database_set_error(error, error_capacity,
-		                           "could not register MRXS bundle");
+		                           "could not register single-object bundle");
 	sqlite3_finalize(statement);
 	sqlite3_close(database);
 	return status;
@@ -1282,11 +1286,19 @@ static archive_database_status_t archive_database_register_native_bundle(
 
 archive_database_status_t archive_database_register_mrxs_bundle(const archive_repository_t* repository,
 		const char* digest, i64 object, archive_database_bundle_t* bundle, char* error, size_t capacity) {
-	return archive_database_register_native_bundle(repository, digest, object, false, bundle, error, capacity);
+	return archive_database_register_single_object_bundle(repository, digest, object, "mrxs",
+		"slidescape-mrxs", ARCHIVE_MRXS_BUNDLE_ADAPTER_VERSION, false, bundle, error, capacity);
 }
 archive_database_status_t archive_database_register_mrxs_zip_bundle(const archive_repository_t* repository,
 		const char* digest, i64 object, archive_database_bundle_t* bundle, char* error, size_t capacity) {
-	return archive_database_register_native_bundle(repository, digest, object, true, bundle, error, capacity);
+	return archive_database_register_single_object_bundle(repository, digest, object, "mrxs-zip",
+		"slidescape-mrxs", ARCHIVE_MRXS_BUNDLE_ADAPTER_VERSION, true, bundle, error, capacity);
+}
+
+archive_database_status_t archive_database_register_dicom_zip_bundle(const archive_repository_t* repository,
+		const char* digest, i64 object, archive_database_bundle_t* bundle, char* error, size_t capacity) {
+	return archive_database_register_single_object_bundle(repository, digest, object, "dicom-zip",
+		"slidescape-dicom-zip", ARCHIVE_DICOM_ZIP_BUNDLE_ADAPTER_VERSION, true, bundle, error, capacity);
 }
 
 archive_database_status_t archive_database_publish_shells(
