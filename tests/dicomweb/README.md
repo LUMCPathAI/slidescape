@@ -1,5 +1,12 @@
 # DICOMweb reference-server matrix
 
+The offline `slidescape_dicomweb_metadata_negotiation` CTest runs the headless
+viewer against a temporary loopback server. It checks fallback to standard
+DICOM JSON when compact metadata is rejected with HTTP 500 (as observed on IDC)
+or 406, that later instances skip the rejected extension, and that real server
+and authentication failures remain errors. Build `slidescape` first
+(`slidescape_console` on Windows); this test is enabled when Python 3 is found.
+
 Orthanc and dcm4chee are independent black-box reference implementations. They are
 not the intended production archive.
 

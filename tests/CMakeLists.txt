@@ -41,8 +41,20 @@ endif()
 
 add_test(NAME slidescape_tests COMMAND slidescape_tests)
 
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if (Python3_Interpreter_FOUND)
+        set(DICOMWEB_TEST_VIEWER slidescape)
+        if (WIN32)
+                set(DICOMWEB_TEST_VIEWER slidescape_console)
+        endif()
+        add_test(NAME slidescape_dicomweb_metadata_negotiation
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_dicomweb_metadata_negotiation.py"
+                "$<TARGET_FILE:${DICOMWEB_TEST_VIEWER}>")
+        set_tests_properties(slidescape_dicomweb_metadata_negotiation PROPERTIES
+                TIMEOUT 90 LABELS "dicomweb;loopback")
+endif()
+
 if (BUILD_SLIDESCAPE_ARCHIVE)
-        find_package(Python3 QUIET COMPONENTS Interpreter)
         if (Python3_Interpreter_FOUND)
                 add_test(NAME slidescape_archive_integration
                         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_archive_integration.py"

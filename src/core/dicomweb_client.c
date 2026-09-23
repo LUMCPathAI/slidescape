@@ -1185,11 +1185,13 @@ static image_t* dicomweb_prepare_configured_series(
 		http_response_t* response = dicomweb_get_with_options(
 			&remote, path, try_compact_metadata ? DICOMWEB_COMPACT_METADATA_MEDIA_TYPE : "application/dicom+json",
 			false, request_options);
-		/* Older archives may reject the extension or ignore Accept and return
-		 * DICOM JSON. Probe at most once on rejection; retain normal DICOMweb. */
+		/* Archives may reject the extension or ignore Accept and return DICOM
+		 * JSON. IDC returns 500 for this unsupported media type. Retry once with
+		 * standard metadata, then stop probing the extension for this series. */
 		if (try_compact_metadata && response &&
 		    (response->status_code == 400 || response->status_code == 406 ||
-		     response->status_code == 415 || response->status_code == 501)) {
+		     response->status_code == 415 || response->status_code == 500 ||
+		     response->status_code == 501)) {
 			http_response_destroy(response);
 			try_compact_metadata = false;
 			response = dicomweb_get_with_options(&remote, path, "application/dicom+json", false, request_options);
