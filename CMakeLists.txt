@@ -267,33 +267,163 @@ else()
     set(FREETYPE_SOURCE_FILES ${FREETYPE_SOURCE_FILES} deps/freetype/src/base/ftdebug.c)
 endif()
 
-# mbedtls
-set(MBEDTLS_CRYPTO_SOURCE_FILES
-        aes.c                   aesni.c                         arc4.c                  aria.c              asn1parse.c
-        asn1write.c             base64.c                        bignum.c                blowfish.c          camellia.c
-        ccm.c                   chacha20.c                      chachapoly.c            cipher.c            cipher_wrap.c
-        cmac.c                  ctr_drbg.c                      des.c                   dhm.c               ecdh.c
-        ecdsa.c                 ecjpake.c                       ecp.c                   ecp_curves.c        entropy.c
-        entropy_poll.c          error.c                         gcm.c                   havege.c            hkdf.c
-        hmac_drbg.c             md.c                            md2.c                   md4.c               md5.c
-        memory_buffer_alloc.c   nist_kw.c                       oid.c                   padlock.c           pem.c
-        pk.c                    pk_wrap.c                       pkcs12.c                pkcs5.c             pkparse.c
-        pkwrite.c               platform.c                      platform_util.c         poly1305.c          psa_crypto.c
-        psa_crypto_se.c         psa_crypto_slot_management.c    psa_crypto_storage.c    psa_its_file.c      ripemd160.c
-        rsa.c                   rsa_internal.c                  sha1.c                  sha256.c            sha512.c
-        threading.c             timing.c                        version.c               version_features.c  xtea.c
-        psa_crypto_client.c     psa_crypto_driver_wrappers.c    psa_crypto_ecp.c        psa_crypto_rsa.c
+# Mbed TLS 4.2.0 + TF-PSA-Crypto 1.2.0. See doc/tls.md for the vendoring recipe.
+
+
+set(TF_PSA_CRYPTO_SOURCE_FILES
+        core/psa_crypto.c
+        core/psa_crypto_client.c
+        core/psa_crypto_driver_wrappers_no_static.c
+        core/psa_crypto_random.c
+        core/psa_crypto_slot_management.c
+        core/psa_crypto_storage.c
+        core/psa_its_file.c
+        core/psa_util.c
+        core/tf_psa_crypto_config.c
+        core/tf_psa_crypto_version.c
+        drivers/builtin/src/aes.c
+        drivers/builtin/src/aesce.c
+        drivers/builtin/src/aesni.c
+        drivers/builtin/src/aria.c
+        drivers/builtin/src/bignum.c
+        drivers/builtin/src/bignum_core.c
+        drivers/builtin/src/bignum_mod.c
+        drivers/builtin/src/bignum_mod_raw.c
+        drivers/builtin/src/block_cipher.c
+        drivers/builtin/src/camellia.c
+        drivers/builtin/src/ccm.c
+        drivers/builtin/src/chacha20.c
+        drivers/builtin/src/chacha20_neon.c
+        drivers/builtin/src/chachapoly.c
+        drivers/builtin/src/cipher.c
+        drivers/builtin/src/cipher_wrap.c
+        drivers/builtin/src/cmac.c
+        drivers/builtin/src/ctr_drbg.c
+        drivers/builtin/src/ecdsa.c
+        drivers/builtin/src/ecjpake.c
+        drivers/builtin/src/ecp.c
+        drivers/builtin/src/ecp_curves.c
+        drivers/builtin/src/entropy.c
+        drivers/builtin/src/entropy_poll.c
+        drivers/builtin/src/gcm.c
+        drivers/builtin/src/hmac_drbg.c
+        drivers/builtin/src/md5.c
+        drivers/builtin/src/poly1305.c
+        drivers/builtin/src/psa_crypto_aead.c
+        drivers/builtin/src/psa_crypto_cipher.c
+        drivers/builtin/src/psa_crypto_ecp.c
+        drivers/builtin/src/psa_crypto_ffdh.c
+        drivers/builtin/src/psa_crypto_hash.c
+        drivers/builtin/src/psa_crypto_mac.c
+        drivers/builtin/src/psa_crypto_pake.c
+        drivers/builtin/src/psa_crypto_rsa.c
+        drivers/builtin/src/psa_crypto_xof.c
+        drivers/builtin/src/psa_util_internal.c
+        drivers/builtin/src/ripemd160.c
+        drivers/builtin/src/rsa.c
+        drivers/builtin/src/rsa_alt_helpers.c
+        drivers/builtin/src/sha1.c
+        drivers/builtin/src/sha256.c
+        drivers/builtin/src/sha3.c
+        drivers/builtin/src/sha512.c
+        extras/lmots.c
+        extras/lms.c
+        extras/md.c
+        extras/nist_kw.c
+        extras/pk.c
+        extras/pk_ecc.c
+        extras/pk_rsa.c
+        extras/pk_wrap.c
+        extras/pkparse.c
+        extras/pkwrite.c
+        platform/memory_buffer_alloc.c
+        platform/platform.c
+        platform/platform_util.c
+        platform/threading.c
+        utilities/asn1parse.c
+        utilities/asn1write.c
+        utilities/base64.c
+        utilities/constant_time.c
+        utilities/oid.c
+        utilities/pem.c
+        utilities/pkcs5.c
 )
-set(MBEDTLS_X509_SOURCE_FILES
-        certs.c                 pkcs11.c                        x509.c                  x509_create.c       x509_crl.c
-        x509_crt.c              x509_csr.c                      x509write_crt.c         x509write_csr.c
+prepend_path(TF_PSA_CRYPTO_SOURCE_FILES deps/tf-psa-crypto)
+
+set(MBEDTLS_SOURCE_FILES
+        debug.c
+        error.c
+        mbedtls_config.c
+        mps_reader.c
+        mps_trace.c
+        net_sockets.c
+        pkcs7.c
+        ssl_cache.c
+        ssl_ciphersuites.c
+        ssl_client.c
+        ssl_cookie.c
+        ssl_debug_helpers_generated.c
+        ssl_msg.c
+        ssl_ticket.c
+        ssl_tls.c
+        ssl_tls12_client.c
+        ssl_tls12_server.c
+        ssl_tls13_client.c
+        ssl_tls13_generic.c
+        ssl_tls13_keys.c
+        ssl_tls13_server.c
+        timing.c
+        version.c
+        version_features.c
+        x509.c
+        x509_create.c
+        x509_crl.c
+        x509_crt.c
+        x509_csr.c
+        x509_oid.c
+        x509write.c
+        x509write_crt.c
+        x509write_csr.c
 )
-set(MBEDTLS_TLS_SOURCE_FILES
-        debug.c                 net_sockets.c                   ssl_cache.c             ssl_ciphersuites.c  ssl_cli.c
-        ssl_cookie.c            ssl_msg.c                       ssl_srv.c               ssl_ticket.c        ssl_tls.c
-)
-set(MBEDTLS_SOURCE_FILES ${MBEDTLS_CRYPTO_SOURCE_FILES} ${MBEDTLS_X509_SOURCE_FILES} ${MBEDTLS_TLS_SOURCE_FILES})
 prepend_path(MBEDTLS_SOURCE_FILES deps/mbedtls/library)
+
+add_library(slidescape_crypto STATIC ${TF_PSA_CRYPTO_SOURCE_FILES} src/platform/tls_platform.c)
+target_include_directories(slidescape_crypto PUBLIC
+        deps/tf-psa-crypto/include
+        deps/tf-psa-crypto/drivers/builtin/include
+        src/platform) # for configuration headers
+target_include_directories(slidescape_crypto PRIVATE
+        deps/tf-psa-crypto/core
+        deps/tf-psa-crypto/dispatch
+        deps/tf-psa-crypto/extras
+        deps/tf-psa-crypto/platform
+        deps/tf-psa-crypto/utilities
+        deps/tf-psa-crypto/drivers/builtin/src)
+target_compile_definitions(slidescape_crypto PUBLIC
+        TF_PSA_CRYPTO_CONFIG_FILE="slidescape_crypto_config.h")
+if (WIN32)
+    target_link_libraries(slidescape_crypto PUBLIC bcrypt)
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(slidescape_crypto PUBLIC Threads::Threads)
+endif()
+
+add_library(slidescape_tls STATIC ${MBEDTLS_SOURCE_FILES})
+target_include_directories(slidescape_tls PUBLIC deps/mbedtls/include)
+target_include_directories(slidescape_tls PRIVATE
+        deps/mbedtls/library
+        deps/tf-psa-crypto/core
+        deps/tf-psa-crypto/dispatch
+        deps/tf-psa-crypto/extras
+        deps/tf-psa-crypto/platform
+        deps/tf-psa-crypto/utilities
+        deps/tf-psa-crypto/drivers/builtin/src)
+target_compile_definitions(slidescape_tls PUBLIC
+        MBEDTLS_CONFIG_FILE="slidescape_tls_config.h")
+target_link_libraries(slidescape_tls PUBLIC slidescape_crypto)
+if (WIN32)
+    target_link_libraries(slidescape_tls PUBLIC ws2_32)
+endif()
 
 if (WIN32)
     set(KEYCODE_SOURCE_FILES keycode_id.c windows_fromhid.c windows_lparam.c windows_name.c windows_rawname.c windows_tohid.c)
@@ -433,7 +563,6 @@ prepend_path(VIEWER_SOURCE_FILES src)
 
 set(LIBRARY_SOURCE_FILES
         ${FREETYPE_SOURCE_FILES}
-        ${MBEDTLS_SOURCE_FILES}
         ${KEYCODE_SOURCE_FILES})
 
 
@@ -532,6 +661,10 @@ else()
             COMMAND chmod +x "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/slidescape.desktop"
             COMMAND chmod +x "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/install_desktop_file.sh"
             COMMAND chmod +x "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/uninstall_desktop_file.sh")
+endif()
+target_link_libraries(slidescape slidescape_tls)
+if (WIN32)
+    target_link_libraries(slidescape_console slidescape_tls)
 endif()
 target_compile_definitions(slidescape PRIVATE IS_SERVER=0)
 

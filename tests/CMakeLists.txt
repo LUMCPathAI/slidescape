@@ -63,3 +63,12 @@ target_include_directories(dicomweb_probe PRIVATE
         ../src/utils
 )
 target_link_libraries(dicomweb_probe PRIVATE slidescape_nongui slidescape_jpeg)
+
+# No external services, OpenSSL executable, or private fixtures are needed.
+add_executable(slidescape_tls_tests test_tls.c)
+set_target_properties(slidescape_tls_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_definitions(slidescape_tls_tests PRIVATE
+        SLIDESCAPE_TLS_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/tls")
+target_link_libraries(slidescape_tls_tests PRIVATE slidescape_tls)
+add_test(NAME slidescape_tls_tests COMMAND slidescape_tls_tests)
+set_tests_properties(slidescape_tls_tests PROPERTIES TIMEOUT 60 LABELS "tls")

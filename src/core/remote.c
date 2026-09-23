@@ -30,33 +30,12 @@
 #include <Security/Security.h>
 #endif
 
-#if !defined(MBEDTLS_CONFIG_FILE)
-#include "mbedtls/config.h"
-#else
-#include MBEDTLS_CONFIG_FILE
-#endif
-
-#if defined(MBEDTLS_PLATFORM_C)
+#include "mbedtls/build_info.h"
 #include "mbedtls/platform.h"
-#else
-#include <stdio.h>
-#include <stdlib.h>
-#define mbedtls_time            time
-#define mbedtls_time_t          time_t
-#define mbedtls_fprintf         fprintf
-#define mbedtls_printf          printf
-#define mbedtls_exit            exit
-#define MBEDTLS_EXIT_SUCCESS    EXIT_SUCCESS
-#define MBEDTLS_EXIT_FAILURE    EXIT_FAILURE
-#endif /* MBEDTLS_PLATFORM_C */
-
 #include "mbedtls/net_sockets.h"
-#include "mbedtls/debug.h"
 #include "mbedtls/ssl.h"
-#include "mbedtls/entropy.h"
-#include "mbedtls/ctr_drbg.h"
 #include "mbedtls/error.h"
-#include "mbedtls/certs.h"
+#include "tls_platform.h"
 
 //#define SERVER_PORT "443"
 //#define SERVER_PORT "4433"
@@ -66,31 +45,15 @@
 
 #include "http_parser.h"
 
-#define DEBUG_LEVEL DO_DEBUG
-
 struct tls_connection_t {
 	i64 start_clock;
 	i64 sockfd;
 	bool use_tls;
 	mbedtls_net_context server_fd;
-	mbedtls_entropy_context entropy;
-	mbedtls_ctr_drbg_context ctr_drbg;
 	mbedtls_ssl_context ssl;
 	mbedtls_ssl_config conf;
 	mbedtls_x509_crt cacert;
 };
-
-static void my_debug( void *ctx, int level,
-                      const char *file, int line,
-                      const char *str )
-{
-	((void) level);
-	if (!is_verbose_mode) return;
-
-	mbedtls_fprintf( (FILE *) ctx, "%s:%04d: %s", file, line, str );
-	fflush(  (FILE *) ctx  );
-}
-
 
 // Adapted from https://github.com/HaxeFoundation/hxcpp/blob/7bd5ff3/src/hx/libs/ssl/SSL.cpp#L455-L491
 // discussed here: https://stackoverflow.com/questions/42432473/programmatically-read-root-ca-certificates-in-ios
@@ -188,42 +151,29 @@ mbedtls_x509_crt* ssl_cert_load_defaults() {
 
 
 tls_connection_t* open_remote_connection(const char* hostname, i32 portno, void* alloced_mem_for_struct) {
+	/* Mbed TLS 4 uses PSA's process-wide RNG and key store. Initialize before
+	 * touching library objects so Windows threading callbacks are installed. */
+	psa_status_t crypto_ret = slidescape_crypto_init();
+	if (crypto_ret != PSA_SUCCESS) {
+		console_print_error("PSA crypto initialization failed: %d\n", (int)crypto_ret);
+		return NULL;
+	}
+
 	int ret = 1, len;
 	int exit_code = MBEDTLS_EXIT_FAILURE;
 	uint32_t flags;
 	unsigned char buf[1024];
-	const char *pers = "ssl_client1";
 	tls_connection_t* connection = (tls_connection_t*) alloced_mem_for_struct;
 	connection->use_tls = true;
 	connection->start_clock = get_clock();
 
-#if defined(MBEDTLS_DEBUG_C)
-	mbedtls_debug_set_threshold( DEBUG_LEVEL );
-#endif
-
 	/*
-	 * 0. Initialize the RNG and the session data
+	 * 0. Initialize the session data
 	 */
 	mbedtls_net_init( &connection->server_fd );
 	mbedtls_ssl_init( &connection->ssl );
 	mbedtls_ssl_config_init( &connection->conf );
 	mbedtls_x509_crt_init( &connection->cacert );
-	mbedtls_ctr_drbg_init( &connection->ctr_drbg );
-
-	console_print_verbose( "\n  . Seeding the random number generator..." );
-	fflush( stdout );
-
-	mbedtls_entropy_init( &connection->entropy );
-	if( ( ret = mbedtls_ctr_drbg_seed( &connection->ctr_drbg, mbedtls_entropy_func, &connection->entropy,
-	                                   (const unsigned char *) pers,
-	                                   strlen( pers ) ) ) != 0 )
-	{
-		console_print_verbose( " failed\n  ! mbedtls_ctr_drbg_seed returned %d\n", ret );
-		goto exit;
-	}
-
-	// TODO: console append to last entry?
-	console_print_verbose( " ok\n" );
 
 	/*
 	 * 0. Initialize certificates
@@ -278,8 +228,6 @@ tls_connection_t* open_remote_connection(const char* hostname, i32 portno, void*
 	/* Remote slide data and credentials must never cross an unverified TLS connection. */
 	mbedtls_ssl_conf_authmode( &connection->conf, MBEDTLS_SSL_VERIFY_REQUIRED );
 	mbedtls_ssl_conf_ca_chain( &connection->conf, &connection->cacert, NULL );
-	mbedtls_ssl_conf_rng( &connection->conf, mbedtls_ctr_drbg_random, &connection->ctr_drbg );
-	mbedtls_ssl_conf_dbg( &connection->conf, my_debug, stdout );
 	mbedtls_ssl_conf_read_timeout( &connection->conf, 250 );
 
 	if( ( ret = mbedtls_ssl_setup( &connection->ssl, &connection->conf ) ) != 0 )
@@ -294,20 +242,8 @@ tls_connection_t* open_remote_connection(const char* hostname, i32 portno, void*
 		goto exit;
 	}
 
-	/*
-	 * The vendored Mbed TLS 2.26 net_recv_timeout() uses net_poll(), whose
-	 * POSIX fd < FD_SETSIZE check is invalid for opaque Winsock SOCKET values
-	 * and can fail a valid connection with MBEDTLS_ERR_NET_POLL_FAILED.
-	 * Restore the blocking receive callback used before handshake timeouts
-	 * were added; requests switch the socket to nonblocking mode below.
-	 */
-#if WINDOWS
-	mbedtls_ssl_set_bio( &connection->ssl, &connection->server_fd, mbedtls_net_send,
-	                     mbedtls_net_recv, NULL );
-#else
 	mbedtls_ssl_set_bio( &connection->ssl, &connection->server_fd, mbedtls_net_send,
 	                     mbedtls_net_recv, mbedtls_net_recv_timeout );
-#endif
 
 	/*
 	 * 4. Handshake
@@ -367,8 +303,6 @@ tls_connection_t* open_remote_connection(const char* hostname, i32 portno, void*
 		mbedtls_x509_crt_free( &connection->cacert );
 		mbedtls_ssl_free( &connection->ssl );
 		mbedtls_ssl_config_free( &connection->conf );
-		mbedtls_ctr_drbg_free( &connection->ctr_drbg );
-		mbedtls_entropy_free( &connection->entropy );
 
 		return NULL;
 
@@ -390,8 +324,6 @@ float close_remote_connection(tls_connection_t* connection) {
 		mbedtls_x509_crt_free(&connection->cacert);
 		mbedtls_ssl_free(&connection->ssl);
 		mbedtls_ssl_config_free(&connection->conf);
-		mbedtls_ctr_drbg_free(&connection->ctr_drbg);
-		mbedtls_entropy_free(&connection->entropy);
 	}
 
 	float seconds_elapsed = get_seconds_elapsed(connection->start_clock, get_clock());
@@ -750,37 +682,6 @@ static void remote_request_set_error(const remote_request_options_t* options,
 	if (options && options->out_error) *options->out_error = error;
 }
 
-static int remote_net_recv_timeout(mbedtls_net_context* context, u8* buffer,
-		size_t size, u32 timeout_ms) {
-#if defined(_WIN32)
-	/*
-	 * Winsock fd_set stores socket handles in an array. Unlike POSIX fd_set,
-	 * the handle value itself does not need to be smaller than FD_SETSIZE.
-	 * mbedtls_net_recv_timeout() applies the POSIX descriptor-value check on
-	 * Windows too, rejecting otherwise valid Winsock handles.
-	 */
-	// TODO (pvalkema 2026-08-03): see if this special handling can be removed after Mbed TLS is updated to a newer version.
-	SOCKET socket_handle = (SOCKET)context->fd;
-	if (socket_handle == INVALID_SOCKET) return MBEDTLS_ERR_NET_INVALID_CONTEXT;
-	fd_set read_fds;
-	FD_ZERO(&read_fds);
-	FD_SET(socket_handle, &read_fds);
-	struct timeval timeout = {
-		(long)(timeout_ms / 1000),
-		(long)((timeout_ms % 1000) * 1000),
-	};
-	i32 ready = select(0, &read_fds, NULL, NULL, timeout_ms ? &timeout : NULL);
-	if (ready == 0) return MBEDTLS_ERR_SSL_TIMEOUT;
-	if (ready == SOCKET_ERROR) {
-		return WSAGetLastError() == WSAEINTR ? MBEDTLS_ERR_SSL_WANT_READ
-		                                      : MBEDTLS_ERR_NET_POLL_FAILED;
-	}
-	return mbedtls_net_recv(context, buffer, size);
-#else
-	return mbedtls_net_recv_timeout(context, buffer, size, timeout_ms);
-#endif
-}
-
 http_response_t* remote_connection_request_http(
 	tls_connection_t* connection, const char* host, remote_http_method_t method,
 	const char* path, const char* accept, const char* content_type,
@@ -872,7 +773,7 @@ http_response_t* remote_connection_request_http(
         }
         ret = connection->use_tls
               ? mbedtls_ssl_read(&connection->ssl, read_buffer, sizeof(read_buffer))
-              : remote_net_recv_timeout(&connection->server_fd, read_buffer,
+              : mbedtls_net_recv_timeout(&connection->server_fd, read_buffer,
 	                                    sizeof(read_buffer), read_poll_timeout_ms);
 
         if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
