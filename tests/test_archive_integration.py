@@ -190,6 +190,48 @@ def main(binary, exercise_deadline=False):
                 parts = body.split(b'--' + boundary)[1:-1]
                 payloads = [part.split(b'\r\n\r\n', 1)[1][:-2] for part in parts]
                 assert payloads == [bytes(range(12, 24)), bytes(range(12)), bytes(range(12, 24))]
+                # A persistent connection can serve mixed routes without tying up
+                # the only worker on a two-core server between requests.
+                client = http.client.HTTPConnection('127.0.0.1', port, timeout=3)
+                try:
+                    client.request('GET', '/health')
+                    response = client.getresponse()
+                    assert response.status == 200 and response.getheader('Connection') == 'keep-alive'
+                    response.read()
+                    original_socket = client.sock
+                    assert original_socket is not None
+                    assert request(port, '/health')[0] == 200
+                    client.request('GET', a + '/metadata', headers={'Accept': compact_type})
+                    response = client.getresponse()
+                    assert response.status == 200 and json.loads(response.read())['frameCount'] == 2
+                    assert client.sock is original_socket
+                    client.request('GET', a + '/frames/1', headers={'Accept': accept})
+                    response = client.getresponse()
+                    assert response.status == 200 and response.read()
+                    assert client.sock is original_socket
+                    client.request('GET', '/health', headers={'Connection': 'close'})
+                    response = client.getresponse()
+                    assert response.status == 200 and response.getheader('Connection') == 'close'
+                    response.read()
+                finally:
+                    client.close()
+                # Two requests arriving in one TCP write must retain the second
+                # header block for the next response.
+                with socket.create_connection(('127.0.0.1', port), timeout=3) as pipeline:
+                    pipeline.sendall(b'GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n'
+                                     b'GET /health HTTP/1.1\r\nHost: localhost\r\n'
+                                     b'Connection: keep-alive\r\nConnection: close\r\n\r\n')
+                    stream = pipeline.makefile('rb')
+                    for connection_header in ('keep-alive', 'close'):
+                        status_line = stream.readline()
+                        assert status_line.startswith(b'HTTP/1.1 200'), status_line
+                        response_headers = {}
+                        while line := stream.readline().strip():
+                            name, value = line.decode().split(':', 1)
+                            response_headers[name.lower()] = value.strip()
+                        assert response_headers['connection'] == connection_header
+                        body = stream.read(int(response_headers['content-length']))
+                        assert json.loads(body)['status'] == 'ok'
                 with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
                     results = list(pool.map(lambda _: request(port, a + '/frames/2,1,2', accept), range(64)))
                 assert all(result[0] == 200 for result in results), [result[0] for result in results]

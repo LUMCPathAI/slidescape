@@ -37,6 +37,7 @@ typedef SOCKET archive_socket_t;
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -51,6 +52,9 @@ typedef int archive_socket_t;
 
 #define ARCHIVE_REQUEST_DEADLINE_MS 30000
 #define ARCHIVE_SOCKET_IDLE_TIMEOUT_MS 5000
+#define ARCHIVE_MAX_IDLE_CONNECTIONS 32
+#define ARCHIVE_MAX_REQUESTS_PER_CONNECTION 256
+#define ARCHIVE_LISTENER_POLL_MS 5
 #define ARCHIVE_RESPONSE_MEMORY_BUDGET MEGABYTES(512)
 
 /* Opt-in stage timings, with no request URLs or patient metadata in the log. */
@@ -62,13 +66,25 @@ static THREAD_LOCAL const char* archive_profile_route;
 typedef struct archive_connection_t {
 	archive_socket_t socket;
 	i64 accepted_at;
+	i64 idle_since;
+	i32 request_count;
+	bool keep_alive;
+	bool sent_headers;
+	bool send_failed;
+	size_t body_remaining;
 } archive_connection_t;
 
 typedef struct archive_client_task_t {
-	archive_connection_t connection;
+	archive_connection_t* connection;
 	const archive_repository_t* repository;
 	const archive_index_t* index;
 } archive_client_task_t;
+
+/* Workers hand completed connections back to the listener. Only the listener
+ * waits for the next request, so idle clients do not occupy its worker pool. */
+static platform_mutex_t archive_returned_mutex = PLATFORM_MUTEX_INITIALIZER;
+static archive_connection_t* archive_returned[ARCHIVE_MAX_IDLE_CONNECTIONS];
+static i32 archive_returned_count;
 
 static void archive_memrw_init_fixed(memrw_t* buffer, void* data, size_t capacity) {
 	*buffer = (memrw_t){0};
@@ -133,21 +149,36 @@ static archive_socket_t archive_create_loopback_listener(i32 family, u16 port) {
 	return server;
 }
 
-static archive_socket_t archive_accept_loopback(archive_socket_t ipv4_server,
-		archive_socket_t ipv6_server) {
-	if (ipv6_server == ARCHIVE_INVALID_SOCKET) return accept(ipv4_server, NULL, NULL);
-	fd_set read_fds;
-	FD_ZERO(&read_fds);
-	FD_SET(ipv4_server, &read_fds);
-	FD_SET(ipv6_server, &read_fds);
-#if defined(_WIN32)
-	i32 ready = select(0, &read_fds, NULL, NULL, NULL);
-#else
-	i32 ready = select(MAX(ipv4_server, ipv6_server) + 1, &read_fds, NULL, NULL, NULL);
+static void archive_close_connection(archive_connection_t* connection) {
+	if (!connection) return;
+	archive_socket_close(connection->socket);
+	free(connection);
+}
+
+static void archive_add_idle_connection(archive_connection_t** idle, i32* count,
+		archive_connection_t* connection) {
+#if !defined(_WIN32)
+	if (connection->socket >= FD_SETSIZE) {
+		archive_close_connection(connection);
+		return;
+	}
 #endif
-	if (ready <= 0) return ARCHIVE_INVALID_SOCKET;
-	if (FD_ISSET(ipv6_server, &read_fds)) return accept(ipv6_server, NULL, NULL);
-	return accept(ipv4_server, NULL, NULL);
+	if (*count >= ARCHIVE_MAX_IDLE_CONNECTIONS) {
+		archive_close_connection(connection);
+		return;
+	}
+	idle[(*count)++] = connection;
+}
+
+static void archive_collect_returned_connections(archive_connection_t** idle, i32* idle_count) {
+	archive_connection_t* returned[ARCHIVE_MAX_IDLE_CONNECTIONS];
+	platform_mutex_lock(&archive_returned_mutex);
+	i32 count = archive_returned_count;
+	memcpy(returned, archive_returned, count * sizeof(*returned));
+	archive_returned_count = 0;
+	platform_mutex_unlock(&archive_returned_mutex);
+	for (i32 i = 0; i < count; ++i)
+		archive_add_idle_connection(idle, idle_count, returned[i]);
 }
 
 /* Apply the remaining absolute deadline to every blocking operation. A client
@@ -169,7 +200,7 @@ static bool archive_set_client_timeout(const archive_connection_t* connection) {
 		(const char*)&timeout, sizeof(timeout)) == 0;
 }
 
-static bool archive_send_all_impl(const archive_connection_t* socket, const char* data, size_t size) {
+static bool archive_send_all_impl(archive_connection_t* socket, const char* data, size_t size) {
 	while (size > 0) {
 		if (!archive_set_client_timeout(socket)) return false;
 #if defined(_WIN32)
@@ -184,15 +215,20 @@ static bool archive_send_all_impl(const archive_connection_t* socket, const char
 	return true;
 }
 
-static bool archive_send_all(const archive_connection_t* socket, const char* data, size_t size) {
-	if (!archive_profile_requests) return archive_send_all_impl(socket, data, size);
-	i64 start = get_clock();
+static bool archive_send_all(archive_connection_t* socket, const char* data, size_t size) {
+	i64 start = archive_profile_requests ? get_clock() : 0;
 	bool success = archive_send_all_impl(socket, data, size);
-	archive_profile_send_ms += get_seconds_elapsed(start, get_clock()) * 1000.0;
+	if (archive_profile_requests)
+		archive_profile_send_ms += get_seconds_elapsed(start, get_clock()) * 1000.0;
+	if (!success || (socket->sent_headers && size > socket->body_remaining)) {
+		socket->send_failed = true;
+	} else if (socket->sent_headers) {
+		socket->body_remaining -= size;
+	}
 	return success;
 }
 
-static bool archive_send_headers(const archive_connection_t* socket, i32 status, const char* reason,
+static bool archive_send_headers(archive_connection_t* socket, i32 status, const char* reason,
 		const char* content_type, size_t body_size) {
 	char header[512];
 	memrw_t builder;
@@ -205,40 +241,60 @@ static bool archive_send_headers(const archive_connection_t* socket, i32 status,
 	memrw_write_string(content_type, &builder);
 	memrw_write_literal("\r\nContent-Length: ", &builder);
 	archive_memrw_write_u64(&builder, (u64)body_size);
-	memrw_write_literal("\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", &builder);
-	return archive_send_all(socket, header, builder.used_size);
+	memrw_write_literal("\r\nCache-Control: no-store\r\nConnection: ", &builder);
+	if (socket->keep_alive) memrw_write_literal("keep-alive\r\n\r\n", &builder);
+	else memrw_write_literal("close\r\n\r\n", &builder);
+	socket->sent_headers = false;
+	if (!archive_send_all(socket, header, builder.used_size)) return false;
+	socket->sent_headers = true;
+	socket->body_remaining = body_size;
+	return true;
 }
 
-static bool archive_send_body(const archive_connection_t* socket, i32 status, const char* reason,
+static bool archive_send_body(archive_connection_t* socket, i32 status, const char* reason,
 		const char* content_type, const char* body, size_t body_size) {
 	return archive_send_headers(socket, status, reason, content_type, body_size) &&
 		archive_send_all(socket, body, body_size);
 }
 
-static bool archive_send_json(const archive_connection_t* socket, i32 status, const char* reason,
+static bool archive_send_json(archive_connection_t* socket, i32 status, const char* reason,
 		const char* json) {
 	return archive_send_body(socket, status, reason, "application/json", json, strlen(json));
 }
 
-static bool archive_read_request_headers_impl(const archive_connection_t* socket, char* request, size_t capacity) {
+static bool archive_read_request_headers_impl(archive_connection_t* socket, char* request, size_t capacity) {
 	size_t used = 0;
 	while (used + 1 < capacity) {
 		if (!archive_set_client_timeout(socket)) return false;
 #if defined(_WIN32)
-		int received = recv(socket->socket, request + used, (int)(capacity - used - 1), 0);
+		int available = recv(socket->socket, request + used, (int)(capacity - used - 1), MSG_PEEK);
 #else
-		ssize_t received = recv(socket->socket, request + used, capacity - used - 1, 0);
+		ssize_t available = recv(socket->socket, request + used, capacity - used - 1, MSG_PEEK);
 #endif
-		if (received <= 0) return false;
-		used += (size_t)received;
+		if (available <= 0) return false;
+		request[used + (size_t)available] = '\0';
+		char* end = strstr(request, "\r\n\r\n");
+		size_t count = end ? (size_t)(end + 4 - request) - used : (size_t)available;
+		size_t consumed = 0;
+		while (consumed < count) {
+			if (!archive_set_client_timeout(socket)) return false;
+#if defined(_WIN32)
+			int received = recv(socket->socket, request + used + consumed, (int)(count - consumed), 0);
+#else
+			ssize_t received = recv(socket->socket, request + used + consumed, count - consumed, 0);
+#endif
+			if (received <= 0) return false;
+			consumed += (size_t)received;
+		}
+		used += count;
 		request[used] = '\0';
-		if (strstr(request, "\r\n\r\n")) return true;
+		if (end) return true;
 	}
 	return false;
 }
 
 
-static bool archive_read_request_headers(const archive_connection_t* socket, char* request, size_t capacity) {
+static bool archive_read_request_headers(archive_connection_t* socket, char* request, size_t capacity) {
 	if (!archive_profile_requests) return archive_read_request_headers_impl(socket, request, capacity);
 	i64 start = get_clock();
 	bool success = archive_read_request_headers_impl(socket, request, capacity);
@@ -246,7 +302,7 @@ static bool archive_read_request_headers(const archive_connection_t* socket, cha
 	return success;
 }
 
-static void archive_send_qido_response(const archive_connection_t* client, const archive_index_t* index,
+static void archive_send_qido_response(archive_connection_t* client, const archive_index_t* index,
 		const archive_route_match_t* route, const char* target) {
 	size_t capacity = MEGABYTES(1);
 	char* body = malloc(capacity);
@@ -299,6 +355,37 @@ static const char* archive_find_header(const char* headers, const char* name) {
 	return NULL;
 }
 
+static bool archive_header_has_token(const char* headers, const char* name, const char* token) {
+	size_t name_size = strlen(name);
+	size_t token_size = strlen(token);
+	for (const char* line = headers; line && *line; ) {
+		const char* end = strstr(line, "\r\n");
+		if (!end) break;
+		if ((size_t)(end - line) > name_size && line[name_size] == ':') {
+			size_t i = 0;
+			while (i < name_size && archive_ascii_lower(line[i]) == archive_ascii_lower(name[i])) ++i;
+			if (i == name_size) {
+				const char* value = line + name_size + 1;
+				while (value < end) {
+					while (value < end && (*value == ' ' || *value == '\t' || *value == ',')) ++value;
+					const char* next = value;
+					while (next < end && *next != ',') ++next;
+					const char* last = next;
+					while (last > value && (last[-1] == ' ' || last[-1] == '\t')) --last;
+					if ((size_t)(last - value) == token_size) {
+						i = 0;
+						while (i < token_size && archive_ascii_lower(value[i]) == archive_ascii_lower(token[i])) ++i;
+						if (i == token_size) return true;
+					}
+					value = next < end ? next + 1 : end;
+				}
+			}
+		}
+		line = end + 2;
+	}
+	return false;
+}
+
 /* The compact bootstrap is an explicit single-media-type opt-in. Ordinary
  * DICOMweb requests continue to receive the full standards representation. */
 static bool archive_wants_compact_metadata(const char* headers) {
@@ -340,7 +427,7 @@ static void archive_write_frame_part_header(memrw_t* builder, bool include_separ
 static platform_mutex_t archive_response_budget_mutex = PLATFORM_MUTEX_INITIALIZER;
 static size_t archive_response_bytes_reserved;
 
-static void archive_send_wado_response_admitted(const archive_connection_t* client,
+static void archive_send_wado_response_admitted(archive_connection_t* client,
 		const archive_repository_t* repository, const archive_index_t* index,
 		const archive_route_match_t* route, const char* request_headers, size_t* reservation) {
 	char error[512] = {0};
@@ -534,7 +621,7 @@ static void archive_send_wado_response_admitted(const archive_connection_t* clie
 	if (sent) archive_send_all(client, closing, closing_size);
 }
 
-static void archive_send_wado_response(const archive_connection_t* client,
+static void archive_send_wado_response(archive_connection_t* client,
 		const archive_repository_t* repository, const archive_index_t* index,
 		const archive_route_match_t* route, const char* request_headers) {
 	size_t reservation = route->kind == ARCHIVE_ROUTE_WADO_FRAMES ? 0 : ARCHIVE_MAX_MULTIPART_RESPONSE_SIZE;
@@ -554,7 +641,7 @@ static void archive_send_wado_response(const archive_connection_t* client,
 	platform_mutex_unlock(&archive_response_budget_mutex);
 }
 
-static void archive_handle_request_with_buffer(const archive_connection_t* client,
+static void archive_handle_request_with_buffer(archive_connection_t* client,
 		const archive_repository_t* repository, const archive_index_t* index,
 		char* request) {
 	if (!archive_read_request_headers(client, request, ARCHIVE_REQUEST_HEADER_LIMIT + 1)) {
@@ -582,6 +669,12 @@ static void archive_handle_request_with_buffer(const archive_connection_t* clien
 		archive_send_json(client, 405, "Method Not Allowed", "{\"error\":\"method_not_allowed\"}\n");
 		return;
 	}
+	/* Request bodies are not consumed by this read-only server. Never reuse a
+	 * connection if one could be waiting after the header block. */
+	client->keep_alive = client->request_count < ARCHIVE_MAX_REQUESTS_PER_CONNECTION &&
+	                     !archive_header_has_token(request_headers, "Connection", "close") &&
+	                     !archive_find_header(request_headers, "Content-Length") &&
+	                     !archive_find_header(request_headers, "Transfer-Encoding");
 	archive_route_match_t route;
 	if (!archive_route_match(method, target, &route)) {
 		archive_send_json(client, 404, "Not Found", "{\"error\":\"route_not_found\"}\n");
@@ -647,7 +740,7 @@ static void archive_handle_request_with_buffer(const archive_connection_t* clien
 	archive_send_json(client, 501, "Not Implemented", body);
 }
 
-static void archive_handle_request(const archive_connection_t* client, const archive_repository_t* repository,
+static void archive_handle_request(archive_connection_t* client, const archive_repository_t* repository,
 		const archive_index_t* index) {
 	temp_memory_t temp = begin_temp_memory_on_local_thread();
 	char* request = arena_push_array(&threadlocal_thread_memory->temp_arena,
@@ -660,19 +753,37 @@ static void archive_handle_request(const archive_connection_t* client, const arc
 static void archive_handle_client_task(i32 logical_thread_index, void* userdata) {
 	(void)logical_thread_index;
 	archive_client_task_t* task = (archive_client_task_t*)userdata;
+	archive_connection_t* connection = task->connection;
 	i64 start = archive_profile_requests ? get_clock() : 0;
 	archive_profile_send_ms = archive_profile_read_ms = 0;
 	archive_profile_route = "invalid";
-	if (archive_set_client_timeout(&task->connection))
-		archive_handle_request(&task->connection, task->repository, task->index);
-	archive_socket_close(task->connection.socket);
+	connection->keep_alive = false;
+	connection->sent_headers = false;
+	connection->send_failed = false;
+	connection->body_remaining = 0;
+	if (archive_set_client_timeout(connection))
+		archive_handle_request(connection, task->repository, task->index);
 	if (archive_profile_requests) {
 		double elapsed = get_seconds_elapsed(start, get_clock()) * 1000.0;
 		fprintf(stderr, "archive timing: route=%s queue=%.3f ms receive=%.3f ms work=%.3f ms send=%.3f ms total=%.3f ms\n",
 			archive_profile_route,
-			get_seconds_elapsed(task->connection.accepted_at, start) * 1000.0,
+			get_seconds_elapsed(connection->accepted_at, start) * 1000.0,
 			archive_profile_read_ms, MAX(0.0, elapsed - archive_profile_read_ms - archive_profile_send_ms),
-			archive_profile_send_ms, get_seconds_elapsed(task->connection.accepted_at, get_clock()) * 1000.0);
+			archive_profile_send_ms, get_seconds_elapsed(connection->accepted_at, get_clock()) * 1000.0);
+	}
+	if (connection->keep_alive && connection->sent_headers && !connection->send_failed &&
+	    connection->body_remaining == 0) {
+		connection->idle_since = get_clock();
+		platform_mutex_lock(&archive_returned_mutex);
+		if (archive_returned_count < ARCHIVE_MAX_IDLE_CONNECTIONS) {
+			archive_returned[archive_returned_count++] = connection;
+			connection = NULL;
+		}
+		platform_mutex_unlock(&archive_returned_mutex);
+	}
+	if (connection) {
+		archive_socket_close(connection->socket);
+		free(connection);
 	}
 }
 
@@ -716,28 +827,91 @@ int archive_http_serve(const archive_repository_t* repository, u16 port,
 	       thread_pool_get_active_worker_thread_count(&global_thread_pool));
 	fflush(stdout);
 
+	archive_connection_t* idle[ARCHIVE_MAX_IDLE_CONNECTIONS] = {0};
+	i32 idle_count = 0;
 	size_t handled = 0;
 	while (max_requests == 0 || handled < max_requests) {
-		archive_socket_t client = archive_accept_loopback(ipv4_server, ipv6_server);
-		if (client == ARCHIVE_INVALID_SOCKET) {
-			fprintf(stderr, "Archive accept failed\n");
+		archive_collect_returned_connections(idle, &idle_count);
+		i64 now = get_clock();
+		for (i32 i = idle_count - 1; i >= 0; --i) {
+			if (get_seconds_elapsed(idle[i]->idle_since, now) * 1000.0 >=
+			    ARCHIVE_SOCKET_IDLE_TIMEOUT_MS) {
+				archive_close_connection(idle[i]);
+				idle[i] = idle[--idle_count];
+			}
+		}
+		fd_set read_fds;
+		FD_ZERO(&read_fds);
+		FD_SET(ipv4_server, &read_fds);
+		archive_socket_t max_socket = ipv4_server;
+		if (ipv6_server != ARCHIVE_INVALID_SOCKET) {
+			FD_SET(ipv6_server, &read_fds);
+			max_socket = MAX(max_socket, ipv6_server);
+		}
+		for (i32 i = 0; i < idle_count; ++i) {
+			FD_SET(idle[i]->socket, &read_fds);
+			max_socket = MAX(max_socket, idle[i]->socket);
+		}
+		struct timeval timeout = {0, ARCHIVE_LISTENER_POLL_MS * 1000};
+#if defined(_WIN32)
+		i32 ready = select(0, &read_fds, NULL, NULL, &timeout);
+#else
+		i32 ready = select(max_socket + 1, &read_fds, NULL, NULL, &timeout);
+		if (ready < 0 && errno == EINTR) continue;
+#endif
+		if (ready < 0) {
+			fprintf(stderr, "Archive listener select failed\n");
 			break;
 		}
-		archive_client_task_t task = {{client, get_clock()}, repository, &index};
-		if (!thread_pool_submit_task(&global_thread_pool, archive_handle_client_task,
-		                             &task, sizeof(task))) {
-			archive_send_json(&task.connection, 503, "Service Unavailable", "{\"error\":\"server_busy\"}\n");
-			archive_socket_close(client);
-		} else if (thread_pool_get_active_worker_thread_count(&global_thread_pool) == 0) {
-			/* A single-core host has no background worker; thread 0 remains a valid
-			 * logical worker with the same temporary-arena contract. */
-			thread_pool_do_work(&global_thread_pool);
+		if (ready == 0) continue;
+		/* Reused connections are ready to request work. Waiting for them happens
+		 * here, outside the worker pool. */
+		for (i32 i = idle_count - 1; i >= 0 && (max_requests == 0 || handled < max_requests); --i) {
+			archive_connection_t* connection = idle[i];
+			if (!FD_ISSET(connection->socket, &read_fds)) continue;
+			idle[i] = idle[--idle_count];
+			connection->accepted_at = get_clock();
+			++connection->request_count;
+			archive_client_task_t task = {connection, repository, &index};
+			if (!thread_pool_submit_task(&global_thread_pool, archive_handle_client_task,
+			                             &task, sizeof(task))) {
+				connection->keep_alive = false;
+				archive_send_json(connection, 503, "Service Unavailable", "{\"error\":\"server_busy\"}\n");
+				archive_close_connection(connection);
+			} else if (thread_pool_get_active_worker_thread_count(&global_thread_pool) == 0) {
+				/* On a single-core host the listener is also logical worker 0. */
+				thread_pool_do_work(&global_thread_pool);
+			}
+			++handled;
 		}
-		++handled;
+		archive_socket_t listeners[2] = {ipv4_server, ipv6_server};
+		for (i32 i = 0; i < 2; ++i) {
+			if (listeners[i] == ARCHIVE_INVALID_SOCKET ||
+			    !FD_ISSET(listeners[i], &read_fds)) continue;
+			archive_socket_t socket = accept(listeners[i], NULL, NULL);
+			if (socket == ARCHIVE_INVALID_SOCKET) continue;
+			/* Multipart responses are written in small header/body pieces. Disable
+			 * Nagle so a persistent connection does not wait for delayed ACKs. */
+			int no_delay = 1;
+			setsockopt(socket, IPPROTO_TCP, TCP_NODELAY,
+			           (const char*)&no_delay, sizeof(no_delay));
+			archive_connection_t* connection = calloc(1, sizeof(*connection));
+			if (!connection) {
+				archive_socket_close(socket);
+				continue;
+			}
+			connection->socket = socket;
+			connection->idle_since = get_clock();
+			archive_add_idle_connection(idle, &idle_count, connection);
+		}
 	}
+	for (i32 i = 0; i < idle_count; ++i) archive_close_connection(idle[i]);
 	archive_socket_close(ipv4_server);
 	if (ipv6_server != ARCHIVE_INVALID_SOCKET) archive_socket_close(ipv6_server);
 	thread_pool_wait_for_completion(&global_thread_pool);
+	idle_count = 0;
+	archive_collect_returned_connections(idle, &idle_count);
+	for (i32 i = 0; i < idle_count; ++i) archive_close_connection(idle[i]);
 	archive_index_destroy(&index);
 	archive_instance_provider_shutdown();
 	archive_socket_shutdown();
