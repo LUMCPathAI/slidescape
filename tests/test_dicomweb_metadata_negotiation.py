@@ -87,10 +87,10 @@ def exercise(binary, compact_status, standard_status):
     success = compact_status in (406, 500) and standard_status == 200
     assert (result.returncode == 0) == success, result.stdout
     if success:
-        assert 'Opened DICOMweb series with 2 pyramid instances.' in result.stdout, result.stdout
+        assert result.stdout.count('Opened DICOMweb series with 2 pyramid instances.') == 1, result.stdout
     else:
         status = standard_status if compact_status in (406, 500) else compact_status
-        assert f'last HTTP status: {status}' in result.stdout, result.stdout
+        assert result.stdout.count(f'last HTTP status: {status}') == 1, result.stdout
 
 
 if __name__ == '__main__':

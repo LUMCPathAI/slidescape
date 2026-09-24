@@ -111,7 +111,23 @@ static bool archive_object_ensure_directory(const char* path, const char* parent
 }
 
 static bool archive_object_create_staging_file(const archive_repository_t* repository,
-		char* path, size_t path_capacity, FILE** file, char* error, size_t error_capacity) {
+		const char* storage_root, char* path, size_t path_capacity, FILE** file,
+		char* error, size_t error_capacity) {
+	const char* staging_directory = "staging";
+	if (strcmp(storage_root, "objects") == 0) {
+		/* The object staging directory can be placed on the objects filesystem. */
+		char parent[ARCHIVE_PATH_CAPACITY];
+		char object_staging[ARCHIVE_PATH_CAPACITY];
+		if (!archive_repository_make_path(repository, "staging", parent, sizeof(parent)) ||
+		    !archive_repository_make_path(repository, "staging/objects", object_staging,
+		                                  sizeof(object_staging)) ||
+		    !archive_object_ensure_directory(object_staging, parent, error, error_capacity)) {
+			return false;
+		}
+		staging_directory = "staging/objects";
+	} else if (strcmp(storage_root, "shells") != 0) {
+		return false;
+	}
 	for (i32 attempt = 0; attempt < 16; ++attempt) {
 		u8 random[16];
 		char random_hex[33];
@@ -124,7 +140,7 @@ static bool archive_object_create_staging_file(const archive_repository_t* repos
 		random_hex[32] = '\0';
 		char relative[80];
 		int relative_length = snprintf(relative, sizeof(relative),
-		                               "staging/object-%s.tmp", random_hex);
+		                               "%s/object-%s.tmp", staging_directory, random_hex);
 		if (relative_length < 0 || (size_t)relative_length >= sizeof(relative) ||
 		    !archive_repository_make_path(repository, relative, path, path_capacity)) {
 			return false;
@@ -288,7 +304,7 @@ archive_object_status_t archive_object_import_file(const archive_repository_t* r
 	}
 	char staging_path[ARCHIVE_PATH_CAPACITY];
 	FILE* staging = NULL;
-	if (!archive_object_create_staging_file(repository, staging_path, sizeof(staging_path),
+	if (!archive_object_create_staging_file(repository, "objects", staging_path, sizeof(staging_path),
 	                                        &staging, error, error_capacity)) {
 		fclose(source);
 		return ARCHIVE_OBJECT_STORAGE_ERROR;
@@ -410,7 +426,7 @@ static archive_object_status_t archive_object_store_bytes_in_tier(
 	}
 	char staging_path[ARCHIVE_PATH_CAPACITY];
 	FILE* staging = NULL;
-	if (!archive_object_create_staging_file(repository, staging_path, sizeof(staging_path),
+	if (!archive_object_create_staging_file(repository, storage_root, staging_path, sizeof(staging_path),
 	                                        &staging, error, error_capacity)) {
 		return ARCHIVE_OBJECT_STORAGE_ERROR;
 	}
@@ -558,7 +574,7 @@ archive_object_status_t archive_object_repair_shell_bytes(
 
 	char staging_path[ARCHIVE_PATH_CAPACITY];
 	FILE* staging = NULL;
-	if (!archive_object_create_staging_file(repository, staging_path,
+	if (!archive_object_create_staging_file(repository, "shells", staging_path,
 	                                        sizeof(staging_path), &staging,
 	                                        error, error_capacity)) {
 		return ARCHIVE_OBJECT_STORAGE_ERROR;
@@ -629,7 +645,7 @@ archive_object_status_t archive_object_store_zip(const archive_repository_t* rep
 	memset(object, 0, sizeof(*object));
 	char staging_path[ARCHIVE_PATH_CAPACITY];
 	archive_zip_sink_t sink = {0};
-	if (!archive_object_create_staging_file(repository, staging_path, sizeof(staging_path),
+	if (!archive_object_create_staging_file(repository, "objects", staging_path, sizeof(staging_path),
 		&sink.file, error, error_capacity)) return ARCHIVE_OBJECT_STORAGE_ERROR;
 	archive_sha256_initialize(&sink.sha);
 	bool success = source_zip_write(members, count, archive_zip_write, &sink, error, error_capacity);

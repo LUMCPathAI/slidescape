@@ -235,12 +235,12 @@ const char* dicomweb_get_last_status(void) {
 	return dicomweb_last_status;
 }
 
+/* Store status without logging; the caller reports the result once. */
 static void set_status(const char* format, ...) {
 	va_list args;
 	va_start(args, format);
 	vsnprintf(dicomweb_last_status, sizeof(dicomweb_last_status), format, args);
 	va_end(args);
-	console_print("%s\n", dicomweb_last_status);
 }
 
 static bool is_loopback_host(const char* hostname) {
@@ -713,11 +713,7 @@ static void dicomweb_async_task_func(i32 logical_thread_index, void* userdata) {
 	}
 
 complete:
-	if (result->succeeded) {
-		console_print("%s\n", result->message);
-	} else {
-		console_print_error("%s\n", result->message);
-	}
+	/* The GUI logs accepted completions; stale results should stay silent. */
 	memset(task->password, 0, sizeof(task->password));
 	if (!completion_queue_post(&task->context->completions,
 	                           DICOMWEB_ASYNC_COMPLETION_RESULT,
@@ -862,19 +858,25 @@ bool dicomweb_async_commit_open(app_state_t* app_state,
 	if (image->dicomweb.available_series_count > 1) show_slide_tray_window = true;
 	set_status("Opened DICOMweb series with %d pyramid instances.",
 	           image->dicomweb.instance_count);
+	console_print("%s\n", dicomweb_last_status);
 	return true;
 }
 
 i32 dicomweb_query_studies(const char* archive_url, const char* username, const char* password,
                            dicomweb_study_ref_t* out, i32 capacity) {
+	dicomweb_last_status[0] = '\0';
 	dicomweb_remote_image_t remote = {0};
-	if (!configure_archive(&remote, archive_url, username, password)) return 0;
+	if (!configure_archive(&remote, archive_url, username, password)) {
+		if (dicomweb_last_status[0]) console_print_error("%s\n", dicomweb_last_status);
+		return 0;
+	}
 	char path[1024];
 	i32 length = snprintf(path, sizeof(path), "%s/studies", remote.root);
 	if (length <= 0 || length >= sizeof(path)) return 0;
 	http_response_t* response = dicomweb_get(&remote, path, "application/dicom+json", false);
 	if (!response || response->status_code < 200 || response->status_code >= 300) {
 		set_status("DICOMweb study query failed (HTTP %d).", response ? response->status_code : 0);
+		console_print_error("%s\n", dicomweb_last_status);
 		if (response) http_response_destroy(response);
 		return 0;
 	}
@@ -882,20 +884,26 @@ i32 dicomweb_query_studies(const char* archive_url, const char* username, const 
 	                                     response->content_length, out, capacity);
 	http_response_destroy(response);
 	set_status("DICOMweb archive returned %d studies.", count);
+	console_print("%s\n", dicomweb_last_status);
 	return count;
 }
 
 i32 dicomweb_query_series(const char* archive_url, const char* username, const char* password,
                           const char* study_uid, dicomweb_series_ref_t* out, i32 capacity) {
 	if (!study_uid || !dicomweb_is_valid_uid(study_uid, strlen(study_uid))) return 0;
+	dicomweb_last_status[0] = '\0';
 	dicomweb_remote_image_t remote = {0};
-	if (!configure_archive(&remote, archive_url, username, password)) return 0;
+	if (!configure_archive(&remote, archive_url, username, password)) {
+		if (dicomweb_last_status[0]) console_print_error("%s\n", dicomweb_last_status);
+		return 0;
+	}
 	char path[1200];
 	i32 length = snprintf(path, sizeof(path), "%s/studies/%s/series", remote.root, study_uid);
 	if (length <= 0 || length >= sizeof(path)) return 0;
 	http_response_t* response = dicomweb_get(&remote, path, "application/dicom+json", false);
 	if (!response || response->status_code < 200 || response->status_code >= 300) {
 		set_status("DICOMweb series query failed (HTTP %d).", response ? response->status_code : 0);
+		console_print_error("%s\n", dicomweb_last_status);
 		if (response) http_response_destroy(response);
 		return 0;
 	}
@@ -903,6 +911,7 @@ i32 dicomweb_query_series(const char* archive_url, const char* username, const c
 	                                      response->content_length, out, capacity);
 	http_response_destroy(response);
 	set_status("DICOMweb study returned %d series.", count);
+	console_print("%s\n", dicomweb_last_status);
 	return count;
 }
 
@@ -912,8 +921,12 @@ i32 dicomweb_query_instances(const char* archive_url, const char* username, cons
 	if (!study_uid || !series_uid ||
 	    !dicomweb_is_valid_uid(study_uid, strlen(study_uid)) ||
 	    !dicomweb_is_valid_uid(series_uid, strlen(series_uid))) return 0;
+	dicomweb_last_status[0] = '\0';
 	dicomweb_remote_image_t remote = {0};
-	if (!configure_archive(&remote, archive_url, username, password)) return 0;
+	if (!configure_archive(&remote, archive_url, username, password)) {
+		if (dicomweb_last_status[0]) console_print_error("%s\n", dicomweb_last_status);
+		return 0;
+	}
 	char path[1400];
 	i32 length = snprintf(path, sizeof(path), "%s/studies/%s/series/%s/instances%s",
 	                      remote.root, study_uid, series_uid,
@@ -922,6 +935,7 @@ i32 dicomweb_query_instances(const char* archive_url, const char* username, cons
 	http_response_t* response = dicomweb_get(&remote, path, "application/dicom+json", false);
 	if (!response || response->status_code < 200 || response->status_code >= 300) {
 		set_status("DICOMweb instance query failed (HTTP %d).", response ? response->status_code : 0);
+		console_print_error("%s\n", dicomweb_last_status);
 		if (response) http_response_destroy(response);
 		return 0;
 	}
@@ -929,6 +943,7 @@ i32 dicomweb_query_instances(const char* archive_url, const char* username, cons
 	                                        response->content_length, out, capacity);
 	http_response_destroy(response);
 	set_status("DICOMweb series returned %d instances.", count);
+	console_print("%s\n", dicomweb_last_status);
 	return count;
 }
 
@@ -1319,10 +1334,12 @@ bool dicomweb_open_series(app_state_t* app_state, const char* series_url,
 		if (!dicomweb_last_status[0]) {
 			set_status("Expected a DICOMweb series URL ending in /studies/{uid}/series/{uid}.");
 		}
+		console_print_error("%s\n", dicomweb_last_status);
 		return false;
 	}
 	if (!set_basic_authorization(&remote, username, password)) {
 		set_status("DICOMweb credentials are too long.");
+		console_print_error("%s\n", dicomweb_last_status);
 		return false;
 	}
 	return dicomweb_open_configured_series(app_state, remote);

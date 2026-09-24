@@ -20,13 +20,19 @@ REPOSITORY/
   archive.sqlite3   transactional metadata, publication, and QIDO authority
   objects/           immutable content-addressed source payloads
   shells/            immutable content-addressed fast-tier virtual DICOM shells
-  staging/           transient files used by atomic object installation
+  staging/           transient files used by atomic shell installation
+    objects/         transient source-object files (can point to the objects volume)
 ```
 
 The directories describe ownership boundaries, not a commitment to a local-filesystem
 production backend. Object storage and a transactional database may implement the same
 interfaces later. Data under `staging/` is never canonical and must not be
 discoverable through QIDO or retrievable through WADO.
+
+When `objects/` is on another filesystem, `staging/objects/` must be on that same
+filesystem. The object writer installs files with a hard link, while shell staging
+remains on the repository filesystem for atomic shell installation. A deployment
+must fail closed if the objects volume is absent.
 
 Publication will be one atomic state transition covering the immutable source-bundle
 manifest, governed metadata version, virtual-DICOM representation manifests, and QIDO
@@ -220,7 +226,7 @@ members and marks their bundle `PUBLISHED` in one writer transaction; lookup adm
 only members of published bundles.
 
 The local immutable-object writer is also implemented. File and in-memory inputs are
-copied to exclusive files under `staging/` while SHA-256 and byte size are computed.
+copied to exclusive files under `staging/objects/` while SHA-256 and byte size are computed.
 After the staged file is flushed, it is installed without overwrite at
 `objects/sha256/HH/FULL_DIGEST`, the containing directory is made durable where the
 platform supports directory synchronization, and the object record is inserted in a

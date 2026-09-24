@@ -317,7 +317,9 @@ def test_dicom_zip(binary, capture_directory=False):
                     failed = run(binary, 'ingest', repository, '--source', tree, *options, success=False)
                     assert 'links' in failed.stderr, failed.stderr
                     (tree / 'link').unlink()
-                assert not list((repository / 'staging').iterdir())
+                assert all(path.name == 'objects' and path.is_dir() and
+                           not list(path.iterdir())
+                           for path in (repository / 'staging').iterdir())
             assert scalar("SELECT bundle_digest FROM bundle WHERE state='PUBLISHED'") == digest
             # Reject incomplete member payloads even when later ZIP bytes are available.
             write_slide(c_path, 4, truncated=True)

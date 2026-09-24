@@ -789,6 +789,8 @@ TEST_CASE("pathology archive stores immutable objects by verified SHA-256") {
 	CHECK(archive_test_rmdir(path) == 0);
 	snprintf(path, sizeof(path), "%s/shells/sha256", temp_path);
 	CHECK(archive_test_rmdir(path) == 0);
+	snprintf(path, sizeof(path), "%s/staging/objects", temp_path);
+	CHECK(archive_test_rmdir(path) == 0);
 	const char* children[] = {
 		"staging", "shells", "objects"
 	};
