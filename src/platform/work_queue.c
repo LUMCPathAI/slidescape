@@ -29,109 +29,156 @@
 #include "work_queue.h"
 #include "platform.h"
 #include "intrinsics.h"
+#include "platform_mutex.h"
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <malloc.h>
 #include "win32_utils.h" // for win32_diagnostic()
 #else
 #include <semaphore.h>
 #include <pthread.h>
+#include <unistd.h>
 #endif
+
+// Each slot has a monotonically increasing generation. For ticket p:
+//   sequence == p            producer may claim and fill the slot
+//   sequence == p + 1        consumer may claim and copy the payload
+//   sequence == p + capacity consumer has finished; next producer may reuse it
+// The ticket CAS only arbitrates ownership (relaxed). Acquire/release on the
+// sequence publishes the payload AND prevents reuse until copying has finished.
+// Keeping the full ticket, rather than a wrapped index, avoids ring-index ABA.
+// This is the bounded MPMC sequence protocol described by Dmitry Vyukov.
+// Counters wrap modulo 2^64; no operation may lag behind by 2^63 tickets.
+#if defined(_MSC_VER)
+#define WORK_QUEUE_ALIGNED __declspec(align(128))
+#else
+#define WORK_QUEUE_ALIGNED __attribute__((aligned(128)))
+#endif
+
+typedef struct WORK_QUEUE_ALIGNED work_queue_slot_t {
+	u64 sequence;
+	work_queue_entry_t entry;
+} work_queue_slot_t;
+
+typedef struct WORK_QUEUE_ALIGNED work_queue_counter_t {
+	u64 value;
+} work_queue_counter_t;
+
+STATIC_ASSERT(sizeof(work_queue_counter_t) == 128);
+STATIC_ASSERT(sizeof(work_queue_slot_t) % 128 == 0);
+
+typedef struct work_queue_state_t {
+	// Separate cache lines: submitting, claiming, and completing are independent.
+	// 128 bytes covers Apple Silicon as well as 64-byte cache-line machines.
+	work_queue_counter_t submitted;
+	work_queue_counter_t claimed;
+	work_queue_counter_t completed;
+	work_queue_slot_t* slots;
+	u64 mask;
+} work_queue_state_t;
+
+static void* work_queue_alloc_aligned(size_t size) {
+	void* result = NULL;
+#if WINDOWS
+	result = _aligned_malloc(size, 128);
+#else
+	if (posix_memalign(&result, 128, size) != 0) result = NULL;
+#endif
+	if (!result) fatal_error("work queue allocation failed");
+	memset(result, 0, size);
+	return result;
+}
+
+static void work_queue_free_aligned(void* allocation) {
+#if WINDOWS
+	_aligned_free(allocation);
+#else
+	free(allocation);
+#endif
+}
+
+static void work_queue_init_storage(work_queue_t* queue, i32 requested_capacity) {
+	if (requested_capacity < 1 || requested_capacity > (1 << 30)) {
+		fatal_error("invalid work queue capacity");
+	}
+	u64 capacity = 2;
+	while (capacity < (u64)requested_capacity) capacity *= 2;
+	if (capacity > SIZE_MAX / sizeof(work_queue_slot_t)) fatal_error("work queue capacity overflow");
+	work_queue_state_t* state = work_queue_alloc_aligned(sizeof(*state));
+	state->slots = work_queue_alloc_aligned((size_t)capacity * sizeof(*state->slots));
+	state->mask = capacity - 1;
+	for (u64 i = 0; i < capacity; ++i) state->slots[i].sequence = i;
+	queue->state = state;
+	queue->entry_count = (i32)capacity;
+	queue->logical_thread_index = threadlocal_logical_thread_index;
+}
 
 work_queue_t work_queue_create(const char* semaphore_name, i32 entry_count) {
 	work_queue_t queue = {0};
-
-	queue.logical_thread_index = threadlocal_logical_thread_index;
-
-	i32 semaphore_initial_count = 0;
 #if WINDOWS
 	(void)semaphore_name;
-	LONG maximum_count = 1e6; // realistically, we'd only get up to the number of worker threads, though
-	/* Each pool needs an independent wake-up count. A fixed named semaphore
-	 * lets unrelated pools consume each other's task and shutdown signals. */
-	queue.semaphore = CreateSemaphoreExA(
-		0, semaphore_initial_count, maximum_count, NULL, 0, SEMAPHORE_ALL_ACCESS);
+	// Unnamed: separate pools must never consume each other's wakeups.
+	queue.semaphore = CreateSemaphoreExA(0, 0, 1000000, NULL, 0, SEMAPHORE_ALL_ACCESS);
+	if (!queue.semaphore) fatal_error("failed to initialize semaphore");
 #elif APPLE
-	// Prevent name collisions by appending a unique number
-	char semaphore_name_unique[64];
+	// macOS requires named semaphores. Include the PID to separate app instances,
+	// then unlink immediately so the name does not survive normal process exit.
+	(void)semaphore_name;
+	char unique_name[32];
 	static volatile i32 sem_id = 0;
-	snprintf(semaphore_name_unique, sizeof(semaphore_name_unique), "%s%lld", semaphore_name, atomic_increment(&sem_id));
-	queue.semaphore = sem_open(semaphore_name_unique, O_CREAT, 0644, semaphore_initial_count);
-	sem_unlink(semaphore_name_unique);
+	snprintf(unique_name, sizeof(unique_name), "/scq-%u-%u", (u32)getpid(), (u32)atomic_increment(&sem_id));
+	queue.semaphore = sem_open(unique_name, O_CREAT | O_EXCL, 0600, 0);
+	if (queue.semaphore == SEM_FAILED) fatal_error("failed to initialize semaphore");
+	sem_unlink(unique_name);
 #else
-	queue.semaphore = calloc(1, sizeof(sem_t));
-	i32 rc = sem_init(queue.semaphore, 0, 0);
-	if (rc != 0) {
-		perror("sem_init");
+	(void)semaphore_name;
+	queue.semaphore = malloc(sizeof(sem_t));
+	if (!queue.semaphore || sem_init(queue.semaphore, 0, 0) != 0) {
 		fatal_error("failed to initialize semaphore");
 	}
 #endif
 	queue.owns_semaphore = true;
-	queue.entry_count = entry_count + 1; // add safety margin to detect when queue is about to overflow
-	queue.entries = calloc(1, (entry_count + 1) * sizeof(work_queue_entry_t));
-	queue.entries_lock = malloc(sizeof(*queue.entries_lock));
-	if (!queue.entries || !queue.entries_lock) fatal_error("work queue allocation failed");
-	platform_mutex_init(queue.entries_lock);
+	work_queue_init_storage(&queue, entry_count);
 	return queue;
 }
 
 work_queue_t work_queue_create_with_existing_semaphore(void* semaphore_handle, i32 entry_count) {
 	work_queue_t queue = {0};
-#if WINDOWS
-	queue.semaphore = (HANDLE)semaphore_handle;
-#else
-	queue.semaphore = (sem_t*)semaphore_handle;
-#endif
-	queue.owns_semaphore = false;
-	queue.entry_count = entry_count + 1; // add safety margin to detect when queue is about to overflow
-	queue.entries = calloc(1, (entry_count + 1) * sizeof(work_queue_entry_t));
-	queue.entries_lock = malloc(sizeof(*queue.entries_lock));
-	if (!queue.entries || !queue.entries_lock) fatal_error("work queue allocation failed");
-	platform_mutex_init(queue.entries_lock);
+	queue.semaphore = semaphore_handle;
+	work_queue_init_storage(&queue, entry_count);
 	return queue;
 }
 
 void work_queue_destroy(work_queue_t* queue) {
-	if (!queue) {
-		return;
-	}
-	if (queue->entries) {
+	if (!queue) return;
+	if (queue->state) {
 		for (i32 i = 0; i < queue->entry_count; ++i) {
-			if (queue->entries[i].heap_userdata) {
-				free(queue->entries[i].heap_userdata);
-			}
+			free(queue->state->slots[i].entry.heap_userdata);
 		}
-		free(queue->entries);
-		queue->entries = NULL;
+		work_queue_free_aligned(queue->state->slots);
+		work_queue_free_aligned(queue->state);
 	}
-	if (queue->entries_lock) {
-		platform_mutex_destroy(queue->entries_lock);
-		free(queue->entries_lock);
-	}
-	if (!queue->owns_semaphore || !queue->semaphore) {
-		memset(queue, 0, sizeof(work_queue_t));
-		return;
-	}
+	if (queue->owns_semaphore && queue->semaphore) {
 #if WINDOWS
-	CloseHandle(queue->semaphore);
+		CloseHandle(queue->semaphore);
 #elif APPLE
-	sem_close(queue->semaphore);
+		sem_close(queue->semaphore);
 #else
-	sem_destroy(queue->semaphore);
-	free(queue->semaphore);
+		sem_destroy(queue->semaphore);
+		free(queue->semaphore);
 #endif
-	queue->semaphore = NULL;
-	memset(queue, 0, sizeof(work_queue_t));
+	}
+	memset(queue, 0, sizeof(*queue));
 }
 
 i32 work_queue_get_entry_count(work_queue_t* queue) {
-	platform_mutex_lock(queue->entries_lock);
-	i32 count = queue->next_entry_to_submit - queue->next_entry_to_execute;
-	while (count < 0) {
-		count += queue->entry_count;
-	}
-	platform_mutex_unlock(queue->entries_lock);
-	return count;
+	if (!queue) return 0;
+	work_queue_state_t* state = queue->state;
+	u64 claimed = atomic_load_u64_acquire(&state->claimed.value);
+	u64 submitted = atomic_load_u64_acquire(&state->submitted.value);
+	// The counters can advance between reads; this is a scheduling estimate.
+	return (i32)MIN(submitted - claimed, (u64)queue->entry_count);
 }
 
 void task_group_begin(task_group_t* group) {
@@ -161,46 +208,54 @@ task_group_t task_group_create_child(task_group_t* parent) {
 	return result;
 }
 
-// TODO: add optional refcount increment
-bool work_queue_submit_to_group(work_queue_t* queue, task_group_t* task_group, work_queue_callback_t callback, u32 task_identifier, void* userdata, size_t userdata_size) {
-	if (!queue) {
-		fatal_error("work_queue_add_entry(): queue is NULL");
+static void work_queue_wake_worker(work_queue_t* queue) {
+	if (queue->owner_pool) {
+		// Paired with registration + recheck in worker_thread(). The SC fences
+		// forbid BOTH producer missing the waiter AND waiter missing publication.
+		// Acquire/release alone on these two independent locations is insufficient.
+		atomic_fence_seq_cst();
+		if (atomic_load_seq_cst(&queue->owner_pool->sleeping_worker_count) == 0) return;
 	}
+	// A credit survives post-before-wait. Standalone queues retain unconditional
+	// notification because external consumers do not participate in registration.
+	platform_semaphore_post(queue->semaphore);
+}
+
+bool work_queue_submit_to_group(work_queue_t* queue, task_group_t* task_group, work_queue_callback_t callback, u32 task_identifier, void* userdata, size_t userdata_size) {
+	ASSERT(queue);
+	ASSERT(userdata || userdata_size == 0);
 	void* heap_userdata = NULL;
 	if (userdata_size > sizeof(((work_queue_entry_t*)0)->userdata)) {
+		// Allocate before reserving a ticket: allocation failure must not leave a
+		// permanent hole, and slow allocation should not hold up other consumers.
 		heap_userdata = malloc(userdata_size);
-		if (!heap_userdata) {
-			console_print_error("work_queue_add_entry(): failed to allocate %zu bytes for userdata\n", userdata_size);
-			return false;
-		}
-		ASSERT(userdata);
+		if (!heap_userdata) return false;
 		memcpy(heap_userdata, userdata, userdata_size);
 	}
-	// Publish the payload and counters together. Consumers must finish copying a
-	// slot before producers can reuse it; CAS on the ring indices alone cannot
-	// guarantee that, and wrapped indices also admit ABA between consumers.
-	platform_mutex_lock(queue->entries_lock);
-	i32 entry_to_submit = queue->next_entry_to_submit;
-	i32 new_next_entry_to_submit = (entry_to_submit + 1) % queue->entry_count;
-	if (new_next_entry_to_submit == queue->next_entry_to_execute) {
-		platform_mutex_unlock(queue->entries_lock);
-		free(heap_userdata);
-		return false; // Caller can retry or cancel; ownership was not transferred.
+	work_queue_state_t* state = queue->state;
+	u64 position = atomic_load_u64_relaxed(&state->submitted.value);
+	work_queue_slot_t* slot;
+	for (;;) {
+		slot = &state->slots[position & state->mask];
+		u64 sequence = atomic_load_u64_acquire(&slot->sequence);
+		i64 difference = (i64)(sequence - position);
+		if (difference == 0) {
+			if (atomic_compare_exchange_u64_relaxed(&state->submitted.value, &position, position + 1)) break;
+		} else if (difference < 0) {
+			free(heap_userdata);
+			return false; // Full, or previous consumer has not finished copying.
+		} else {
+			position = atomic_load_u64_relaxed(&state->submitted.value);
+		}
 	}
+	// A reserved ticket must always be published. From here on nothing can fail.
 	task_group_begin(task_group);
-	work_queue_entry_t* entry = queue->entries + entry_to_submit;
-	*entry = (work_queue_entry_t){ .is_valid = true, .callback = callback,
+	slot->entry = (work_queue_entry_t){ .is_valid = true, .callback = callback,
 	        .task_identifier = task_identifier, .task_group = task_group,
 	        .userdata_size = userdata_size, .heap_userdata = heap_userdata };
-	if (userdata_size > 0 && !heap_userdata) {
-		ASSERT(userdata);
-		memcpy(entry->userdata, userdata, userdata_size);
-	}
-	++queue->completion_goal;
-	++queue->start_goal;
-	queue->next_entry_to_submit = new_next_entry_to_submit;
-	platform_mutex_unlock(queue->entries_lock);
-	platform_semaphore_post(queue->semaphore);
+	if (userdata_size > 0 && !heap_userdata) memcpy(slot->entry.userdata, userdata, userdata_size);
+	atomic_store_u64_release(&slot->sequence, position + 1);
+	work_queue_wake_worker(queue);
 	return true;
 }
 
@@ -224,84 +279,70 @@ bool work_queue_submit_notification(work_queue_t* queue, u32 task_identifier, vo
 
 work_queue_entry_t work_queue_get_next_entry(work_queue_t* queue) {
 	work_queue_entry_t result = {0};
-	platform_mutex_lock(queue->entries_lock);
-	i32 entry_to_execute = queue->next_entry_to_execute;
-	if (entry_to_execute != queue->next_entry_to_submit) {
-		result = queue->entries[entry_to_execute];
-		queue->entries[entry_to_execute] = (work_queue_entry_t){0};
-		queue->next_entry_to_execute = (entry_to_execute + 1) % queue->entry_count;
+	if (!queue) return result;
+	work_queue_state_t* state = queue->state;
+	u64 position = atomic_load_u64_relaxed(&state->claimed.value);
+	work_queue_slot_t* slot;
+	for (;;) {
+		slot = &state->slots[position & state->mask];
+		u64 sequence = atomic_load_u64_acquire(&slot->sequence);
+		i64 difference = (i64)(sequence - (position + 1));
+		if (difference == 0) {
+			if (atomic_compare_exchange_u64_relaxed(&state->claimed.value, &position, position + 1)) break;
+		} else if (difference < 0) {
+			return result; // Empty, or head producer is still filling its slot.
+		} else {
+			position = atomic_load_u64_relaxed(&state->claimed.value);
+		}
 	}
-	platform_mutex_unlock(queue->entries_lock);
+	result = slot->entry;
+	// Transfer heap ownership to the local copy. Clearing just this pointer lets
+	// destruction free pending entries without touching already consumed payloads.
+	slot->entry.heap_userdata = NULL;
+	atomic_store_u64_release(&slot->sequence, position + (u64)queue->entry_count);
 	return result;
 }
 
 void work_queue_mark_entry_completed(work_queue_t* queue) {
-	platform_mutex_lock(queue->entries_lock);
-	++queue->completion_count;
-	platform_mutex_unlock(queue->entries_lock);
+	// Release RMWs form a release sequence: acquiring the final count publishes
+	// writes from ALL completed callbacks, even if they completed out of order.
+	atomic_increment_u64_release(&queue->state->completed.value);
 }
-
 
 bool work_queue_do_work(work_queue_t* queue) {
-    if (!queue) {
-        return false;
-    }
 	work_queue_entry_t entry = work_queue_get_next_entry(queue);
-	if (entry.is_valid) {
-		if (queue->owner_pool) {
-			atomic_decrement(&queue->owner_pool->worker_thread_idle_count);
-		}
-		platform_mutex_lock(queue->entries_lock);
-		++queue->start_count;
-		platform_mutex_unlock(queue->entries_lock);
-		ASSERT(entry.callback);
-		if (entry.callback) {
-			// Copy the user data (arguments for the call) onto the stack
-			void* userdata = entry.heap_userdata;
-			if (userdata == NULL) {
-				userdata = alloca(sizeof(entry.userdata));
-				memcpy(userdata, entry.userdata, sizeof(entry.userdata));
-			}
-
-			// Ensure all the memory allocated on the thread's temp_arena will be released when the task completes
-			temp_memory_t temp = begin_temp_memory_on_local_thread();
-
-			// Execute the task
-			entry.callback(threadlocal_logical_thread_index, userdata);
-
-			release_temp_memory(&temp);
-			if (entry.heap_userdata) {
-				free(entry.heap_userdata);
-			}
-		}
-		task_group_end(entry.task_group);
-		if (queue->owner_pool) {
-			atomic_increment(&queue->owner_pool->worker_thread_idle_count);
-		}
-		work_queue_mark_entry_completed(queue);
-	}
-	return entry.is_valid;
+	if (!entry.is_valid) return false;
+	ASSERT(entry.callback); // Notifications must use the manual consumer API.
+	temp_memory_t temp = begin_temp_memory_on_local_thread();
+	// Inline userdata is already copied to our stack, independent of slot reuse.
+	entry.callback(threadlocal_logical_thread_index, entry.heap_userdata ? entry.heap_userdata : entry.userdata);
+	release_temp_memory(&temp);
+	free(entry.heap_userdata);
+	task_group_end(entry.task_group);
+	work_queue_mark_entry_completed(queue);
+	return true;
 }
 
-
 bool work_queue_is_work_in_progress(work_queue_t* queue) {
-	if (!queue) {
-		return false;
-	}
-	platform_mutex_lock(queue->entries_lock);
-	bool result = (queue->completion_goal != queue->completion_count);
-	platform_mutex_unlock(queue->entries_lock);
-	return result;
+	if (!queue) return false;
+	work_queue_state_t* state = queue->state;
+	u64 completed = atomic_load_u64_acquire(&state->completed.value);
+	// Submitted includes unpublished reservations; claimed includes copying and
+	// running callbacks. Neither an empty ring nor claimed == submitted is enough.
+	return atomic_load_u64_acquire(&state->submitted.value) != completed;
 }
 
 bool work_queue_is_work_waiting_to_start(work_queue_t* queue) {
-	if (!queue) {
-		return false;
+	if (!queue) return false;
+	work_queue_state_t* state = queue->state;
+	u64 position = atomic_load_u64_relaxed(&state->claimed.value);
+	for (;;) {
+		i64 difference = (i64)(atomic_load_u64_acquire(&state->slots[position & state->mask].sequence) - (position + 1));
+		if (difference <= 0) return difference == 0;
+		// A consumer already recycled this generation. Recheck the current head
+		// instead of reporting empty merely because our ticket snapshot was stale.
+		position = atomic_load_u64_relaxed(&state->claimed.value);
 	}
-	platform_mutex_lock(queue->entries_lock);
-	bool result = (queue->next_entry_to_submit != queue->next_entry_to_execute);
-	platform_mutex_unlock(queue->entries_lock);
-	return result;
 }
 
 completion_queue_t completion_queue_create(i32 entry_count) {
@@ -437,7 +478,6 @@ static void* worker_thread(void* parameter) {
 //	fprintf(stderr, "Hello from thread %d\n", threadlocal_logical_thread_index);
 
 	init_thread_memory(&global_system_info);
-	atomic_increment(&pool->worker_thread_idle_count);
 
 	if (pool->thread_init_callback) {
 		// NOTE: worker threads might want to do additional setup at this point, e.g. OpenGL initialization
@@ -458,24 +498,53 @@ static void* worker_thread(void* parameter) {
 #endif
 
 	for (;;) {
-		if (!pool->active) {
-			atomic_decrement(&pool->refcount);
+		if (!atomic_load_acquire(&pool->active)) {
 			break;
 		}
 
-		if (logical_thread_index > pool->active_worker_thread_count) {
+		if (logical_thread_index > atomic_load_acquire(&pool->active_worker_thread_count)) {
 			// Worker is disabled, do nothing
 			platform_sleep(100);
 			continue;
 		}
 
-		if (!work_queue_do_work(pool->high_priority_queue)) {
-			if (!work_queue_do_work(pool->queue)) {
-				if (!(work_queue_is_work_waiting_to_start(pool->queue) || work_queue_is_work_waiting_to_start(pool->high_priority_queue))) {
-					platform_semaphore_wait(pool->queue->semaphore);
-				}
+		if (work_queue_do_work(pool->high_priority_queue) || work_queue_do_work(pool->queue)) continue;
+
+		// A short, finite spin catches closely spaced tiny tasks without a kernel
+		// round trip. 512 iterations was the measured compromise on Apple Silicon;
+		// this is an iteration budget, not a time guarantee. Idle pools still park.
+		bool found_work = false;
+		for (i32 spin = 0; spin < 512; ++spin) {
+			cpu_relax();
+			if (!atomic_load_acquire(&pool->active) ||
+			    logical_thread_index > atomic_load_acquire(&pool->active_worker_thread_count)) break;
+			if (work_queue_do_work(pool->high_priority_queue) || work_queue_do_work(pool->queue)) {
+				found_work = true;
+				break;
 			}
 		}
+		if (found_work) continue;
+
+		// Register BEFORE rechecking both queues. Producers publish, fence, then
+		// inspect this shared count; both priority queues wake the same workers.
+		// Never execute callbacks while registered: a long callback would cause
+		// needless semaphore posts for every task submitted in the meantime.
+		atomic_increment(&pool->sleeping_worker_count);
+		atomic_fence_seq_cst();
+		if (atomic_load_acquire(&pool->active) &&
+		    logical_thread_index <= atomic_load_acquire(&pool->active_worker_thread_count) &&
+		    !work_queue_is_work_waiting_to_start(pool->high_priority_queue) &&
+		    !work_queue_is_work_waiting_to_start(pool->queue)) {
+			platform_semaphore_wait(pool->queue->semaphore);
+			// A worker disabled while parked may take the only task wakeup. Pass
+			// it on before leaving the eligible set, or enabled workers could sleep
+			// indefinitely with work queued. On shutdown each worker keeps its wake.
+			if (atomic_load_acquire(&pool->active) &&
+			    logical_thread_index > atomic_load_acquire(&pool->active_worker_thread_count)) {
+				platform_semaphore_post(pool->queue->semaphore);
+			}
+		}
+		atomic_decrement(&pool->sleeping_worker_count);
 
 	}
 
@@ -542,7 +611,6 @@ void init_thread_pool(thread_pool_t* pool, i32 work_queue_max_entry_count, bool 
 			pool->thread_handles[i] = thread;
 
 #endif
-			++pool->refcount;
 		}
 		pool->initialized = true;
 	}
@@ -592,7 +660,7 @@ i32 thread_pool_get_task_capacity(thread_pool_t* pool) {
 	if (!pool || !pool->initialized || !pool->queue) {
 		return 0;
 	}
-	return pool->queue->entry_count - 1;
+	return pool->queue->entry_count;
 }
 
 i32 thread_pool_get_worker_thread_count(thread_pool_t* pool) {
@@ -606,21 +674,31 @@ i32 thread_pool_get_active_worker_thread_count(thread_pool_t* pool) {
 	if (!pool || !pool->initialized) {
 		return 0;
 	}
-	return pool->active_worker_thread_count;
+	return atomic_load_acquire(&pool->active_worker_thread_count);
 }
 
-i32* thread_pool_get_active_worker_thread_count_ptr(thread_pool_t* pool) {
-	if (!pool || !pool->initialized) {
-		return NULL;
+void thread_pool_set_active_worker_thread_count(thread_pool_t* pool, i32 count) {
+	if (!pool || !pool->initialized) return;
+	count = MAX(0, MIN(count, pool->total_worker_thread_count - 1));
+	atomic_store_release(&pool->active_worker_thread_count, count);
+	// Wake parked workers so those just disabled stop competing for task wakes.
+	// Disabled workers poll separately and never consume the shared semaphore.
+	for (i32 i = 1; i < pool->total_worker_thread_count; ++i) {
+		platform_semaphore_post(pool->queue->semaphore);
 	}
-	return &pool->active_worker_thread_count;
+}
+
+static u64 work_queue_running_count(work_queue_t* queue) {
+	if (!queue) return 0;
+	u64 completed = atomic_load_u64_acquire(&queue->state->completed.value);
+	return atomic_load_u64_acquire(&queue->state->claimed.value) - completed;
 }
 
 i32 thread_pool_get_idle_worker_thread_count(thread_pool_t* pool) {
-	if (!pool || !pool->initialized) {
-		return 0;
-	}
-	return pool->worker_thread_idle_count;
+	if (!pool || !pool->initialized) return 0;
+	i32 enabled = thread_pool_get_active_worker_thread_count(pool);
+	u64 running = work_queue_running_count(pool->queue) + work_queue_running_count(pool->high_priority_queue);
+	return running < (u64)enabled ? enabled - (i32)running : 0;
 }
 
 bool thread_pool_submit_high_priority_task(thread_pool_t* pool, work_queue_callback_t callback, void* userdata, size_t userdata_size) {
@@ -694,8 +772,8 @@ void thread_pool_destroy(thread_pool_t* pool) {
 	}
 
 	thread_pool_wait_for_completion(pool);
-	pool->active = 0;
-	write_barrier;
+	// Publish shutdown before waking everyone, including workers about to park.
+	atomic_store_release(&pool->active, 0);
 
 	for (i32 i = 1; i < pool->total_worker_thread_count; ++i) {
 		platform_semaphore_post(pool->queue->semaphore);

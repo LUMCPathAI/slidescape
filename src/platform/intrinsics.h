@@ -123,11 +123,110 @@ static inline u32 bit_scan_forward(u32 x) {
 
 // Pairs with a release/seq_cst update before consuming the published data.
 static inline i32 atomic_load_acquire(const volatile i32* x) {
-#if WINDOWS
+#if defined(_MSC_VER) && defined(_M_X64)
+	// Aligned x64 loads are atomic and hardware acquire-ordered.
+	i32 result = *x;
+	_ReadWriteBarrier();
+	return result;
+#elif defined(_MSC_VER)
 	// Interlocked provides stronger ordering than acquire, which is sufficient.
 	return InterlockedCompareExchange((volatile LONG*)x, 0, 0);
 #else
 	return __atomic_load_n(x, __ATOMIC_ACQUIRE);
+#endif
+}
+
+// Explicit ordering for the work queue. All u64 operands must be naturally
+// aligned (8 bytes). GCC/Clang use language atomics, including on Windows.
+// MSVC x64 has atomic aligned loads/stores and acquire/release hardware ordering;
+// compiler barriers keep accesses on the correct side of publication. Other
+// MSVC targets use the stronger Interlocked operations for correctness.
+static inline u64 atomic_load_u64_relaxed(const volatile u64* x) {
+#if defined(_MSC_VER) && defined(_M_X64)
+	return *x;
+#elif defined(_MSC_VER)
+	return (u64)InterlockedCompareExchange64((volatile LONG64*)x, 0, 0);
+#else
+	return __atomic_load_n(x, __ATOMIC_RELAXED);
+#endif
+}
+
+static inline u64 atomic_load_u64_acquire(const volatile u64* x) {
+#if defined(_MSC_VER)
+	u64 result = atomic_load_u64_relaxed(x);
+	_ReadWriteBarrier();
+	return result;
+#else
+	return __atomic_load_n(x, __ATOMIC_ACQUIRE);
+#endif
+}
+
+static inline void atomic_store_u64_release(volatile u64* x, u64 value) {
+#if defined(_MSC_VER) && defined(_M_X64)
+	_ReadWriteBarrier();
+	*x = value;
+#elif defined(_MSC_VER)
+	InterlockedExchange64((volatile LONG64*)x, (LONG64)value);
+#else
+	__atomic_store_n(x, value, __ATOMIC_RELEASE);
+#endif
+}
+
+// Strong CAS; on failure, replace *expected with the observed value for retry.
+static inline bool atomic_compare_exchange_u64_relaxed(volatile u64* x, u64* expected, u64 desired) {
+#if defined(_MSC_VER)
+	u64 observed = (u64)InterlockedCompareExchange64((volatile LONG64*)x, (LONG64)desired, (LONG64)*expected);
+	if (observed == *expected) return true;
+	*expected = observed;
+	return false;
+#else
+	return __atomic_compare_exchange_n(x, expected, desired, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+#endif
+}
+
+static inline void atomic_increment_u64_release(volatile u64* x) {
+#if defined(_MSC_VER)
+	InterlockedIncrement64((volatile LONG64*)x);
+#else
+	__atomic_fetch_add(x, 1, __ATOMIC_RELEASE);
+#endif
+}
+
+static inline void atomic_store_release(volatile i32* x, i32 value) {
+#if defined(_MSC_VER) && defined(_M_X64)
+	_ReadWriteBarrier();
+	*x = value;
+#elif defined(_MSC_VER)
+	InterlockedExchange((volatile LONG*)x, value);
+#else
+	__atomic_store_n(x, value, __ATOMIC_RELEASE);
+#endif
+}
+
+static inline i32 atomic_load_seq_cst(const volatile i32* x) {
+#if defined(_MSC_VER)
+	return InterlockedCompareExchange((volatile LONG*)x, 0, 0);
+#else
+	return __atomic_load_n(x, __ATOMIC_SEQ_CST);
+#endif
+}
+
+static inline void atomic_fence_seq_cst(void) {
+#if defined(_MSC_VER)
+	MemoryBarrier();
+#else
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
+// Spin-loop hint only; this does not publish data or yield to the OS scheduler.
+static inline void cpu_relax(void) {
+#if defined(_MSC_VER)
+	YieldProcessor();
+#elif defined(__i386__) || defined(__x86_64__)
+	__asm__ __volatile__("pause");
+#elif defined(__aarch64__) || defined(__ARM_NEON__) || defined(__ARM_NEON)
+	__asm__ __volatile__("yield");
 #endif
 }
 
