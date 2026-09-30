@@ -50,6 +50,9 @@
      #include <spe.h>
 #endif
 
+// Shared atomic RMW helpers are sequentially consistent on every platform.
+// Arithmetic/bitwise operations return the updated value; compare-exchange is
+// strong (no spurious failure) and returns success without exposing the old value.
 #if WINDOWS
 #include <windows.h>
 
@@ -83,66 +86,33 @@ static inline u32 bit_scan_forward(u32 x) {
 	return (u32) first_bit;
 }
 
-#elif APPLE
-#define OSATOMIC_USE_INLINED 1
-#include <libkern/OSAtomic.h>
-
-#define write_barrier
-#define read_barrier
-
-static inline i32 atomic_increment(volatile i32* x) {
-	return OSAtomicIncrement32(x);
-}
-
-static inline i32 atomic_decrement(volatile i32* x) {
-	return OSAtomicDecrement32(x);
-}
-
-static inline i32 atomic_add(volatile i32* x, i32 amount) {
-    return OSAtomicAdd32(amount, x);
-}
-
-static inline i32 atomic_subtract(volatile i32* x, i32 amount) {
-    return OSAtomicAdd32(-amount, x);
-}
-
-static inline bool atomic_compare_exchange(volatile i32* destination, i32 exchange, i32 comparand) {
-	bool result = OSAtomicCompareAndSwap32(comparand, exchange, destination);
-	return result;
-}
-
-static inline u32 bit_scan_forward(u32 x) {
-	return __builtin_ctz(x);
-}
-
 #else
-//TODO: implement
 #define write_barrier
 #define read_barrier
 
 static inline i32 atomic_increment(volatile i32* x) {
-    return __sync_add_and_fetch(x, 1);
+    return __atomic_add_fetch(x, 1, __ATOMIC_SEQ_CST);
 }
 
 static inline i32 atomic_decrement(volatile i32* x) {
-    return __sync_sub_and_fetch(x, 1);
+    return __atomic_sub_fetch(x, 1, __ATOMIC_SEQ_CST);
 }
 
 static inline i32 atomic_add(volatile i32* x, i32 amount) {
-    return __sync_add_and_fetch(x, amount);
+    return __atomic_add_fetch(x, amount, __ATOMIC_SEQ_CST);
 }
 
 static inline i32 atomic_subtract(volatile i32* x, i32 amount) {
-    return __sync_sub_and_fetch(x, amount);
+    return __atomic_sub_fetch(x, amount, __ATOMIC_SEQ_CST);
 }
 
 static inline bool atomic_compare_exchange(volatile i32* destination, i32 exchange, i32 comparand) {
-    i32 read_value = __sync_val_compare_and_swap(destination, comparand, exchange);
-    return (read_value == comparand);
+	return __atomic_compare_exchange_n(destination, &comparand, exchange, false,
+	                                   __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
 }
 
 static inline u32 atomic_or(volatile u32* x, u32 mask) {
-	return __sync_or_and_fetch(x, mask);
+	return __atomic_or_fetch(x, mask, __ATOMIC_SEQ_CST);
 }
 
 static inline u32 bit_scan_forward(u32 x) {
@@ -150,6 +120,16 @@ static inline u32 bit_scan_forward(u32 x) {
 }
 
 #endif
+
+// Pairs with a release/seq_cst update before consuming the published data.
+static inline i32 atomic_load_acquire(const volatile i32* x) {
+#if WINDOWS
+	// Interlocked provides stronger ordering than acquire, which is sufficient.
+	return InterlockedCompareExchange((volatile LONG*)x, 0, 0);
+#else
+	return __atomic_load_n(x, __ATOMIC_ACQUIRE);
+#endif
+}
 
 // see:
 // https://stackoverflow.com/questions/41770887/cross-platform-definition-of-byteswap-uint64-and-byteswap-ulong

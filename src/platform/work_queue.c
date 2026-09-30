@@ -69,6 +69,9 @@ work_queue_t work_queue_create(const char* semaphore_name, i32 entry_count) {
 	queue.owns_semaphore = true;
 	queue.entry_count = entry_count + 1; // add safety margin to detect when queue is about to overflow
 	queue.entries = calloc(1, (entry_count + 1) * sizeof(work_queue_entry_t));
+	queue.entries_lock = malloc(sizeof(*queue.entries_lock));
+	if (!queue.entries || !queue.entries_lock) fatal_error("work queue allocation failed");
+	platform_mutex_init(queue.entries_lock);
 	return queue;
 }
 
@@ -82,6 +85,9 @@ work_queue_t work_queue_create_with_existing_semaphore(void* semaphore_handle, i
 	queue.owns_semaphore = false;
 	queue.entry_count = entry_count + 1; // add safety margin to detect when queue is about to overflow
 	queue.entries = calloc(1, (entry_count + 1) * sizeof(work_queue_entry_t));
+	queue.entries_lock = malloc(sizeof(*queue.entries_lock));
+	if (!queue.entries || !queue.entries_lock) fatal_error("work queue allocation failed");
+	platform_mutex_init(queue.entries_lock);
 	return queue;
 }
 
@@ -97,6 +103,10 @@ void work_queue_destroy(work_queue_t* queue) {
 		}
 		free(queue->entries);
 		queue->entries = NULL;
+	}
+	if (queue->entries_lock) {
+		platform_mutex_destroy(queue->entries_lock);
+		free(queue->entries_lock);
 	}
 	if (!queue->owns_semaphore || !queue->semaphore) {
 		memset(queue, 0, sizeof(work_queue_t));
@@ -115,16 +125,18 @@ void work_queue_destroy(work_queue_t* queue) {
 }
 
 i32 work_queue_get_entry_count(work_queue_t* queue) {
+	platform_mutex_lock(queue->entries_lock);
 	i32 count = queue->next_entry_to_submit - queue->next_entry_to_execute;
 	while (count < 0) {
 		count += queue->entry_count;
 	}
+	platform_mutex_unlock(queue->entries_lock);
 	return count;
 }
 
 void task_group_begin(task_group_t* group) {
 	if (group) {
-		atomic_increment(&group->pending_count);
+		atomic_add(&group->pending_count, 1);
 		if (group->parent) {
 			task_group_begin(group->parent);
 		}
@@ -133,15 +145,15 @@ void task_group_begin(task_group_t* group) {
 
 void task_group_end(task_group_t* group) {
 	if (group) {
-		atomic_decrement(&group->pending_count);
-		if (group->parent) {
-			task_group_end(group->parent);
-		}
+		// A waiter may destroy a stack-allocated group immediately at zero.
+		task_group_t* parent = group->parent;
+		atomic_add(&group->pending_count, -1);
+		if (parent) task_group_end(parent);
 	}
 }
 
 bool task_group_is_complete(task_group_t* group) {
-	return !group || group->pending_count == 0;
+	return !group || atomic_load_acquire(&group->pending_count) == 0;
 }
 
 task_group_t task_group_create_child(task_group_t* parent) {
@@ -164,51 +176,32 @@ bool work_queue_submit_to_group(work_queue_t* queue, task_group_t* task_group, w
 		ASSERT(userdata);
 		memcpy(heap_userdata, userdata, userdata_size);
 	}
-	for (i32 tries = 0; tries < 1000; ++tries) {
-		// Circular FIFO buffer
-		i32 entry_to_submit = queue->next_entry_to_submit;
-		i32 new_next_entry_to_submit = (queue->next_entry_to_submit + 1) % queue->entry_count;
-		if (new_next_entry_to_submit == queue->next_entry_to_execute) {
-			// TODO: fix multithreading problem: completion queue overflowing
-			console_print_error("Warning: work queue is overflowing - job is cancelled\n");
-			return false;
-		}
-
-		bool succeeded = atomic_compare_exchange(&queue->next_entry_to_submit,
-		                                         new_next_entry_to_submit, entry_to_submit);
-		if (succeeded) {
-			task_group_begin(task_group);
-//		    console_print("exhange succeeded\n");
-			work_queue_entry_t* entry = queue->entries + entry_to_submit;
-			*entry = (work_queue_entry_t){ .callback = callback, .task_identifier = task_identifier, .task_group = task_group };
-			entry->userdata_size = userdata_size;
-			entry->heap_userdata = heap_userdata;
-			if (userdata_size > 0) {
-				ASSERT(userdata);
-				if (heap_userdata == NULL) {
-					memcpy(entry->userdata, userdata, userdata_size);
-				}
-			}
-			write_barrier;
-			entry->is_valid = true;
-			write_barrier;
-			atomic_increment(&queue->completion_goal);
-			atomic_increment(&queue->start_goal);
-//		    queue->next_entry_to_submit = new_next_entry_to_submit;
-			platform_semaphore_post(queue->semaphore);
-			return true;
-		} else {
-			if (tries > 5) {
-				console_print_error("exchange failed, retrying (try #%d)\n", tries);
-			}
-			continue;
-		}
-
-	}
-	if (heap_userdata) {
+	// Publish the payload and counters together. Consumers must finish copying a
+	// slot before producers can reuse it; CAS on the ring indices alone cannot
+	// guarantee that, and wrapped indices also admit ABA between consumers.
+	platform_mutex_lock(queue->entries_lock);
+	i32 entry_to_submit = queue->next_entry_to_submit;
+	i32 new_next_entry_to_submit = (entry_to_submit + 1) % queue->entry_count;
+	if (new_next_entry_to_submit == queue->next_entry_to_execute) {
+		platform_mutex_unlock(queue->entries_lock);
 		free(heap_userdata);
+		return false; // Caller can retry or cancel; ownership was not transferred.
 	}
-	return false;
+	task_group_begin(task_group);
+	work_queue_entry_t* entry = queue->entries + entry_to_submit;
+	*entry = (work_queue_entry_t){ .is_valid = true, .callback = callback,
+	        .task_identifier = task_identifier, .task_group = task_group,
+	        .userdata_size = userdata_size, .heap_userdata = heap_userdata };
+	if (userdata_size > 0 && !heap_userdata) {
+		ASSERT(userdata);
+		memcpy(entry->userdata, userdata, userdata_size);
+	}
+	++queue->completion_goal;
+	++queue->start_goal;
+	queue->next_entry_to_submit = new_next_entry_to_submit;
+	platform_mutex_unlock(queue->entries_lock);
+	platform_semaphore_post(queue->semaphore);
+	return true;
 }
 
 bool work_queue_submit(work_queue_t* queue, work_queue_callback_t callback, u32 task_identifier, void* userdata, size_t userdata_size) {
@@ -231,32 +224,23 @@ bool work_queue_submit_notification(work_queue_t* queue, u32 task_identifier, vo
 
 work_queue_entry_t work_queue_get_next_entry(work_queue_t* queue) {
 	work_queue_entry_t result = {0};
-
+	platform_mutex_lock(queue->entries_lock);
 	i32 entry_to_execute = queue->next_entry_to_execute;
-	i32 new_next_entry_to_execute = (entry_to_execute + 1) % queue->entry_count;
-
-	// don't even try to execute a task if it is not yet submitted, or not yet fully submitted
-	if ((entry_to_execute != queue->next_entry_to_submit) && (queue->entries[entry_to_execute].is_valid)) {
-		bool succeeded = atomic_compare_exchange(&queue->next_entry_to_execute,
-		                                         new_next_entry_to_execute, entry_to_execute);
-		if (succeeded) {
-			// We have dibs to execute this task!
-			result = queue->entries[entry_to_execute];
-			queue->entries[entry_to_execute] = (work_queue_entry_t){0}; // discourage competing threads (maybe not needed?)
-			if (result.callback == NULL && result.task_identifier == 0) {
-				console_print_error("Warning: encountered a work entry with a missing callback routine and/or task identifier (is this intended)?\n");
-			}
-			result.is_valid = true;
-			read_barrier;
-		}
+	if (entry_to_execute != queue->next_entry_to_submit) {
+		result = queue->entries[entry_to_execute];
+		queue->entries[entry_to_execute] = (work_queue_entry_t){0};
+		queue->next_entry_to_execute = (entry_to_execute + 1) % queue->entry_count;
 	}
-
+	platform_mutex_unlock(queue->entries_lock);
 	return result;
 }
 
 void work_queue_mark_entry_completed(work_queue_t* queue) {
-	atomic_increment(&queue->completion_count);
+	platform_mutex_lock(queue->entries_lock);
+	++queue->completion_count;
+	platform_mutex_unlock(queue->entries_lock);
 }
+
 
 bool work_queue_do_work(work_queue_t* queue) {
     if (!queue) {
@@ -267,7 +251,9 @@ bool work_queue_do_work(work_queue_t* queue) {
 		if (queue->owner_pool) {
 			atomic_decrement(&queue->owner_pool->worker_thread_idle_count);
 		}
-		atomic_increment(&queue->start_count);
+		platform_mutex_lock(queue->entries_lock);
+		++queue->start_count;
+		platform_mutex_unlock(queue->entries_lock);
 		ASSERT(entry.callback);
 		if (entry.callback) {
 			// Copy the user data (arguments for the call) onto the stack
@@ -288,11 +274,11 @@ bool work_queue_do_work(work_queue_t* queue) {
 				free(entry.heap_userdata);
 			}
 		}
-        work_queue_mark_entry_completed(queue);
 		task_group_end(entry.task_group);
 		if (queue->owner_pool) {
 			atomic_increment(&queue->owner_pool->worker_thread_idle_count);
 		}
+		work_queue_mark_entry_completed(queue);
 	}
 	return entry.is_valid;
 }
@@ -302,7 +288,9 @@ bool work_queue_is_work_in_progress(work_queue_t* queue) {
 	if (!queue) {
 		return false;
 	}
-	bool result = (queue->completion_goal > queue->completion_count);
+	platform_mutex_lock(queue->entries_lock);
+	bool result = (queue->completion_goal != queue->completion_count);
+	platform_mutex_unlock(queue->entries_lock);
 	return result;
 }
 
@@ -310,7 +298,9 @@ bool work_queue_is_work_waiting_to_start(work_queue_t* queue) {
 	if (!queue) {
 		return false;
 	}
-	bool result = (queue->start_goal > queue->start_count);
+	platform_mutex_lock(queue->entries_lock);
+	bool result = (queue->next_entry_to_submit != queue->next_entry_to_execute);
+	platform_mutex_unlock(queue->entries_lock);
 	return result;
 }
 

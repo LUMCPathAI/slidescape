@@ -31,6 +31,7 @@ extern "C" {
 #endif
 
 #include "common.h"
+#include "platform_mutex.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -79,12 +80,14 @@ typedef struct work_queue_t {
 #endif
 	i32 volatile next_entry_to_submit;
 	i32 volatile next_entry_to_execute;
-	i32 volatile completion_count;
-	i32 volatile completion_goal;
-	i32 volatile start_count;
-	i32 volatile start_goal;
+	u64 completion_count;
+	u64 completion_goal;
+	u64 start_count;
+	u64 start_goal;
 	i32 entry_count;
 	work_queue_entry_t* entries;
+	// Stable allocation: queue constructors return the struct by value.
+	platform_mutex_t* entries_lock;
 	thread_pool_t* owner_pool;
 	i32 logical_thread_index; // index of the thread that created/owns this work queue
 	bool owns_semaphore;

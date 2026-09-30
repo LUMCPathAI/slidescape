@@ -223,3 +223,92 @@ TEST_CASE("task groups allow nested tasks to wait for child work") {
 
 	global_system_info = old_system_info;
 }
+
+#include <atomic>
+#include <thread>
+#include <chrono>
+
+TEST_CASE("work queue preserves every payload with concurrent producers and consumers across wraparound") {
+	// Small queue, many transfers: exercise slot reuse while another consumer copies.
+	work_queue_t queue = work_queue_create("/slidescape_test_queue_wrap", 31);
+	const int producer_count = 4, consumer_count = 4, per_producer = 10000;
+	const int total = producer_count * per_producer;
+	std::atomic<int>* seen = new std::atomic<int>[total]();
+	std::atomic<int> finished_producers(0), received(0), corrupt(0);
+	std::atomic<bool> stop(false);
+	struct payload_t { int id; u8 bytes[512]; };
+	size_t payload_size = 0;
+	SUBCASE("inline userdata") { payload_size = 124; }
+	SUBCASE("heap userdata") { payload_size = sizeof(payload_t); }
+	const int byte_count = (int)payload_size - sizeof(int);
+	std::thread producers[producer_count], consumers[consumer_count];
+	for (int c = 0; c < consumer_count; ++c) consumers[c] = std::thread([&]() {
+		while (!stop.load()) {
+			work_queue_entry_t entry = work_queue_get_next_entry(&queue);
+			if (!entry.is_valid) { std::this_thread::yield(); continue; }
+			payload_t payload;
+			memcpy(&payload, entry.heap_userdata ? entry.heap_userdata : entry.userdata, payload_size);
+			free(entry.heap_userdata);
+			bool valid = entry.task_identifier == 123 && entry.userdata_size == payload_size &&
+			             payload.id >= 0 && payload.id < total;
+			for (int j = 0; valid && j < byte_count; ++j) valid = payload.bytes[j] == (u8)(payload.id + j);
+			if (valid) ++seen[payload.id]; else ++corrupt;
+			++received;
+			work_queue_mark_entry_completed(&queue);
+		}
+	});
+	for (int p = 0; p < producer_count; ++p) producers[p] = std::thread([&, p]() {
+		for (int i = 0; i < per_producer && !stop.load(); ++i) {
+			payload_t payload = {}; payload.id = p * per_producer + i;
+			for (int j = 0; j < byte_count; ++j) payload.bytes[j] = (u8)(payload.id + j);
+			while (!stop.load() && !work_queue_submit_notification(&queue, 123, &payload, payload_size)) std::this_thread::yield();
+		}
+		++finished_producers;
+	});
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+	while ((finished_producers.load() < producer_count || received.load() < total) &&
+	       std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+	stop = true;
+	for (auto& producer : producers) producer.join();
+	for (auto& consumer : consumers) consumer.join();
+	CHECK(finished_producers.load() == producer_count);
+	CHECK(received.load() == total);
+	CHECK(corrupt.load() == 0);
+	int missing_or_duplicate = 0;
+	for (int i = 0; i < total; ++i) if (seen[i] != 1) ++missing_or_duplicate;
+	CHECK(missing_or_duplicate == 0);
+	delete[] seen;
+	work_queue_destroy(&queue);
+}
+
+TEST_CASE("nested task groups publish results before stack groups are reused") {
+	ensure_test_thread_memory();
+	system_info_t old_system_info = global_system_info;
+	global_system_info.suggested_total_thread_count = 4;
+	thread_pool_t pool = {};
+	init_thread_pool(&pool, 128, true, false, NULL);
+	i32 volatile counter = 0;
+	for (int round = 0; round < 100; ++round) {
+		task_group_t group = {};
+		test_nested_task_t task = {&pool, &group, &counter};
+		for (int i = 0; i < 16; ++i) {
+			REQUIRE(thread_pool_submit_task_to_group(&pool, &group, nested_counter_task, &task, sizeof(task)));
+		}
+		thread_pool_wait_for_group(&pool, &group);
+		CHECK(counter == (round + 1) * 32);
+	}
+	thread_pool_destroy(&pool);
+	global_system_info = old_system_info;
+}
+
+TEST_CASE("atomic helpers preserve updated values and strong compare exchange semantics") {
+	volatile i32 value = 3;
+	CHECK(atomic_increment(&value) == 4);
+	CHECK(atomic_decrement(&value) == 3);
+	CHECK(atomic_add(&value, -8) == -5);
+	CHECK(atomic_subtract(&value, -2) == -3);
+	CHECK_FALSE(atomic_compare_exchange(&value, 9, 7));
+	CHECK(atomic_load_acquire(&value) == -3);
+	CHECK(atomic_compare_exchange(&value, 9, -3));
+	CHECK(atomic_load_acquire(&value) == 9);
+}
