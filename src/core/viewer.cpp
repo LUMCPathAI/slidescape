@@ -1783,6 +1783,7 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 }
 
 void do_after_scene_render(app_state_t* app_state, input_t* input) {
+	// Hotkeys that never produce text (e.g. F-keys): ignore gui_want_capture_keyboard
 	if (was_key_pressed(input, KEY_F1)) {
 		if (input->keyboard.modifiers & KMOD_CTRL) {
 			show_debugging_window = !show_debugging_window; // Ctrl+F1
@@ -1808,28 +1809,37 @@ void do_after_scene_render(app_state_t* app_state, input_t* input) {
 			viewer_save_options(app_state);
 		}
 	}
-	if (!gui_want_capture_keyboard) {
-		u32 key_modifiers_without_shift = input->keyboard.modifiers & ~KMOD_SHIFT;
-		if (was_key_pressed(input, KEY_L) && key_modifiers_without_shift == KMOD_CTRL) {
-			show_layers_window = !show_layers_window; // Ctrl+L
-		} else if (was_key_pressed(input, KEY_L) && key_modifiers_without_shift == 0) {
-			show_label_image_window = !show_label_image_window; // L
-		}
-		if (was_key_pressed(input, KEY_O) && key_modifiers_without_shift == 0) {
-			show_macro_image_window = !show_macro_image_window; // O (overview)
-		}
-		if (was_key_pressed(input, KEY_H)) {
-			app_state->scene.enable_annotations = !app_state->scene.enable_annotations;
-		}
-        if (was_key_pressed(input, KEY_G)) {
-            show_annotation_group_assignment_window = !show_annotation_group_assignment_window;
-        }
-	}
-    // Ctrl+U: open URI window
-    if (was_key_pressed(input, KEY_U) && input->keyboard.key_ctrl.down) {
-        show_open_uri_window = true;
-    }
 
+	// Hotkeys for keys that could produce text: respect gui_want_capture_keyboard conditionally
+	u32 key_modifiers_without_shift = input->keyboard.modifiers & ~KMOD_SHIFT;
+	if (key_modifiers_without_shift == KMOD_CTRL) {
+		// Hotkeys with Ctrl pressed: ignore gui_want_capture_keyboard, ignore Shift (for now)
+		if (was_key_pressed(input, KEY_L)) {
+			show_layers_window = !show_layers_window; // Ctrl+L (open Layers window)
+		}
+		if (was_key_pressed(input, KEY_U)) {
+			show_open_uri_window = true; // Ctrl+U (open URI window)
+		}
+	} else if (key_modifiers_without_shift == 0) {
+		// Hotkeys without modifiers (or only Shift, which is ignored): respect gui_want_capture_keyboard
+		if (!gui_want_capture_keyboard) {
+			if (was_key_pressed(input, KEY_L)) {
+				show_label_image_window = !show_label_image_window; // L (label)
+			}
+			if (was_key_pressed(input, KEY_O)) {
+				show_macro_image_window = !show_macro_image_window; // O (overview)
+			}
+			if (was_key_pressed(input, KEY_H)) {
+				app_state->scene.enable_annotations = !app_state->scene.enable_annotations; // H (hide annotations)
+			}
+			if (was_key_pressed(input, KEY_G)) {
+				show_annotation_group_assignment_window = !show_annotation_group_assignment_window;
+			}
+		}
+	}
+
+	// NOTE: some more hotkeys are handled directly in viewer_update_and_render()
+	// TODO: maybe handle all hotkeys in one location?
 
 	profiler_begin(PROFILER_SECTION_GUI_DRAW);
 	gui_draw(app_state, curr_input, app_state->client_viewport.w, app_state->client_viewport.h);
