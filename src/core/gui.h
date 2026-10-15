@@ -69,6 +69,7 @@ void gui_draw_bounds_in_scene(bounds2f bounds, rgba_t color, float thickness, sc
 bool gui_draw_selected_annotation_submenu_section(app_state_t* app_state, scene_t* scene, annotation_set_t* annotation_set);
 void gui_draw_insert_annotation_submenu(app_state_t* app_state);
 simple_image_t* gui_find_associated_image(app_state_t* app_state, bool find_label);
+bool gui_navigate_slide_tray(app_state_t* app_state, i32 direction);
 void gui_draw(app_state_t* app_state, input_t* input, i32 client_width, i32 client_height);
 void gui_do_modal_popups();
 void draw_profiler_window(app_state_t* app_state);

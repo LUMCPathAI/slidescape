@@ -1119,6 +1119,15 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 			app_state->seconds_without_mouse_movement += delta_time;
 		}
 
+		if (!gui_want_capture_keyboard && input->keyboard.modifiers == KMOD_NONE) {
+			i32 slide_direction = was_key_pressed(input, KEY_Space) ? 1
+			                    : was_key_pressed(input, KEY_Delete) ? -1 : 0;
+			if (slide_direction != 0 && gui_navigate_slide_tray(app_state, slide_direction)) {
+				do_after_scene_render(app_state, input);
+				return;
+			}
+		}
+
 		if ((was_key_pressed(input, KEY_W) && input->keyboard.key_ctrl.down) || app_state->need_close) {
 			menu_close_file(app_state);
             do_after_scene_render(app_state, input);

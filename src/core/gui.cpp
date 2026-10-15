@@ -534,15 +534,81 @@ static void gui_draw_dicomweb_archive_window(app_state_t* app_state) {
 	ImGui::End();
 }
 
+static i32 gui_get_slide_tray_slide_count(const image_t* image) {
+	if (image->backend == IMAGE_BACKEND_DICOM) return arrlen(image->dicom.slides);
+	if (image->backend == IMAGE_BACKEND_DICOMWEB) return image->dicomweb.available_series_count;
+	if (image->backend == IMAGE_BACKEND_SSI) return image->ssi.folder_slide_count;
+	return 0;
+}
+
+static i32 gui_get_slide_tray_selected_index(const image_t* image) {
+	if (image->backend == IMAGE_BACKEND_DICOM) return image->dicom.selected_slide_index;
+	if (image->backend == IMAGE_BACKEND_DICOMWEB) return image->dicomweb.selected_series_index;
+	if (image->backend == IMAGE_BACKEND_SSI) {
+		for (i32 i = 0; i < image->ssi.folder_slide_count; ++i) {
+			if (strcmp(image->ssi.folder_slides[i].id, image->ssi.slide_guid) == 0) return i;
+		}
+	}
+	return -1;
+}
+
+static void gui_open_slide_tray_slide(app_state_t* app_state, image_t* image, i32 slide_index) {
+	if (image->backend == IMAGE_BACKEND_DICOM) {
+		dicom_slide_t* slide = image->dicom.slides + slide_index;
+		char filename[512];
+		char source_directory[512];
+		copy_cstring(filename, slide->representative_filename, sizeof(filename));
+		copy_cstring(source_directory, image->dicom.source_directory, sizeof(source_directory));
+		load_dicom_file_from_directory(app_state, filename, source_directory,
+		                               FILETYPE_HINT_BASE_IMAGE);
+	} else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
+		dicomweb_open_related_series(app_state, image, slide_index);
+	} else if (image->backend == IMAGE_BACKEND_SSI) {
+		ssi_slide_ref_t* slide = image->ssi.folder_slides + slide_index;
+		ssi_uri_config_t retry_config = {0};
+		copy_cstring(retry_config.api_url, image->ssi.api_url, sizeof(retry_config.api_url));
+		copy_cstring(retry_config.slide_center_url, image->ssi.slide_center_url,
+		             sizeof(retry_config.slide_center_url));
+		copy_cstring(retry_config.slide_guid, slide->id, sizeof(retry_config.slide_guid));
+		copy_cstring(retry_config.caption, slide->name, sizeof(retry_config.caption));
+		if (!ssi_open_folder_slide(app_state, image, slide_index)) {
+			ssi_failure_kind_t failure_kind = ssi_get_last_failure_kind();
+			if (failure_kind == SSI_FAILURE_SESSION_EXPIRED) {
+				open_uri_try_ssi_config(app_state, &retry_config);
+			} else {
+				open_uri_set_ssi_retry_config(&retry_config);
+				copy_cstring(open_uri_status, ssi_get_last_status(), sizeof(open_uri_status));
+				open_uri_show_ssi_credentials_modal =
+					ssi_failure_requires_credentials(failure_kind);
+			}
+		}
+	}
+}
+
+bool gui_navigate_slide_tray(app_state_t* app_state, i32 direction) {
+	ASSERT(direction == -1 || direction == 1);
+	if (arrlen(app_state->loaded_images) == 0) return false;
+
+	image_t* image = app_state->loaded_images[0];
+	i32 slide_count = gui_get_slide_tray_slide_count(image);
+	if (slide_count <= 1) return false;
+
+	// Consume the navigation key for a multi-slide case, even at either end of the tray.
+	i32 selected_index = gui_get_slide_tray_selected_index(image);
+	i32 target_index = selected_index + direction;
+	if (selected_index >= 0 && target_index >= 0 && target_index < slide_count) {
+		gui_open_slide_tray_slide(app_state, image, target_index);
+	}
+	return true;
+}
+
 static void draw_slide_tray_window(app_state_t* app_state) {
 	if (!show_slide_tray_window || arrlen(app_state->loaded_images) == 0) return;
 	image_t* image = app_state->loaded_images[0];
 	bool is_local_dicom = image->backend == IMAGE_BACKEND_DICOM;
 	bool is_dicomweb = image->backend == IMAGE_BACKEND_DICOMWEB;
 	bool is_ssi = image->backend == IMAGE_BACKEND_SSI;
-	i32 slide_count = is_local_dicom ? arrlen(image->dicom.slides)
-	                                : is_dicomweb ? image->dicomweb.available_series_count
-	                                : is_ssi ? image->ssi.folder_slide_count : 0;
+	i32 slide_count = gui_get_slide_tray_slide_count(image);
 	if (slide_count <= 1) {
 		show_slide_tray_window = false;
 		return;
@@ -596,38 +662,7 @@ static void draw_slide_tray_window(app_state_t* app_state) {
 			                                            : strcmp(ssi_slide->id,
 			                                                     image->ssi.slide_guid) == 0;
 			if (ImGui::Selectable(label, selected) && !selected) {
-				if (is_local_dicom) {
-					char filename[512];
-					char source_directory[512];
-					copy_cstring(filename, slide->representative_filename, sizeof(filename));
-					copy_cstring(source_directory, image->dicom.source_directory,
-					             sizeof(source_directory));
-					load_dicom_file_from_directory(app_state, filename, source_directory,
-					                               FILETYPE_HINT_BASE_IMAGE);
-				} else if (is_dicomweb) {
-					dicomweb_open_related_series(app_state, image, i);
-				} else if (!ssi_open_folder_slide(app_state, image, i)) {
-					ssi_uri_config_t retry_config = {0};
-					copy_cstring(retry_config.api_url, image->ssi.api_url,
-					             sizeof(retry_config.api_url));
-					copy_cstring(retry_config.slide_center_url,
-					             image->ssi.slide_center_url,
-					             sizeof(retry_config.slide_center_url));
-					copy_cstring(retry_config.slide_guid, ssi_slide->id,
-					             sizeof(retry_config.slide_guid));
-					copy_cstring(retry_config.caption, ssi_slide->name,
-					             sizeof(retry_config.caption));
-					ssi_failure_kind_t failure_kind = ssi_get_last_failure_kind();
-					if (failure_kind == SSI_FAILURE_SESSION_EXPIRED) {
-						open_uri_try_ssi_config(app_state, &retry_config);
-					} else {
-						open_uri_set_ssi_retry_config(&retry_config);
-						copy_cstring(open_uri_status, ssi_get_last_status(),
-						             sizeof(open_uri_status));
-						open_uri_show_ssi_credentials_modal =
-							ssi_failure_requires_credentials(failure_kind);
-					}
-				}
+				gui_open_slide_tray_slide(app_state, image, i);
 				break;
 			}
 			if (ImGui::IsItemHovered()) {
@@ -1486,7 +1521,7 @@ void draw_layers_window(app_state_t* app_state) {
     if (disable_layer_transition_control) {
         ImGui::BeginDisabled();
     }
-	ImGui::Text("Currently displayed layer: %d.\nPress Space or F5 to toggle layers.", app_state->scene.active_layer);
+	ImGui::Text("Currently displayed layer: %d.\nPress F5 to toggle layers.", app_state->scene.active_layer);
 
 	ImGui::SliderFloat("Layer transition", &app_state->scene.target_layer_time, 0.0f, 1.0f);
     if (disable_layer_transition_control) {
