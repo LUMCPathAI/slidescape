@@ -84,13 +84,20 @@ if (MSVC)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${COMMON_COMPILER_FLAGS}")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${COMMON_COMPILER_FLAGS}")
 else()
-    set(GCC_WARN_OPTIONS "-Wall -Wno-unused-function -Wno-unused-but-set-variable -Wno-unused-variable -Wno-missing-braces -Wno-format -Wno-strict-aliasing -Wno-shift-negative-value -Wno-sign-compare")
+    set(GCC_WARN_OPTIONS "-Wall -Wformat=2 -Wno-unused-function -Wno-unused-but-set-variable -Wno-unused-variable -Wno-missing-braces -Wno-strict-aliasing -Wno-shift-negative-value -Wno-sign-compare")
     if (APPLE)
         set(GCC_WARN_OPTIONS "${GCC_WARN_OPTIONS} -Wno-deprecated-declarations -Wno-unknown-warning-option")
     endif()
 
     if (CPU_TYPE STREQUAL "x86_64" OR CPU_TYPE STREQUAL "i386")
-        set(GCC_CPU_OPTIONS "-mmmx -msse -msse2 -msse3 -mssse3 -msse4 -msse4.1 -msse4.2 -mavx") # Sandy Bridge CPU or later
+        if (WIN32)
+            # For now, disable AVX globally on Windows: MinGW can emit aligned AVX stack accesses in
+            # functions whose incoming stack is only guaranteed to be 16-byte aligned.
+            # TODO: isolate the compiler bug causing this; restore AVX support
+            set(GCC_CPU_OPTIONS "-mmmx -msse -msse2 -msse3 -mssse3 -msse4 -msse4.1 -msse4.2")
+        else()
+            set(GCC_CPU_OPTIONS "-mmmx -msse -msse2 -msse3 -mssse3 -msse4 -msse4.1 -msse4.2 -mavx")
+        endif()
     elseif(CPU_TYPE STREQUAL "arm64" OR CPU_TYPE STREQUAL "arm")
         if (APPLE)
             set(GCC_CPU_OPTIONS "-mcpu=native")
@@ -461,6 +468,7 @@ set(SLIDESCAPE_NONGUI_BASE_FILES
         src/core/tile_loader.c
         src/core/http_request.c
         src/core/http_response_parser.c
+        src/core/remote_url.c
         src/core/ssi_protocol.c
         src/core/ssi_transport.c
         src/utils/phasecorrelate.c

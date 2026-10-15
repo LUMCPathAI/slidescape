@@ -140,7 +140,9 @@ static void feature_set_attribute(annotation_set_t* annotation_set, annotation_f
 
 bool load_asap_xml_annotations(app_state_t* app_state, const char* filename) {
 
-	annotation_set_t* annotation_set = &app_state->scene.annotation_set;
+	annotation_set_t* live_annotation_set = &app_state->scene.annotation_set;
+	annotation_set_t* annotation_set = duplicate_annotation_set(live_annotation_set);
+	if (!annotation_set) return false;
 	annotation_group_t current_group = {};
 	annotation_feature_t current_feature = {};
 	asap_xml_element_enum element_stack[ASAP_XML_PARSER_MAX_STACK] = {};
@@ -156,6 +158,17 @@ bool load_asap_xml_annotations(app_state_t* app_state, const char* filename) {
 	if (0) { failed: cleanup:
 		if (x) free(x);
 		if (file) free(file);
+		if (success) {
+			// Parsing is transactional: publish the new state only after both passes
+			// and the final XML validity check have completed successfully.
+			destroy_annotation_set(live_annotation_set);
+			*live_annotation_set = *annotation_set;
+			free(annotation_set);
+			annotation_history_reset(live_annotation_set);
+		} else {
+			destroy_annotation_set(annotation_set);
+			free(annotation_set);
+		}
 		return success;
 	}
 
@@ -163,6 +176,7 @@ bool load_asap_xml_annotations(app_state_t* app_state, const char* filename) {
 		// hack: merge memory for yxml_t struct and stack buffer
 		// Note: what is a good stack buffer size?
 		x = (yxml_t*) malloc(sizeof(yxml_t) + YXML_STACK_BUFFER_SIZE);
+		if (!x) goto failed;
 
 		// ASAP puts all of the group definitions at the end of the file, instead of the beginning.
 		// To preserve the order of the groups, we need to load the XML in two passes:
@@ -170,6 +184,8 @@ bool load_asap_xml_annotations(app_state_t* app_state, const char* filename) {
 		// pass 1: read annotations and coordinates
 		for (i32 pass = 0; pass < 2; ++pass) {
 			yxml_init(x, x + 1, YXML_STACK_BUFFER_SIZE);
+			element_stack_index = 0;
+			is_within_annotationfeatures_tag = false;
 
 			// parse XML byte for byte
 			char attrbuf[128];
@@ -265,12 +281,11 @@ bool load_asap_xml_annotations(app_state_t* app_state, const char* filename) {
 //						    console_print("   element content: %s\n", x->elem);
 							if (!contentcur) break;
 							char* tmp = x->data;
-							while (*tmp && contentbuf < contentbuf_end) {
+							while (*tmp && contentcur < contentbuf_end - 1) {
 								*(contentcur++) = *(tmp++);
 							}
-							if (contentcur == contentbuf_end) {
+							if (*tmp) {
 								// too long content
-								// TODO: harden against buffer overflow, see approach in isyntax.c
 								console_print_error("load_asap_xml_annotations(): encountered a too long XML element content\n");
 								goto failed;
 							}
@@ -347,10 +362,10 @@ bool load_asap_xml_annotations(app_state_t* app_state, const char* filename) {
 //						    console_print("   attr val: %s\n", x->attr);
 							if (!attrcur) break;
 							char* tmp = x->data;
-							while (*tmp && attrbuf < attrbuf_end) {
+							while (*tmp && attrcur < attrbuf_end - 1) {
 								*(attrcur++) = *(tmp++);
 							}
-							if (attrcur == attrbuf_end) {
+							if (*tmp) {
 								// too long attribute
 								console_print("load_asap_xml_annotations(): encountered a too long XML attribute\n");
 								goto failed;
@@ -397,6 +412,10 @@ bool load_asap_xml_annotations(app_state_t* app_state, const char* filename) {
 						}
 					}
 				}
+			}
+			if (yxml_eof(x) != YXML_OK || element_stack_index != 0) {
+				console_print_error("load_asap_xml_annotations(): incomplete XML document\n");
+				goto failed;
 			}
 		}
 	}

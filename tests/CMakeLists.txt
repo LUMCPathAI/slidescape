@@ -4,11 +4,13 @@ add_executable(slidescape_tests
         test_fixtures.cpp
         test_dicomweb.cpp
         test_archive.cpp
+        test_block_allocator.cpp
         test_http_response_parser.cpp
         test_http_request.cpp
         test_mathutils.cpp
         test_source_io.cpp
         test_memrw.cpp
+        test_remote_url.cpp
         test_stb_sprintf.cpp
         test_slide_score.cpp
         test_ssi.cpp

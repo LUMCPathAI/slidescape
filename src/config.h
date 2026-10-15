@@ -14,10 +14,8 @@
 
 #define NO_TIMER_INITIALIZED_RUNTIME_CHECK
 
-#if defined(_WIN32)
-// Disabling ltalloc on macOS and Linux because it can cause crashes in a multithreaded setting; TODO: investigate
-#define USE_LTALLOC_INSTEAD_OF_MALLOC
-#endif
+// ltalloc is disabled on all platforms. It has caused allocator corruption in
+// multithreaded code, including reproducible failures in the Windows test suite.
 
 #define USE_OPENGL_DEBUG_CONTEXT DO_DEBUG
 

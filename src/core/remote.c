@@ -23,6 +23,7 @@
 #include "platform.h"
 #include "viewer.h"
 #include "remote.h"
+#include "remote_url.h"
 #include "stringutils.h"
 
 #ifdef __APPLE__
@@ -524,66 +525,6 @@ bool open_remote_slide(app_state_t *app_state, const char *hostname, i32 portno,
 }
 
 
-// from https://stackoverflow.com/questions/726122/best-ways-of-parsing-a-url-using-c
-typedef struct url_info_t
-{
-    const char* protocol;
-    const char* site;
-    const char* port;
-    const char* path;
-} url_info_t;
-
-url_info_t* split_url(url_info_t* info, const char* url)
-{
-    if (!info || !url)
-        return NULL;
-    info->protocol = strtok(strcpy((char*)malloc(strlen(url)+1), url), "://");
-    if (!info->protocol)
-        return NULL;
-    info->site = strstr(url, "://");
-    if (info->site)
-    {
-        info->site += 3;
-        char* site_port_path = strcpy((char*)calloc(1, strlen(info->site) + 1), info->site);
-        info->site = strtok(site_port_path, ":");
-        info->site = strtok(site_port_path, "/");
-    }
-    else
-    {
-        char* site_port_path = strcpy((char*)calloc(1, strlen(url) + 1), url);
-        info->site = strtok(site_port_path, ":");
-        info->site = strtok(site_port_path, "/");
-    }
-    char* URL = strcpy((char*)malloc(strlen(url) + 1), url);
-    info->port = strstr(URL + 6, ":");
-    char* port_path = 0;
-    char* port_path_copy = 0;
-    if (info->port && isdigit(*(port_path = (char*)info->port + 1)))
-    {
-        port_path_copy = strcpy((char*)malloc(strlen(port_path) + 1), port_path);
-        char * r = strtok(port_path, "/");
-        if (r)
-            info->port = r;
-        else
-            info->port = port_path;
-    }
-    else
-        info->port = "80";
-    if (port_path_copy)
-        info->path = port_path_copy + strlen(info->port ? info->port : "");
-    else
-    {
-        char* path = strstr(URL + 8, "/");
-        info->path = path ? path : "/";
-    }
-    int r = strcmp(info->protocol, info->site) == 0;
-    if (r && strcmp(info->port, "80") == 0)
-        info->protocol = "http";
-    else if (r)
-        info->protocol = "tcp";
-    return info;
-}
-
 static i32 header_field_callback(http_parser *parser, const char *p, size_t len) {
 //    parser->data;
     return 0;
@@ -609,6 +550,10 @@ static i32 message_complete_callback(http_parser *parser) {
 }
 
 static i32 remote_build_get_request(char* request, size_t request_size, const char* host, const char* path, const char* api_token, const char* cookie_header, bool close_after_request) {
+	if ((api_token && strpbrk(api_token, "\r\n")) ||
+	    (cookie_header && strpbrk(cookie_header, "\r\n"))) {
+		return -1;
+	}
     char token_header_string[4196] = "";
     if (api_token && api_token[0] != '\0') {
         snprintf(token_header_string, sizeof(token_header_string), "Authorization: Bearer %s\r\n", api_token);
@@ -842,22 +787,27 @@ http_response_t* remote_connection_request(tls_connection_t* connection, const c
 
 http_response_t* open_remote_uri_with_extra_headers(const char *uri, const char* api_token, const char* cookie_header) {
 
-    url_info_t url_info = {};
-    if (!split_url(&url_info, uri)) {
+    remote_url_t url_info = {};
+    if (!remote_url_parse(&url_info, uri)) {
         console_print_error("Error parsing URI \"%s\"\n", uri);
         return NULL;
     }
+	if (!remote_url_protocol_equals(url_info.protocol, "https")) {
+		console_print_error("Refusing non-HTTPS remote URI\n");
+		return NULL;
+	}
 
     char request[4096];
-    remote_build_get_request(request, sizeof(request), url_info.site, url_info.path, api_token, cookie_header, true);
-    i32 request_len = (i32)strlen(request);
+	i32 request_len = remote_build_get_request(request, sizeof(request), url_info.host_header, url_info.path,
+	                                           api_token, cookie_header, true);
+	if (request_len < 0 || (size_t)request_len >= sizeof(request)) {
+		console_print_error("Remote HTTP request is too large\n");
+		return NULL;
+	}
 
 	console_print_verbose("Sending remote HTTP request; credentials and URI are redacted.\n");
 
     i32 portno = atoi(url_info.port);
-    if (portno == 80 && strcmp(url_info.protocol, "https") == 0) {
-        portno = 443;
-    }
     tls_connection_t* connection = open_remote_connection(url_info.site, portno, alloca(sizeof(tls_connection_t)));
     if (!connection) {
         return NULL;
@@ -869,10 +819,8 @@ http_response_t* open_remote_uri_with_extra_headers(const char *uri, const char*
 
     http_response_t* response = NULL;
     if (read_ok && mem_buffer.used_size > 0) {
-        // now we should have the whole HTTP response
-        console_print_verbose("%s\n", mem_buffer.data);
-
         response = calloc(1, sizeof(http_response_t));
+		if (!response) goto response_cleanup;
         response->buffer = memrw_create(MEGABYTES(2));
 
         http_parser_settings settings = {};
@@ -881,24 +829,40 @@ http_response_t* open_remote_uri_with_extra_headers(const char *uri, const char*
         settings.on_message_complete = message_complete_callback;
 
         http_parser* parser = malloc(sizeof(http_parser));
+		if (!parser) {
+			memrw_destroy(&response->buffer);
+			free(response);
+			response = NULL;
+			goto response_cleanup;
+		}
         http_parser_init(parser, HTTP_RESPONSE);
         http_response_parse_context_t context = {};
         context.response = response;
         parser->data = (void*)&context;
 
-        i32 nparsed = http_parser_execute(parser, &settings, (char*)mem_buffer.data, mem_buffer.used_size);
-        response->status_code = parser->status_code;
-        memrw_putc(0, &response->buffer); // zero-terminate the content string
-
-        console_print_verbose("Content length = %d\n", response->content_length);
-        if (response->content_length < KILOBYTES(64)) {
-            console_print_verbose("%s\n", response->buffer.data);
-        }
+        size_t nparsed = http_parser_execute(parser, &settings, (char*)mem_buffer.data, mem_buffer.used_size);
+		if (nparsed == mem_buffer.used_size && HTTP_PARSER_ERRNO(parser) == HPE_OK && !context.message_complete) {
+			http_parser_execute(parser, &settings, NULL, 0); // Signal EOF for close-delimited bodies.
+		}
+		bool parse_ok = nparsed == mem_buffer.used_size &&
+		                HTTP_PARSER_ERRNO(parser) == HPE_OK && context.message_complete;
+		if (parse_ok) {
+			response->status_code = parser->status_code;
+			memrw_putc(0, &response->buffer); // zero-terminate the content string
+			console_print_verbose("Content length = %d\n", response->content_length);
+		} else {
+			console_print_error("Invalid or incomplete HTTP response (%s)\n",
+			                    http_errno_name(HTTP_PARSER_ERRNO(parser)));
+			memrw_destroy(&response->buffer);
+			free(response);
+			response = NULL;
+		}
 
         free(parser);
 
     }
 
+response_cleanup:
     memrw_destroy(&mem_buffer);
 
     return response;

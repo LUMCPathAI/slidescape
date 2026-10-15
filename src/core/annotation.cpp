@@ -3508,6 +3508,7 @@ void unload_and_reinit_annotations(annotation_set_t* annotation_set) {
 
 annotation_set_t* duplicate_annotation_set(annotation_set_t* annotation_set) {
 	annotation_set_t* copy = (annotation_set_t*)malloc(sizeof(annotation_set_t));
+	if (!copy) return NULL;
 	*copy = *annotation_set;
 	copy->is_saving_in_progress = 0;
 	copy->selected_annotations = NULL;

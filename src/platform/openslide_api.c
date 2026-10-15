@@ -43,20 +43,16 @@ HINSTANCE win32_load_library_with_possible_filenames(const wchar_t** filenames, 
 
 const wchar_t* one_past_last_slash_w(const wchar_t* s, i32 max) {
     if (max <= 0) return s;
-    size_t len = wcsnlen(s, (size_t)(max - 1));
-    size_t stripped_len = 0;
-    const wchar_t* pos = s + len - 1;
-    for (; pos >= s; --pos) {
-        wchar_t c = *pos;
+	size_t len = wcsnlen(s, (size_t)max);
+	const wchar_t* pos = s + len;
+	while (pos > s) {
+		--pos;
+		wchar_t c = *pos;
         if (c == '/' || c == '\\')  {
-            break;
-        } else {
-            ++stripped_len;
+			return pos + 1;
         }
     }
-    const wchar_t* result = pos + 1; // gone back one too far
-    ASSERT(stripped_len > 0 && stripped_len <= len);
-    return result;
+	return s;
 }
 
 #endif
@@ -66,10 +62,15 @@ bool init_openslide() {
 
 #ifdef _WIN32
 	// Look for DLLs in an openslide/ folder in the same location as the .exe
-	wchar_t dll_path[4096];
-	GetModuleFileNameW(NULL, dll_path, sizeof(dll_path));
-    wchar_t* pos = (wchar_t*)one_past_last_slash_w(dll_path, sizeof(dll_path));
-	i32 chars_left = COUNT(dll_path) - (pos - dll_path);
+	wchar_t dll_path[4096] = {};
+	DWORD path_length = GetModuleFileNameW(NULL, dll_path, COUNT(dll_path));
+	if (path_length == 0 || path_length >= COUNT(dll_path)) {
+		console_print("OpenSlide not available: could not determine the executable directory\n");
+		return false;
+	}
+    wchar_t* pos = (wchar_t*)one_past_last_slash_w(dll_path, (i32)COUNT(dll_path));
+	size_t chars_left = COUNT(dll_path) - (size_t)(pos - dll_path);
+	if (chars_left < COUNT(L"openslide")) return false;
 	wcsncpy(pos, L"openslide", chars_left);
 	SetDllDirectoryW(dll_path);
 

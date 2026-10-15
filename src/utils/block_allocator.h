@@ -54,8 +54,8 @@ struct allocator_t {
 
 typedef struct block_allocator_item_t block_allocator_item_t;
 struct block_allocator_item_t {
-	i32 chunk_index;
-	i32 block_index;
+	size_t chunk_index;
+	size_t block_index;
 	block_allocator_item_t* next;
 };
 
@@ -66,19 +66,23 @@ typedef struct block_allocator_chunk_t {
 
 typedef struct block_allocator_t {
 	size_t block_size;
-	i32 chunk_capacity_in_blocks;
+	size_t max_capacity_in_blocks;
+	size_t chunk_capacity_in_blocks;
 	size_t chunk_size;
-	i32 chunk_count;
-	i32 used_chunks;
+	size_t chunk_count;
+	size_t used_chunks;
+	size_t next_unused_block_index;
 	block_allocator_chunk_t* chunks;
 	block_allocator_item_t* free_list_storage;
 	block_allocator_item_t* free_list;
-	i32 free_list_length;
+	size_t free_list_length;
+	u8* allocation_state;
 	platform_mutex_t lock;
 	bool is_valid;
 } block_allocator_t;
 
 void block_allocator_init(block_allocator_t* allocator, size_t block_size, size_t max_capacity_in_blocks, size_t chunk_size);
+// The allocator object itself must be heap-allocated; destroy releases it too.
 void block_allocator_destroy(block_allocator_t* allocator);
 void* block_alloc(block_allocator_t* allocator);
 void block_free(block_allocator_t* allocator, void* ptr_to_free);

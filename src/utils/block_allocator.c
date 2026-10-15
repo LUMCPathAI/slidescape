@@ -47,30 +47,48 @@ void* block_allocator_proc(allocator_t* this_allocator, size_t size_to_allocate,
 */
 
 void block_allocator_init(block_allocator_t* allocator, size_t block_size, size_t max_capacity_in_blocks, size_t chunk_size) {
-	u64 total_capacity = (u64)block_size * (u64)max_capacity_in_blocks;
-	u64 chunk_count = total_capacity / chunk_size;
-	u64 chunk_capacity_in_blocks = max_capacity_in_blocks / chunk_count;
+	if (!allocator || block_size == 0 || max_capacity_in_blocks == 0 || chunk_size < block_size) {
+		console_print_error("block_allocator_init(): invalid allocator dimensions\n");
+		fatal_error();
+	}
+
+	size_t chunk_capacity_in_blocks = chunk_size / block_size;
+	size_t chunk_count = 1 + (max_capacity_in_blocks - 1) / chunk_capacity_in_blocks;
+	if (chunk_count > SIZE_MAX / sizeof(block_allocator_chunk_t) ||
+	    max_capacity_in_blocks > SIZE_MAX / sizeof(block_allocator_item_t)) {
+		console_print_error("block_allocator_init(): bookkeeping size overflow\n");
+		fatal_error();
+	}
 	memset(allocator, 0, sizeof(*allocator));
 	allocator->block_size = block_size;
+	allocator->max_capacity_in_blocks = max_capacity_in_blocks;
 	allocator->chunk_capacity_in_blocks = chunk_capacity_in_blocks;
 	allocator->chunk_size = chunk_size;
-	ASSERT(chunk_count > 0);
 	allocator->chunk_count = chunk_count;
-	allocator->used_chunks = 1;
 	allocator->chunks = calloc(1, chunk_count * sizeof(block_allocator_chunk_t));
-	allocator->chunks[0].memory = (u8*)malloc(chunk_size);
 	allocator->free_list_storage = calloc(1, max_capacity_in_blocks * sizeof(block_allocator_item_t));
+	allocator->allocation_state = calloc(1, max_capacity_in_blocks);
+	if (!allocator->chunks || !allocator->free_list_storage || !allocator->allocation_state) {
+		free(allocator->chunks);
+		free(allocator->free_list_storage);
+		free(allocator->allocation_state);
+		memset(allocator, 0, sizeof(*allocator));
+		console_print_error("block_allocator_init(): failed to allocate bookkeeping storage\n");
+		fatal_error();
+	}
     platform_mutex_init(&allocator->lock);
 	allocator->is_valid = true;
 }
 
 void block_allocator_destroy(block_allocator_t* allocator) {
-	for (i32 i = 0; i < allocator->used_chunks; ++i) {
+	if (!allocator) return;
+	for (size_t i = 0; i < allocator->used_chunks; ++i) {
 		block_allocator_chunk_t* chunk = allocator->chunks + i;
 		if (chunk->memory) free(chunk->memory);
 	}
 	if (allocator->chunks) free(allocator->chunks);
 	if (allocator->free_list_storage) free(allocator->free_list_storage);
+	if (allocator->allocation_state) free(allocator->allocation_state);
     platform_mutex_destroy(&allocator->lock);
 	free(allocator);
 }
@@ -82,30 +100,36 @@ void* block_alloc(block_allocator_t* allocator) {
 		// Grab a block from the free list
 		block_allocator_item_t* free_item = allocator->free_list;
 		result = allocator->chunks[free_item->chunk_index].memory + free_item->block_index * allocator->block_size;
+		size_t global_index = free_item->chunk_index * allocator->chunk_capacity_in_blocks + free_item->block_index;
+		ASSERT(global_index < allocator->max_capacity_in_blocks);
+		ASSERT(allocator->allocation_state[global_index] == 0);
+		allocator->allocation_state[global_index] = 1;
 		allocator->free_list = free_item->next;
 		--allocator->free_list_length;
 	} else {
-		ASSERT(allocator->used_chunks >= 1);
-		i32 chunk_index = allocator->used_chunks-1;
+		if (allocator->next_unused_block_index >= allocator->max_capacity_in_blocks) {
+			platform_mutex_unlock(&allocator->lock);
+			console_print_error("block_alloc(): capacity exhausted\n");
+			fatal_error();
+		}
+
+		size_t global_index = allocator->next_unused_block_index++;
+		size_t chunk_index = global_index / allocator->chunk_capacity_in_blocks;
+		size_t block_index = global_index % allocator->chunk_capacity_in_blocks;
+		ASSERT(chunk_index < allocator->chunk_count);
 		block_allocator_chunk_t* current_chunk = allocator->chunks + chunk_index;
-		if (current_chunk->used_blocks < allocator->chunk_capacity_in_blocks) {
-			i32 block_index = current_chunk->used_blocks++;
-			result = current_chunk->memory + block_index * allocator->block_size;
-		} else {
-			// Chunk is full, allocate a new chunk
-			if (allocator->used_chunks < allocator->chunk_count) {
-//				console_print("block_alloc(): allocating a new chunk\n");
-				chunk_index = allocator->used_chunks++;
-				current_chunk = allocator->chunks + chunk_index;
-				ASSERT(current_chunk->memory == NULL);
-				current_chunk->memory = (u8*)malloc(allocator->chunk_size);
-				i32 block_index = current_chunk->used_blocks++;
-				result = current_chunk->memory + block_index * allocator->block_size;
-			} else {
-				console_print_error("block_alloc(): out of memory!\n");
+		if (!current_chunk->memory) {
+			current_chunk->memory = (u8*)malloc(allocator->chunk_size);
+			if (!current_chunk->memory) {
+				platform_mutex_unlock(&allocator->lock);
+				console_print_error("block_alloc(): failed to allocate a chunk\n");
 				fatal_error();
 			}
+			allocator->used_chunks = MAX(allocator->used_chunks, chunk_index + 1);
 		}
+		current_chunk->used_blocks = MAX(current_chunk->used_blocks, block_index + 1);
+		allocator->allocation_state[global_index] = 1;
+		result = current_chunk->memory + block_index * allocator->block_size;
 	}
     platform_mutex_unlock(&allocator->lock);
 	return result;
@@ -115,21 +139,38 @@ void block_free(block_allocator_t* allocator, void* ptr_to_free) {
     platform_mutex_lock(&allocator->lock);
 	block_allocator_item_t free_item = {0};
 	// Find the right chunk
-	i32 chunk_index = -1;
-	for (i32 i = 0; i < allocator->used_chunks; ++i) {
+	size_t chunk_index = SIZE_MAX;
+	for (size_t i = 0; i < allocator->used_chunks; ++i) {
 		block_allocator_chunk_t* chunk = allocator->chunks + i;
-		bool match = ((u8*)ptr_to_free >= chunk->memory && (u8*)ptr_to_free < (chunk->memory + allocator->chunk_size));
+		if (!chunk->memory) continue;
+		uintptr_t ptr_value = (uintptr_t)ptr_to_free;
+		uintptr_t chunk_start = (uintptr_t)chunk->memory;
+		bool match = ptr_value >= chunk_start && ptr_value - chunk_start < allocator->chunk_size;
 		if (match) {
 			chunk_index = i;
 			break;
 		}
 	}
-	if (chunk_index >= 0) {
+	if (chunk_index != SIZE_MAX) {
 		block_allocator_chunk_t* chunk = allocator->chunks + chunk_index;
+		size_t offset = (size_t)((u8*)ptr_to_free - chunk->memory);
+		size_t block_index = offset / allocator->block_size;
+		size_t global_index = chunk_index * allocator->chunk_capacity_in_blocks + block_index;
+		bool valid = (offset % allocator->block_size) == 0 &&
+		             block_index < chunk->used_blocks &&
+		             global_index < allocator->max_capacity_in_blocks &&
+		             allocator->allocation_state[global_index] != 0 &&
+		             allocator->free_list_length < allocator->max_capacity_in_blocks;
+		if (!valid) {
+			platform_mutex_unlock(&allocator->lock);
+			console_print_error("block_free(): invalid or duplicate pointer\n");
+			fatal_error();
+		}
+		allocator->allocation_state[global_index] = 0;
 		free_item.next = allocator->free_list;
 		free_item.chunk_index = chunk_index;
-		free_item.block_index = ((u8*)ptr_to_free - chunk->memory) / allocator->block_size;
-		i32 free_index = allocator->free_list_length++;
+		free_item.block_index = block_index;
+		size_t free_index = allocator->free_list_length++;
 		allocator->free_list_storage[free_index] = free_item;
 		allocator->free_list = allocator->free_list_storage + free_index;
         platform_mutex_unlock(&allocator->lock);
