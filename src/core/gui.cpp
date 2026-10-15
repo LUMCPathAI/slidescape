@@ -43,14 +43,8 @@
 #include "gui.h"
 #include "stringutils.h"
 
-#if WINDOWS
-#include "ltalloc.h"
-static void*   imgui_malloc_wrapper(size_t size, void* user_data)    { IM_UNUSED(user_data); return ltmalloc(size); }
-static void    imgui_free_wrapper(void* ptr, void* user_data)        { IM_UNUSED(user_data); ltfree(ptr); }
-#else
 static void*   imgui_malloc_wrapper(size_t size, void* user_data)    { IM_UNUSED(user_data); return malloc(size); }
 static void    imgui_free_wrapper(void* ptr, void* user_data)        { IM_UNUSED(user_data); free(ptr); }
-#endif
 
 
 static char imgui_ini_filename[512];

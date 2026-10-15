@@ -477,7 +477,6 @@ set(SLIDESCAPE_NONGUI_BASE_FILES
         src/third_party/minfft.c
         src/third_party/miniz.c
         src/third_party/http_parser.c
-        src/third_party/ltalloc.cc
         src/tiff/tiff.c
         src/tiff/tiff_write.c
         src/tiff/tiff_xml.c
@@ -774,7 +773,6 @@ add_executable(dicom_dict_gen
         src/utils/stringutils.c
         src/third_party/yxml.c
         src/third_party/lz4.c
-        src/third_party/ltalloc.cc
         )
 target_compile_definitions(dicom_dict_gen PRIVATE IS_SERVER=1)
 
