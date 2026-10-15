@@ -1842,5 +1842,5 @@ TEST_CASE("archive JPEG admission and decode reject header mismatches before pix
 			break;
 		}
 	}
-	free(jpeg);
+	libc_free(jpeg);
 }

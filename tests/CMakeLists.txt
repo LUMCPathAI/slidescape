@@ -34,6 +34,9 @@ target_compile_definitions(slidescape_tests PRIVATE
         SLIDESCAPE_TEST_DICOMWEB_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/dicomweb"
         ISYNTAX_JPEG_DECODER_USE_LIBJPEG=1
 )
+if (WIN32)
+        target_compile_definitions(slidescape_tests PRIVATE NOMINMAX) # prevent Windows SDK's min and max macro definitions colliding with std::min and std::max
+endif()
 target_link_libraries(slidescape_tests PRIVATE slidescape_nongui slidescape_jpeg slidescape_archive_core)
 if (WIN32)
         target_link_libraries(slidescape_tests PRIVATE winmm)

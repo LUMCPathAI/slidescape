@@ -213,6 +213,11 @@ typedef struct dicom_header_t {
 
 #define DICOM_UNDEFINED_LENGTH 0xFFFFFFFF
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4200) // disable nonstandard extension warning: zero-sized array in struct/union
+#endif
+
 #pragma pack(push,1)
 
 typedef struct dicom_tag_t {
@@ -247,6 +252,10 @@ typedef struct dicom_sequence_item_t {
 	u8 data[0];
 } dicom_sequence_item_t;
 #pragma pack(pop)
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 typedef struct dicom_data_element_t {
 	dicom_tag_t tag;

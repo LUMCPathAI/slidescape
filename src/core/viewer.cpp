@@ -633,7 +633,7 @@ void update_and_render_image(app_state_t* app_state, image_t* image) {
 				                 10.0f);
 				mat4x4_scale_aniso(model_matrix, model_matrix, pmax.x, pmax.y, 1.0f);
 				mat4x4 model_matrix_rot;
-				mat4x4_rotate_Z(model_matrix_rot, model_matrix, 0.5f * M_PI);
+				mat4x4_rotate_Z(model_matrix_rot, model_matrix, 0.5f * PI_F);
 				renderer_set_image_model_matrix(model_matrix_rot);
 
 				renderer_draw_textured_rect(label_image->texture);

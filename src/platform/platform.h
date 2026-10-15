@@ -59,12 +59,21 @@ extern "C" {
 
 typedef struct app_state_t app_state_t;
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4200) // disable nonstandard extension warning: zero-sized array in struct/union
+#endif
+
 typedef struct mem_t {
 	size_t len;
 	size_t capacity;
     i64 cursor;
 	u8 data[0];
 } mem_t;
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 #if WINDOWS
 typedef HANDLE semaphore_handle_t;

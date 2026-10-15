@@ -335,7 +335,8 @@ static std::vector<u8> tiny_mrxs_zip(bool duplicate = false, bool omit_data = fa
 		u8* encoded = nullptr; u64 size = 0;
 		jpeg_encode_image(pixels, 2, 2, 90, &encoded, &size);
 		REQUIRE(encoded);
-		bmp.assign(encoded, encoded + size); free(encoded);
+		bmp.assign(encoded, encoded + size);
+		libc_free(encoded);
 		put(index, 69, size, 4);
 	}
 	std::vector<u8> data = {99,98,97}; data.insert(data.end(), bmp.begin(), bmp.end());

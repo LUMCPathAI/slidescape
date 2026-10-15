@@ -8,6 +8,15 @@
   (at your option) any later version.
 */
 
+// NOTE: we need to guarantee Winsock 2 is included 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 #include "archive_http.h"
 #include "dicomweb.h"
 
@@ -28,9 +37,6 @@
 #include <string.h>
 
 #if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
 typedef SOCKET archive_socket_t;
 #define ARCHIVE_INVALID_SOCKET INVALID_SOCKET
 #define archive_socket_close closesocket

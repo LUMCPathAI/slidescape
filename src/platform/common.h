@@ -150,6 +150,8 @@
 #define access _access
 #define F_OK 0 // check for file existence
 #define	S_ISDIR(m)	(((m) & 0xF000) == 0x4000) // check for whether a file is a directory (from stat.h)
+#define	S_ISREG(m)	(((m) & 0xF000) == 0x8000) // check for whether a file is a regular file (from stat.h)
+#define wstat _wstat
 #define strncasecmp _strnicmp
 #define strcasecmp _stricmp
 #define alloca _alloca
@@ -323,7 +325,7 @@ typedef struct str_t {
 #define __FILENAME__ __FILE__
 #endif
 
-#define fatal_error(message) _ssc_fatal_error(__FILE__, __LINE__, __func__, "" message)
+#define fatal_error(...) _ssc_fatal_error(__FILE__, __LINE__, __func__, "" __VA_ARGS__)
 #if FATAL_ERROR_DONT_INLINE
 #define FATAL_ERROR_INLINE_SPECIFIER
 // Not inlining _fatal_error() shaves a few kilobytes off the executable size.
@@ -331,7 +333,7 @@ typedef struct str_t {
 #ifdef __cplusplus
 extern "C"
 #endif
-void _fatal_error(const char* source_filename, i32 line, const char* func, const char* message);
+void _ssc_fatal_error(const char* source_filename, i32 line, const char* func, const char* message);
 #else
 #define FATAL_ERROR_IMPLEMENTATION
 #define FATAL_ERROR_INLINE_SPECIFIER FORCE_INLINE

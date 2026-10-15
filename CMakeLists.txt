@@ -79,6 +79,7 @@ message(STATUS "${BITS}-bit build (${CPU_TYPE})")
 
 # Set up compiler and linker flags
 if (MSVC)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
     set(COMMON_COMPILER_FLAGS "${MSVC_CPU_OPTIONS} ${MSVC_WARN_OPTIONS}")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${COMMON_COMPILER_FLAGS}")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${COMMON_COMPILER_FLAGS}")
@@ -577,9 +578,20 @@ if (WIN32)
     target_link_libraries(slidescape         slidescape_nongui slidescape_jpeg user32 gdi32 winmm imm32 dwmapi ws2_32 psapi shlwapi crypt32)
     target_link_libraries(slidescape_console slidescape_nongui slidescape_jpeg user32 gdi32 winmm imm32 dwmapi ws2_32 psapi shlwapi crypt32)
 
-    # Hide the console window on (non-console) release builds
-    target_link_options(slidescape PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-mwindows>")
-    target_compile_definitions(slidescape_console PRIVATE DONT_REGISTER_FILETYPE_ASSOCIATIONS=1) # associate only non-console buils
+    target_compile_definitions(slidescape_console PRIVATE DONT_REGISTER_FILETYPE_ASSOCIATIONS=1) # associate only non-console builds
+
+    # Hide the console window on non-Debug GUI builds.
+    if (MSVC)
+        target_link_options(slidescape PRIVATE "$<$<NOT:$<CONFIG:Debug>>:/SUBSYSTEM:WINDOWS>" "$<$<NOT:$<CONFIG:Debug>>:/ENTRY:mainCRTStartup>")
+    else()
+        target_link_options(slidescape PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-mwindows>")
+    endif()
+
+    # Suppress MSVC creating a second default manifest with resource ID 1 (the manifest is already explicitly embedded in icon.rc)
+    if (MSVC)
+        target_link_options(slidescape PRIVATE /MANIFEST:NO)
+        target_link_options(slidescape_console PRIVATE /MANIFEST:NO)
+    endif()
 elseif(APPLE)
     set(CMAKE_C_LINK_FLAGS "${CMAKE_C_LINK_FLAGS} -headerpad_max_install_names")
     find_package(SDL2 REQUIRED)

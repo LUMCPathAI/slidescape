@@ -19,8 +19,15 @@
 #include "common.h"
 #include "mathutils.h"
 
-#include <tgmath.h>
-#include <complex.h>
+#include <math.h>
+/*
+ * MSVC's math.h defines "complex" as the legacy struct _complex.
+ * That is not C99 complex arithmetic. Force minfft's portable
+ * [real, imaginary] representation, which this file uses.
+ */
+#ifdef complex
+#undef complex
+#endif
 #include "minfft.h"
 
 #include "phasecorrelate.h"
@@ -67,9 +74,9 @@ void debug_create_magnitude_plot(minfft_cmpl* src, i32 w, i32 h, real_t scale, c
 		minfft_cmpl* src_row = src + y * w ;
 		u8* dst_row = magnitudes + y * w;
 		for (i32 x = 0; x < w; ++x) {
-			real_t Re = creal(src_row[x]);
-			real_t Im = cimag(src_row[x]);
-			real_t mag = sqrt(Re * Re + Im * Im);
+			real_t re = src_row[x][0];
+			real_t im = src_row[x][1];
+			real_t mag = sqrtf(re * re + im * im);
 			mag *= scale;
 			dst_row[x] = (u8)ATMOST(255, (mag));
 		}
@@ -108,7 +115,7 @@ void debug_create_luminance_png_complex(minfft_cmpl* src, i32 w, i32 h, real_t s
 		minfft_cmpl* src_row = src + y * w;
 		u8* dst_row = magnitudes + y * w;
 		for (i32 x = 0; x < w; ++x) {
-			real_t c = creal(src_row[x]);
+			real_t c = src_row[x][0];
 			dst_row[x] = (u8)ATMOST(255, (c * scale * 255.0f));
 		}
 	}
@@ -234,11 +241,18 @@ v2f phase_correlate(buffer2d_t* src1, buffer2d_t* src2, buffer2d_t* window, floa
 		minfft_cmpl* src_row2 = FFT2 + y * fft_w;
 		minfft_cmpl* dst_row = P + y * fft_w;
 		for (i32 x = 0; x < fft_w; ++x) {
-			minfft_cmpl s1 = src_row1[x];
-			minfft_cmpl s2 = src_row2[x];
-			minfft_cmpl p = s1 * conj(s2);
-			p /= fabs(p) + 0.0001f;
-			dst_row[x] = p;
+			real_t s1_re = src_row1[x][0];
+			real_t s1_im = src_row1[x][1];
+			real_t s2_re = src_row2[x][0];
+			real_t s2_im = src_row2[x][1];
+
+			/* s1 * conjugate(s2) */
+			real_t p_re = s1_re * s2_re + s1_im * s2_im;
+			real_t p_im = s1_im * s2_re - s1_re * s2_im;
+			real_t magnitude = sqrtf(p_re * p_re + p_im * p_im) + 0.0001f;
+
+			dst_row[x][0] = p_re / magnitude;
+			dst_row[x][1] = p_im / magnitude;
 		}
 	}
 

@@ -270,9 +270,9 @@ enum {
 static void viewer_join_path(char* dest, size_t dest_size, const char* directory, const char* name) {
 	size_t directory_len = strlen(directory);
 	if (directory_len > 0 && (directory[directory_len - 1] == '/' || directory[directory_len - 1] == '\\')) {
-		snprintf(dest, dest_size, "%s%s", directory, name);
+		snprintf(dest, (i32)dest_size, "%s%s", directory, name);
 	} else {
-		snprintf(dest, dest_size, "%s" PATH_SEP "%s", directory, name);
+		snprintf(dest, (i32)dest_size, "%s" PATH_SEP "%s", directory, name);
 	}
 }
 

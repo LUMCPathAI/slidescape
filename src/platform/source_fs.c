@@ -55,7 +55,7 @@ void source_fs_close(source_fs_t* source) {
 	}
 	source_zip_close(source->zip);
 	source_blob_close(&source->container);
-	free(source->root);
+	libc_free(source->root); // NOTE: created by strdup()
 	free(source);
 }
 

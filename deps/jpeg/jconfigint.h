@@ -33,7 +33,15 @@
 
 /* The size of `size_t', as computed by sizeof. */
 #ifdef _MSC_VER
-#define SIZEOF_SIZE_T sizeof(void*)
+#if defined(_WIN64)
+#define SIZEOF_SIZE_T 8
+#elif defined(_WIN32)
+#define SIZEOF_SIZE_T 4
+#elif defined(__SIZEOF_SIZE_T__)
+#define SIZEOF_SIZE_T __SIZEOF_SIZE_T__
+#else
+#error "Unable to determine sizeof(size_t)"
+#endif
 #else
 #define SIZEOF_SIZE_T __SIZEOF_POINTER__
 #endif

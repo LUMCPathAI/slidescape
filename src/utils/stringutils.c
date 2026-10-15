@@ -89,7 +89,7 @@ void dots_to_underscores(char* s, i32 max) {
 }
 
 const char* one_past_last_slash(const char* s, i32 max) {
-	i32 len = strnlen(s, max - 1);
+	i32 len = (i32)strnlen(s, max - 1);
 	i32 stripped_len = 0;
 	const char* pos = s + len - 1;
 	for (; pos >= s; --pos) {
@@ -153,7 +153,7 @@ void replace_file_extension(char* filename, i32 max_len, const char* new_ext) {
 	}
 	// Now append the new extension
 	const char* new_ext_pos = new_ext;
-	for (i32 append_len = (buffer_end - append_pos); append_len > 0; --append_len) {
+	for (i64 append_len = (buffer_end - append_pos); append_len > 0; --append_len) {
 		*append_pos = *new_ext_pos;
 		if (*new_ext_pos == '\0') break;
 		++append_pos;

@@ -82,7 +82,7 @@ void memrw_rewind(memrw_t* buffer) {
 }
 
 void memrw_seek(memrw_t* buffer, i64 offset) {
-	if (offset >= 0 && (i64)offset < buffer->used_size) {
+	if (offset >= 0 && offset < (i64)buffer->used_size) {
 		buffer->cursor = offset;
 	} else {
 		fatal_error();

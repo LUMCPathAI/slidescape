@@ -100,13 +100,11 @@ void destroy_image_buffer(image_buffer_t* image_buffer) {
 }
 
 
-#define MAKE_UINT32(u0, u1, u2, u3) ((u32)(u0) | ((u32)(u1) << 8) | ((u32)(u2) << 16) | ((u32)(u3) << 24))
-
 static float sinc_filter(float x) {
     if (x == 0.0f) {
         return 1.0f;
     } else {
-        x *= M_PI;
+        x *= PI_F;
         return sinf(x) / x;
     }
 }

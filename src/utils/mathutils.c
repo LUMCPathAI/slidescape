@@ -163,7 +163,7 @@ v2i world_pos_to_pixel_pos(v2f world_pos, float um_per_pixel, i32 level) {
 i32 tile_pos_from_world_pos(float world_pos, float tile_side) {
 	ASSERT(tile_side > 0);
 	float tile_float = (world_pos / tile_side);
-	float tile = (i32)floorf(tile_float);
+	i32 tile = (i32)floorf(tile_float);
 	return tile;
 }
 
