@@ -95,7 +95,7 @@ add_test(NAME slidescape_tls_tests COMMAND slidescape_tls_tests)
 set_tests_properties(slidescape_tls_tests PROPERTIES TIMEOUT 60 LABELS "tls")
 
 # TODO: remove allocator benchmarks again once integration is stable?
-if(BUILD_SLIDESCAPE_BENCHMARKS AND WIN32)
+if(BUILD_SLIDESCAPE_BENCHMARKS AND (WIN32 OR APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
         add_executable(slidescape_allocator_benchmark
                 allocator_benchmark.cpp
                 ../src/core/tile_buffer_pool.c
