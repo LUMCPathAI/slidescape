@@ -50,6 +50,9 @@ u8 *download_remote_batch(const char *hostname, i32 portno, const char *filename
 bool open_remote_slide(app_state_t *app_state, const char *hostname, i32 portno, const char *filename);
 http_response_t* open_remote_uri(app_state_t *app_state, const char *uri, const char* api_token);
 http_response_t* open_remote_uri_with_extra_headers(const char *uri, const char* api_token, const char* cookie_header);
+http_response_t* open_remote_uri_with_extra_headers_and_options(
+	const char* uri, const char* api_token, const char* cookie_header,
+	const remote_request_options_t* options);
 tls_connection_t* remote_connection_open(const char* hostname, i32 portno);
 tls_connection_t* remote_connection_open_http(const char* hostname, i32 portno, bool use_tls);
 void remote_connection_close_and_free(tls_connection_t* connection);

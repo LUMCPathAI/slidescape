@@ -1993,7 +1993,8 @@ static void open_uri_try_slide_score(app_state_t* app_state, const char* uri) {
 	             sizeof(open_uri_status));
 	if (slide_score_last_open_succeeded()) {
 		open_uri_finish_success();
-	} else if (needs_api_token && !strstr(open_uri_status, "no image id")) {
+	} else if (needs_api_token && slide_score_failure_requires_api_token(
+			slide_score_get_last_failure_kind())) {
 		open_uri_show_api_token_modal = true;
 	}
 }
@@ -2165,7 +2166,10 @@ static void gui_draw_open_uri_credential_modals(app_state_t* app_state) {
 		}
 		if (retry) {
 			open_uri_try_slide_score(app_state, open_uri_slide_score_retry_uri);
-			if (slide_score_last_open_succeeded()) ImGui::CloseCurrentPopup();
+			if (slide_score_last_open_succeeded() || !slide_score_failure_requires_api_token(
+					slide_score_get_last_failure_kind())) {
+				ImGui::CloseCurrentPopup();
+			}
 		}
 		ImGui::EndPopup();
 	}

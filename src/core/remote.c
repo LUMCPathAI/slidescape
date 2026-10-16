@@ -525,56 +525,6 @@ bool open_remote_slide(app_state_t *app_state, const char *hostname, i32 portno,
 }
 
 
-static i32 header_field_callback(http_parser *parser, const char *p, size_t len) {
-//    parser->data;
-    return 0;
-}
-
-typedef struct http_response_parse_context_t {
-    http_response_t* response;
-    bool message_complete;
-} http_response_parse_context_t;
-
-static i32 body_callback(http_parser *parser, const char *p, size_t len) {
-    http_response_parse_context_t* context = (http_response_parse_context_t*)parser->data;
-    http_response_t* response = context->response;
-    memrw_push_back(&response->buffer, (void*)p, len);
-    response->content_length += len;
-    return 0;
-}
-
-static i32 message_complete_callback(http_parser *parser) {
-    http_response_parse_context_t* context = (http_response_parse_context_t*)parser->data;
-    context->message_complete = true;
-    return 0;
-}
-
-static i32 remote_build_get_request(char* request, size_t request_size, const char* host, const char* path, const char* api_token, const char* cookie_header, bool close_after_request) {
-	if ((api_token && strpbrk(api_token, "\r\n")) ||
-	    (cookie_header && strpbrk(cookie_header, "\r\n"))) {
-		return -1;
-	}
-    char token_header_string[4196] = "";
-    if (api_token && api_token[0] != '\0') {
-        snprintf(token_header_string, sizeof(token_header_string), "Authorization: Bearer %s\r\n", api_token);
-    }
-    char cookie_header_string[1024] = "";
-    if (cookie_header && cookie_header[0] != '\0') {
-        snprintf(cookie_header_string, sizeof(cookie_header_string), "Cookie: %s\r\n", cookie_header);
-    }
-
-    static const char requestfmt[] =
-            "GET %s HTTP/1.1\r\n"
-            "Accept: application/json,image/jpeg,*/*\r\n"
-            "Accept-Language: en,nl;q=0.9,en-US;q=0.8,af;q=0.7\r\n%s%s"
-            "Cache-Control: max-age=0\r\n"
-            "Connection: %s\r\n"
-            "Host: %s\r\n"
-            "Upgrade-Insecure-Requests: 1\r\n\r\n";
-    return snprintf(request, request_size, requestfmt, path, token_header_string, cookie_header_string,
-                    close_after_request ? "close" : "keep-alive", host);
-}
-
 static tls_connection_t* remote_connection_open_plain(const char* hostname, i32 portno) {
     tls_connection_t* connection = (tls_connection_t*)calloc(1, sizeof(tls_connection_t));
     if (!connection) return NULL;
@@ -770,38 +720,58 @@ http_response_t* remote_connection_request_with_headers(tls_connection_t* connec
         connection, host, path, accept, extra_headers, close_after_request, NULL);
 }
 
+static bool remote_build_credential_headers(char* headers, size_t headers_size,
+		const char* api_token, const char* cookie_header) {
+	if (!headers || headers_size == 0 ||
+	    (api_token && strpbrk(api_token, "\r\n")) ||
+	    (cookie_header && strpbrk(cookie_header, "\r\n"))) {
+		return false;
+	}
+	headers[0] = '\0';
+	size_t used = 0;
+	if (api_token && api_token[0]) {
+		i32 written = snprintf(headers + used, headers_size - used,
+		                       "Authorization: Bearer %s\r\n", api_token);
+		if (written < 0 || (size_t)written >= headers_size - used) return false;
+		used += (size_t)written;
+	}
+	if (cookie_header && cookie_header[0]) {
+		i32 written = snprintf(headers + used, headers_size - used,
+		                       "Cookie: %s\r\n", cookie_header);
+		if (written < 0 || (size_t)written >= headers_size - used) return false;
+	}
+	return true;
+}
+
 http_response_t* remote_connection_request(tls_connection_t* connection, const char* host, const char* path, const char* api_token, const char* cookie_header, bool close_after_request) {
     char headers[6144] = "";
-    size_t used = 0;
-    if (api_token && api_token[0]) {
-        used += snprintf(headers + used, sizeof(headers) - used,
-                         "Authorization: Bearer %s\r\n", api_token);
-    }
-    if (cookie_header && cookie_header[0] && used < sizeof(headers)) {
-        snprintf(headers + used, sizeof(headers) - used, "Cookie: %s\r\n", cookie_header);
-    }
+	if (!remote_build_credential_headers(headers, sizeof(headers), api_token, cookie_header)) return NULL;
     return remote_connection_request_with_headers(connection, host, path,
                                                   "application/json,image/jpeg,*/*",
                                                   headers, close_after_request);
 }
 
-http_response_t* open_remote_uri_with_extra_headers(const char *uri, const char* api_token, const char* cookie_header) {
+http_response_t* open_remote_uri_with_extra_headers_and_options(
+		const char* uri, const char* api_token, const char* cookie_header,
+		const remote_request_options_t* options) {
+	remote_request_set_error(options, HTTP_RESPONSE_ERROR_NONE);
 
     remote_url_t url_info = {};
     if (!remote_url_parse(&url_info, uri)) {
         console_print_error("Error parsing URI \"%s\"\n", uri);
+		remote_request_set_error(options, HTTP_RESPONSE_ERROR_INVALID_REQUEST);
         return NULL;
     }
 	if (!remote_url_protocol_equals(url_info.protocol, "https")) {
 		console_print_error("Refusing non-HTTPS remote URI\n");
+		remote_request_set_error(options, HTTP_RESPONSE_ERROR_INVALID_REQUEST);
 		return NULL;
 	}
 
-    char request[4096];
-	i32 request_len = remote_build_get_request(request, sizeof(request), url_info.host_header, url_info.path,
-	                                           api_token, cookie_header, true);
-	if (request_len < 0 || (size_t)request_len >= sizeof(request)) {
-		console_print_error("Remote HTTP request is too large\n");
+	char headers[6144];
+	if (!remote_build_credential_headers(headers, sizeof(headers), api_token, cookie_header)) {
+		console_print_error("Remote HTTP credentials are invalid or too large\n");
+		remote_request_set_error(options, HTTP_RESPONSE_ERROR_INVALID_REQUEST);
 		return NULL;
 	}
 
@@ -810,62 +780,20 @@ http_response_t* open_remote_uri_with_extra_headers(const char *uri, const char*
     i32 portno = atoi(url_info.port);
     tls_connection_t* connection = open_remote_connection(url_info.site, portno, alloca(sizeof(tls_connection_t)));
     if (!connection) {
+		remote_request_set_error(options, HTTP_RESPONSE_ERROR_CONNECTION);
         return NULL;
     }
 
-    memrw_t mem_buffer = memrw_create(MEGABYTES(2));
-    bool32 read_ok = remote_request(connection, request, request_len, &mem_buffer);
-    float seconds_elapsed = close_remote_connection(connection);
-
-    http_response_t* response = NULL;
-    if (read_ok && mem_buffer.used_size > 0) {
-        response = calloc(1, sizeof(http_response_t));
-		if (!response) goto response_cleanup;
-        response->buffer = memrw_create(MEGABYTES(2));
-
-        http_parser_settings settings = {};
-        settings.on_header_field = header_field_callback;
-        settings.on_body = body_callback;
-        settings.on_message_complete = message_complete_callback;
-
-        http_parser* parser = malloc(sizeof(http_parser));
-		if (!parser) {
-			memrw_destroy(&response->buffer);
-			free(response);
-			response = NULL;
-			goto response_cleanup;
-		}
-        http_parser_init(parser, HTTP_RESPONSE);
-        http_response_parse_context_t context = {};
-        context.response = response;
-        parser->data = (void*)&context;
-
-        size_t nparsed = http_parser_execute(parser, &settings, (char*)mem_buffer.data, mem_buffer.used_size);
-		if (nparsed == mem_buffer.used_size && HTTP_PARSER_ERRNO(parser) == HPE_OK && !context.message_complete) {
-			http_parser_execute(parser, &settings, NULL, 0); // Signal EOF for close-delimited bodies.
-		}
-		bool parse_ok = nparsed == mem_buffer.used_size &&
-		                HTTP_PARSER_ERRNO(parser) == HPE_OK && context.message_complete;
-		if (parse_ok) {
-			response->status_code = parser->status_code;
-			memrw_putc(0, &response->buffer); // zero-terminate the content string
-			console_print_verbose("Content length = %d\n", response->content_length);
-		} else {
-			console_print_error("Invalid or incomplete HTTP response (%s)\n",
-			                    http_errno_name(HTTP_PARSER_ERRNO(parser)));
-			memrw_destroy(&response->buffer);
-			free(response);
-			response = NULL;
-		}
-
-        free(parser);
-
-    }
-
-response_cleanup:
-    memrw_destroy(&mem_buffer);
-
+	http_response_t* response = remote_connection_request_with_headers_and_options(
+		connection, url_info.host_header, url_info.path,
+		"application/json,image/jpeg,*/*", headers, true, options);
+	close_remote_connection(connection);
     return response;
+}
+
+http_response_t* open_remote_uri_with_extra_headers(const char* uri, const char* api_token,
+		const char* cookie_header) {
+	return open_remote_uri_with_extra_headers_and_options(uri, api_token, cookie_header, NULL);
 }
 
 http_response_t* open_remote_uri(app_state_t *app_state, const char *uri, const char* api_token) {

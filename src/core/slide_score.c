@@ -147,6 +147,7 @@ static const char* slide_score_api_names[SLIDE_SCORE_API_LAST] = {
 
 static char slide_score_last_status[512];
 static bool slide_score_open_succeeded;
+static slide_score_failure_kind_t slide_score_last_failure_kind;
 
 static void slide_score_set_last_status(const char* fmt, ...) {
     va_list args;
@@ -163,6 +164,22 @@ const char* slide_score_get_last_status(void) {
 
 bool slide_score_last_open_succeeded(void) {
     return slide_score_open_succeeded;
+}
+
+slide_score_failure_kind_t slide_score_get_last_failure_kind(void) {
+	return slide_score_last_failure_kind;
+}
+
+slide_score_failure_kind_t slide_score_classify_http_failure(i32 status_code) {
+	if (status_code == 401 || status_code == 403) {
+		return SLIDE_SCORE_FAILURE_AUTHENTICATION;
+	}
+	return status_code > 0 ? SLIDE_SCORE_FAILURE_HTTP : SLIDE_SCORE_FAILURE_TRANSPORT;
+}
+
+bool slide_score_failure_requires_api_token(slide_score_failure_kind_t failure_kind) {
+	return failure_kind == SLIDE_SCORE_FAILURE_CREDENTIALS_REQUIRED ||
+	       failure_kind == SLIDE_SCORE_FAILURE_AUTHENTICATION;
 }
 
 
@@ -382,16 +399,42 @@ bool slide_score_request_api(slide_score_client_t* ss, slide_score_api_enum api,
 
     char url[1024];
     snprintf(url, sizeof(url), "https://%s%s", ss->server_name, (char*)call.url.data);
-    http_response_t* response = open_remote_uri_with_extra_headers(url, ss->api_key, NULL);
+	http_response_error_t transport_error = HTTP_RESPONSE_ERROR_NONE;
+	remote_request_options_t options = {
+		.max_response_body_size = MEGABYTES(2),
+		.out_error = &transport_error,
+	};
+    http_response_t* response = open_remote_uri_with_extra_headers_and_options(
+		url, ss->api_key, NULL, &options);
     if (response) {
         if (response->status_code >= 200 && response->status_code < 300) {
             slide_score_api_result_t parsed = debug_slide_score_api_handle_response((const char*)response->buffer.data, response->content_length, api);
             if (out_result) *out_result = parsed;
             success = parsed.success || api == SLIDE_SCORE_API_GET_TILE_SERVER;
+			if (success) {
+				slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_NONE;
+			} else {
+				slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_INVALID_RESPONSE;
+				slide_score_set_last_status("Slide Score %s returned an invalid response.",
+				                            slide_score_api_names[api]);
+			}
         } else {
+			slide_score_last_failure_kind = slide_score_classify_http_failure(response->status_code);
+			if (slide_score_last_failure_kind == SLIDE_SCORE_FAILURE_AUTHENTICATION) {
+				slide_score_set_last_status("Slide Score rejected the API token (HTTP %d).",
+				                            response->status_code);
+			} else {
+				slide_score_set_last_status("Slide Score %s request failed: HTTP %d.",
+				                            slide_score_api_names[api], response->status_code);
+			}
             console_print_error("Slide Score API request failed: HTTP %d for %s\n", response->status_code, url);
         }
         http_response_destroy(response);
+	} else {
+		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_TRANSPORT;
+		slide_score_set_last_status("Slide Score %s request failed: %s.",
+		                            slide_score_api_names[api],
+		                            http_response_error_string(transport_error));
     }
     web_api_call_destroy(&call);
     return success;
@@ -407,7 +450,12 @@ bool slide_score_refresh_tile_server(slide_score_remote_image_t* remote) {
         return false;
     }
     remote->tile_server = result.get_tile_server;
-    return remote->tile_server.cookie_part[0] && remote->tile_server.url_part[0];
+	bool valid = remote->tile_server.cookie_part[0] && remote->tile_server.url_part[0];
+	if (!valid) {
+		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_INVALID_RESPONSE;
+		slide_score_set_last_status("Slide Score returned an invalid tile server response.");
+	}
+	return valid;
 }
 
 static i32 ceil_log2_i64(i64 value) {
@@ -498,6 +546,11 @@ bool slide_score_open_remote_image(app_state_t* app_state, const char* server_ur
     slide_score_remote_image_t remote = {};
     slide_score_client_init(&remote.client, server_url_or_hostname, api_token);
     remote.image_id = image_id;
+	if (!remote.client.api_key[0]) {
+		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_CREDENTIALS_REQUIRED;
+		slide_score_set_last_status("A Slide Score API token is required.");
+		return false;
+	}
 
     char image_id_str[32];
     snprintf(image_id_str, sizeof(image_id_str), "%d", image_id);
@@ -506,7 +559,6 @@ bool slide_score_open_remote_image(app_state_t* app_state, const char* server_ur
 
     slide_score_api_result_t metadata_result = {};
     if (!slide_score_request_api(&remote.client, SLIDE_SCORE_API_GET_IMAGE_METADATA, names, values, 1, &metadata_result)) {
-        slide_score_set_last_status("Slide Score failed to retrieve metadata for image %d.", image_id);
         console_print_error("%s\n", slide_score_last_status);
         return false;
     }
@@ -514,7 +566,6 @@ bool slide_score_open_remote_image(app_state_t* app_state, const char* server_ur
     remote.max_deepzoom_level = ceil_log2_i64(MAX(remote.metadata.level_0_width, remote.metadata.level_0_height));
 
     if (!slide_score_refresh_tile_server(&remote)) {
-        slide_score_set_last_status("Slide Score failed to retrieve tile server token for image %d.", image_id);
         console_print_error("%s\n", slide_score_last_status);
         return false;
     }
@@ -529,6 +580,7 @@ bool slide_score_open_remote_image(app_state_t* app_state, const char* server_ur
     if (is_valid) {
         unload_all_images(app_state);
         add_image(app_state, image, true, false);
+		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_NONE;
         slide_score_set_last_status("Opened Slide Score image %d.", image_id);
     } else {
         image_destroy(image);
@@ -554,15 +606,24 @@ static bool slide_score_validate_qupath_link(slide_score_remote_image_t* remote)
 
     char url[1024];
     snprintf(url, sizeof(url), "https://%s%s", remote->client.server_name, path);
-    http_response_t* response = open_remote_uri_with_extra_headers(url, NULL, NULL);
+	http_response_error_t transport_error = HTTP_RESPONSE_ERROR_NONE;
+	remote_request_options_t options = {
+		.max_response_body_size = MEGABYTES(2),
+		.out_error = &transport_error,
+	};
+    http_response_t* response = open_remote_uri_with_extra_headers_and_options(
+		url, NULL, NULL, &options);
     if (!response) {
-        slide_score_set_last_status("QuPath link validation failed: no response from Slide Score.");
+		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_TRANSPORT;
+        slide_score_set_last_status("QuPath link validation failed: %s.",
+		                            http_response_error_string(transport_error));
         console_print_error("%s\n", slide_score_last_status);
         return false;
     }
 
     bool success = response->status_code >= 200 && response->status_code < 300 && response->content_length > 0;
     if (!success) {
+		slide_score_last_failure_kind = slide_score_classify_http_failure(response->status_code);
         slide_score_set_last_status("QuPath link appears expired or invalid (HTTP %d while requesting first tile).", response->status_code);
         console_print_error("%s\n", slide_score_last_status);
     }
@@ -589,9 +650,17 @@ bool slide_score_open_qupath_metadata_url(app_state_t* app_state, const char* ur
         return false;
     }
 
-    http_response_t* response = open_remote_uri_with_extra_headers(uri, NULL, NULL);
+	http_response_error_t transport_error = HTTP_RESPONSE_ERROR_NONE;
+	remote_request_options_t options = {
+		.max_response_body_size = MEGABYTES(2),
+		.out_error = &transport_error,
+	};
+    http_response_t* response = open_remote_uri_with_extra_headers_and_options(
+		uri, NULL, NULL, &options);
     if (!response) {
-        slide_score_set_last_status("Slide Score failed to retrieve QuPath metadata URL.");
+		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_TRANSPORT;
+        slide_score_set_last_status("Slide Score failed to retrieve QuPath metadata: %s.",
+		                            http_response_error_string(transport_error));
         console_print_error("%s\n", slide_score_last_status);
         return false;
     }
@@ -619,6 +688,7 @@ bool slide_score_open_qupath_metadata_url(app_state_t* app_state, const char* ur
         if (is_valid) {
             unload_all_images(app_state);
             add_image(app_state, image, true, false);
+			slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_NONE;
             slide_score_set_last_status("Opened Slide Score QuPath link for image %d.", remote.image_id);
             success = true;
         } else {
@@ -626,6 +696,7 @@ bool slide_score_open_qupath_metadata_url(app_state_t* app_state, const char* ur
             free(image);
         }
     } else {
+		slide_score_last_failure_kind = slide_score_classify_http_failure(response->status_code);
         slide_score_set_last_status("Slide Score QuPath metadata request failed: HTTP %d.", response->status_code);
         console_print_error("%s URL: %s\n", slide_score_last_status, uri);
     }
@@ -722,6 +793,8 @@ bool slide_score_uri_is_supported(const char* uri) {
 
 bool slide_score_try_open_uri(app_state_t* app_state, const char* uri, const char* api_token) {
     slide_score_open_succeeded = false;
+	slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_NONE;
+	slide_score_last_status[0] = '\0';
     i32 image_id = 0;
     slide_score_uri_parts_t parts = {};
     if (!slide_score_get_uri_parts(uri, &parts)) return false;

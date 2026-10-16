@@ -10,10 +10,15 @@
 extern "C" {
 i32 global_next_resource_id = 1000;
 
-http_response_t* open_remote_uri_with_extra_headers(const char* uri, const char* api_token, const char* cookie_header) {
+http_response_t* open_remote_uri_with_extra_headers_and_options(
+		const char* uri, const char* api_token, const char* cookie_header,
+		const remote_request_options_t* options) {
 	(void)uri;
 	(void)api_token;
 	(void)cookie_header;
+	if (options && options->out_error) {
+		*options->out_error = HTTP_RESPONSE_ERROR_CONNECTION;
+	}
 	return NULL;
 }
 
@@ -32,6 +37,18 @@ void add_image(app_state_t* app_state, image_t* image, bool need_zoom_reset, boo
 	(void)need_image_registration;
 }
 
+}
+
+TEST_CASE("Slide Score only requests an API token for credential failures") {
+	CHECK(slide_score_classify_http_failure(401) == SLIDE_SCORE_FAILURE_AUTHENTICATION);
+	CHECK(slide_score_classify_http_failure(403) == SLIDE_SCORE_FAILURE_AUTHENTICATION);
+	CHECK(slide_score_classify_http_failure(500) == SLIDE_SCORE_FAILURE_HTTP);
+	CHECK(slide_score_classify_http_failure(0) == SLIDE_SCORE_FAILURE_TRANSPORT);
+	CHECK(slide_score_failure_requires_api_token(SLIDE_SCORE_FAILURE_CREDENTIALS_REQUIRED));
+	CHECK(slide_score_failure_requires_api_token(SLIDE_SCORE_FAILURE_AUTHENTICATION));
+	CHECK_FALSE(slide_score_failure_requires_api_token(SLIDE_SCORE_FAILURE_TRANSPORT));
+	CHECK_FALSE(slide_score_failure_requires_api_token(SLIDE_SCORE_FAILURE_HTTP));
+	CHECK_FALSE(slide_score_failure_requires_api_token(SLIDE_SCORE_FAILURE_INVALID_RESPONSE));
 }
 
 TEST_CASE("Slide Score metadata parser handles nested metadata and arrays") {
@@ -140,7 +157,7 @@ TEST_CASE("Slide Score URI parser recognizes QuPath metadata with custom scheme"
 	bool recognized = slide_score_try_open_uri(&app_state,
 	                                           "slidescore://clidipa.slidescore.com/i/18/token/SlideScoreMetadata.json",
 	                                           NULL);
-	bool got_expected_status = strstr(slide_score_get_last_status(), "QuPath metadata URL") != NULL;
+	bool got_expected_status = strstr(slide_score_get_last_status(), "QuPath metadata") != NULL;
 	CHECK(recognized);
 	CHECK(got_expected_status);
 	CHECK_FALSE(slide_score_last_open_succeeded());
