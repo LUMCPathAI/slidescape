@@ -2600,11 +2600,19 @@ void gui_draw(app_state_t* app_state, input_t* input, i32 client_width, i32 clie
 			}
 			ImGui::SliderInt("Min level display", &global_lowest_scale_to_render, 0, 16);
 			ImGui::SliderInt("Max level display", &global_highest_scale_to_render, 0, 16);
-			ImGui::SliderFloat("Rotation", &app_state->scene.rotation, -1.0f * IM_PI, 1.0f * IM_PI);
+			if (ImGui::SliderFloat("Rotation", &app_state->scene.rotation,
+			                       -1.0f * IM_PI, 1.0f * IM_PI)) {
+				app_state->scene.rotation_target = app_state->scene.rotation;
+				app_state->scene.sin_rotation = sinf(app_state->scene.rotation);
+				app_state->scene.cos_rotation = cosf(app_state->scene.rotation);
+				app_state->scene.need_rotation_animation = false;
+			}
 			if (ImGui::Button("Reset rotation")) {
 				app_state->scene.rotation = 0.0f;
+				app_state->scene.rotation_target = 0.0f;
 				app_state->scene.sin_rotation = 0.0f;
 				app_state->scene.cos_rotation = 1.0f;
+				app_state->scene.need_rotation_animation = false;
 			}
             ImGui::Checkbox("Draw WSI image", &app_state->scene.draw_wsi_image);
             ImGui::Checkbox("Draw WSI background", &app_state->scene.draw_wsi_background);

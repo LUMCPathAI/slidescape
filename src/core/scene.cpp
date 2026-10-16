@@ -79,8 +79,10 @@ void init_scene(app_state_t *app_state, scene_t *scene) {
 	scene->camera = V2F(0.0f, 0.0f); // center camera at origin
 	init_zoom_state(&scene->zoom, 0.0f, 1.0f, 1.0f, 1.0f);
 	scene->rotation = 0.0f;
+	scene->rotation_target = 0.0f;
 	scene->sin_rotation = 0.0f;
 	scene->cos_rotation = 1.0f;
+	scene->need_rotation_animation = false;
 	scene->is_mpp_known = false;
 	scene->enable_grid = false;
 	scene->enable_annotations = true;

@@ -1243,8 +1243,10 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 			scene->camera.x = base_image->width_in_um / 2.0f;
 			scene->camera.y = base_image->height_in_um / 2.0f;
 			scene->rotation = base_image->initial_rotation;
+			scene->rotation_target = scene->rotation;
 			scene->sin_rotation = sinf(scene->rotation);
 			scene->cos_rotation = cosf(scene->rotation);
+			scene->need_rotation_animation = false;
 
 			scene->need_zoom_reset = false;
 		}
@@ -1288,24 +1290,34 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 			float residual_dlevel = scene->zoom_target_state.pos - scene->zoom.pos; // how much the zoom is lagging behind
 			float abs_residual_dlevel = fabs(residual_dlevel);
 			bool integer_zoom = true; // can override later
-			bool use_zoom_animation = !use_fast_rendering;
+			bool use_view_animation = !use_fast_rendering;
 			bool32 used_mouse_to_zoom = false;
 
 			// Zoom in or out, or rotate using the mouse wheel.
 			if (!gui_want_capture_mouse && input->mouse_z != 0.0f) {
 				if (input->keyboard.key_ctrl.down) {
-					// Rotate counterclockwise when scrolling down, and clockwise when scrolling up.
-					// TODO(pvalkema): rotate smoothly when use_zoom_animation is true
-                    // TODO: ctrl+drag to rotate the view?
-					scene->rotation += input->mouse_z * ((1.0f / 18.0f) * IM_PI);
-					if (scene->rotation >= 2.0f * IM_PI) {
-						scene->rotation -= 2.0f * IM_PI;
+					// Whole wheel notches snap to 5 degree increments. Repeated input while
+					// animation is pending accelerates to 10 degrees per notch. SDL preserves
+					// fractional trackpad deltas, which remain linear for finer control.
+					const float rotation_notch = PI_F / 36.0f;
+					float rounded_wheel_delta = roundf(input->mouse_z);
+					bool precise_wheel_input =
+						fabsf(input->mouse_z - rounded_wheel_delta) > 0.001f;
+					if (!scene->need_rotation_animation) {
+						scene->rotation_target = scene->rotation;
 					}
-					if (scene->rotation <= -2.0f * IM_PI) {
-						scene->rotation += 2.0f * IM_PI;
+					if (precise_wheel_input) {
+						scene->rotation_target += input->mouse_z * (2.0f * rotation_notch);
+					} else {
+						float residual_rotation = scene->rotation_target - scene->rotation;
+						float notch_multiplier = fabsf(residual_rotation) < 0.6f * rotation_notch
+						                             ? 1.499f : 1.999f;
+						float new_target = scene->rotation_target +
+						                   input->mouse_z * notch_multiplier * rotation_notch;
+						scene->rotation_target =
+							roundf(new_target / rotation_notch) * rotation_notch;
 					}
-					scene->sin_rotation = sinf(scene->rotation);
-					scene->cos_rotation = cosf(scene->rotation);
+					scene->need_rotation_animation = true;
 
 				} else if (input->keyboard.key_alt.down && arrlen(app_state->loaded_images) > 1) {
 					// Quickly scroll through different layers using the mouse wheel.
@@ -1329,7 +1341,7 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 						recount_enabled_images(app_state);
 					}
 				} else {
-					if (use_zoom_animation) {
+					if (use_view_animation) {
 						// We want to snap to multiples of 0.5 levels when zooming in discrete increments using the mouse wheel.
 						// Pro: gives better control than zooming in whole levels; con: makes zooming in/out rather slow.
 						// Trick: advance the 'zoom target' in increments of ~0.75 or more levels, but round down to the nearest 0.5 once we are close by.
@@ -1346,6 +1358,33 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 					used_mouse_to_zoom = true;
 				}
 
+			}
+
+			if (scene->need_rotation_animation) {
+				float rotation_delta = scene->rotation_target - scene->rotation;
+				float abs_rotation_delta = fabsf(rotation_delta);
+				if (!use_view_animation || abs_rotation_delta < 1e-5f) {
+					scene->rotation = scene->rotation_target;
+					scene->need_rotation_animation = false;
+					if (fabsf(scene->rotation) >= 2.0f * PI_F) {
+						scene->rotation = fmodf(scene->rotation, 2.0f * PI_F);
+						scene->rotation_target = scene->rotation;
+					}
+				} else {
+					float sign_rotation_delta = signbit(rotation_delta) ? -1.0f : 1.0f;
+					float linear_catch_up_speed = 2.0f * delta_time;
+					float exponential_catch_up_speed = 16.0f * delta_time;
+					if (abs_rotation_delta > linear_catch_up_speed) {
+						rotation_delta =
+							(linear_catch_up_speed +
+							 (abs_rotation_delta - linear_catch_up_speed) *
+							 exponential_catch_up_speed) * sign_rotation_delta;
+					}
+					scene->rotation += rotation_delta;
+				}
+				scene->sin_rotation = sinf(scene->rotation);
+				scene->cos_rotation = cosf(scene->rotation);
+				app_state->allow_idling_next_frame = false;
 			}
 
 			float key_repeat_interval = 0.15f; // in seconds
@@ -1451,7 +1490,7 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 			}
 
 			if (scene->need_zoom_animation) {
-				if (!use_zoom_animation) {
+				if (!use_view_animation) {
 					// skip animation by jumping to the target state immediately
 					zoom_update_pos(&scene->zoom, scene->zoom_target_state.pos);
 				}

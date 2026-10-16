@@ -121,8 +121,10 @@ typedef struct scene_t {
 	bounds2f camera_bounds;
 	bounds2f tile_load_bounds;
 	float rotation;
+	float rotation_target;
 	float cos_rotation; // should be updated every time the rotation is updated
 	float sin_rotation; // should be updated every time the rotation is updated
+	bool need_rotation_animation;
 	bool restrict_load_bounds;
 	float r_minus_l;
 	float t_minus_b;
