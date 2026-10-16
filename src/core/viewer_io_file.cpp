@@ -28,6 +28,7 @@
 #include "jpeg_decoder.h"
 #include "ssi_transport.h"
 #include "tile_cache.h"
+#include "tile_buffer_pool.h"
 
 #include "gui.h" // for global data, TODO: refactor
 
@@ -50,7 +51,8 @@ static void remote_jpeg_post_tile_result(load_tile_task_t* task, u8* pixel_memor
 
 	if (!tile_cache_post_load_result(image, &completion_task)) {
 		if (completion_task.pixel_memory) {
-			free(completion_task.pixel_memory);
+			tile_buffer_release(completion_task.pixel_memory,
+			                    (size_t)completion_task.tile_width * completion_task.tile_height * BYTES_PER_PIXEL);
 		}
 	}
 }
@@ -117,7 +119,11 @@ void slide_score_load_tile_batch_func(i32 logical_thread_index, void* userdata) 
 			continue;
 		}
 		size_t pixel_memory_size = level_image->tile_width * level_image->tile_height * BYTES_PER_PIXEL;
-		u8* pixel_memory = (u8*)malloc(pixel_memory_size);
+		u8* pixel_memory = tile_buffer_acquire(pixel_memory_size);
+		if (!pixel_memory) {
+			remote_jpeg_post_tile_result(task, NULL, true, false);
+			continue;
+		}
 		memset(pixel_memory, image->is_background_black ? 0 : 0xFF, pixel_memory_size);
 
 		bool failed = false;
@@ -182,7 +188,7 @@ void slide_score_load_tile_batch_func(i32 logical_thread_index, void* userdata) 
 		}
 
 		if (failed) {
-			free(pixel_memory);
+			tile_buffer_release(pixel_memory, pixel_memory_size);
 			pixel_memory = NULL;
 		}
 		remote_jpeg_post_tile_result(task, pixel_memory, failed, false);
@@ -445,7 +451,7 @@ void ssi_load_tile_batch_func(i32 logical_thread_index, void* userdata) {
 		load_tile_task_t* task = active_tasks[i];
 		if (!task) continue;
 		size_t pixel_size = level->tile_width * level->tile_height * BYTES_PER_PIXEL;
-		u8* pixels = failed ? NULL : (u8*)malloc(pixel_size);
+		u8* pixels = failed ? NULL : tile_buffer_acquire(pixel_size);
 		bool tile_failed = failed || pixels == NULL;
 		i32 tile_x = task->tile_index % level->width_in_tiles;
 		i32 tile_y = task->tile_index / level->width_in_tiles;
@@ -466,7 +472,7 @@ void ssi_load_tile_batch_func(i32 logical_thread_index, void* userdata) {
 			}
 		}
 		if (tile_failed) {
-			free(pixels);
+			tile_buffer_release(pixels, pixel_size);
 			pixels = NULL;
 			++failed_tile_count;
 		} else {

@@ -16,6 +16,7 @@ add_executable(slidescape_tests
         test_ssi.cpp
         test_support.cpp
         test_stringutils.cpp
+        test_tile_buffer_pool.cpp
         test_tile_cache.cpp
         test_work_queue.cpp
         ../src/core/slide_score.c
@@ -40,6 +41,7 @@ if (WIN32)
         target_compile_definitions(slidescape_tests PRIVATE NOMINMAX) # prevent Windows SDK's min and max macro definitions colliding with std::min and std::max
 endif()
 target_link_libraries(slidescape_tests PRIVATE slidescape_nongui slidescape_jpeg slidescape_archive_core)
+slidescape_enable_process_allocator(slidescape_tests)
 if (WIN32)
         target_link_libraries(slidescape_tests PRIVATE winmm)
 endif()
@@ -80,6 +82,7 @@ target_include_directories(dicomweb_probe PRIVATE
         ../src/utils
 )
 target_link_libraries(dicomweb_probe PRIVATE slidescape_nongui slidescape_jpeg)
+slidescape_enable_process_allocator(dicomweb_probe)
 
 # No external services, OpenSSL executable, or private fixtures are needed.
 add_executable(slidescape_tls_tests test_tls.c)
@@ -87,5 +90,22 @@ set_target_properties(slidescape_tls_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "
 target_compile_definitions(slidescape_tls_tests PRIVATE
         SLIDESCAPE_TLS_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/tls")
 target_link_libraries(slidescape_tls_tests PRIVATE slidescape_tls)
+slidescape_enable_process_allocator(slidescape_tls_tests)
 add_test(NAME slidescape_tls_tests COMMAND slidescape_tls_tests)
 set_tests_properties(slidescape_tls_tests PROPERTIES TIMEOUT 60 LABELS "tls")
+
+# TODO: remove allocator benchmarks again once integration is stable?
+if(BUILD_SLIDESCAPE_BENCHMARKS AND WIN32)
+        add_executable(slidescape_allocator_benchmark
+                allocator_benchmark.cpp
+                ../src/core/tile_buffer_pool.c
+                ../src/platform/platform_mutex.c)
+        target_include_directories(slidescape_allocator_benchmark PRIVATE
+                ../src
+                ../src/core
+                ../src/platform
+                ../src/utils
+                ../src/third_party)
+        target_compile_definitions(slidescape_allocator_benchmark PRIVATE IS_SERVER=0)
+        slidescape_enable_process_allocator(slidescape_allocator_benchmark)
+endif()

@@ -28,6 +28,7 @@
 
 #include "tile_loader.h"
 #include "tile_cache.h"
+#include "tile_buffer_pool.h"
 
 static void (*ssi_close_callback)(ssi_remote_image_t* remote);
 
@@ -1432,7 +1433,8 @@ static bool image_read_region_impl(image_t* image, i32 level, i32 x, i32 y, i32 
 							tile->is_empty = true;
 						}
 						platform_mutex_unlock(&image->lock);
-						free(action.pixels_to_free);
+						tile_buffer_release(action.pixels_to_free,
+						                    (size_t)cache_result.tile_width * cache_result.tile_height * BYTES_PER_PIXEL);
 					} else {
 						bool all_tiles_ready = true;
 						i32 retry_tiles_to_load = 0;

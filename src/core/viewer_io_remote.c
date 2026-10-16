@@ -21,6 +21,7 @@
 #include "remote.h"
 #include "jpeg_decoder.h"
 #include "tile_cache.h"
+#include "tile_buffer_pool.h"
 
 void tiff_load_tile_batch_func(i32 logical_thread_index, void* userdata) {
 	load_tile_task_batch_t* batch = (load_tile_task_batch_t*) userdata;
@@ -111,13 +112,16 @@ void tiff_load_tile_batch_func(i32 logical_thread_index, void* userdata) {
 					for (i32 i = 0; i < active_count; ++i) {
 						load_tile_task_t* task = active_tasks[i];
 						level_image_t* level_image = image->level_images + task->level;
-
-						size_t pixel_memory_size = level_image->tile_width * level_image->tile_height * BYTES_PER_PIXEL;
-						u8* pixel_memory = (u8*)malloc(pixel_memory_size);
-						memset(pixel_memory, 0xFF, pixel_memory_size);
-
 						u8* current_chunk = content + chunk_offset_in_read_buffer;
 						chunk_offset_in_read_buffer += chunk_sizes[i];
+
+						size_t pixel_memory_size = level_image->tile_width * level_image->tile_height * BYTES_PER_PIXEL;
+						u8* pixel_memory = tile_buffer_acquire(pixel_memory_size);
+						if (!pixel_memory) {
+							tile_cache_cancel_decode(image, task->level, task->tile_index);
+							continue;
+						}
+						memset(pixel_memory, 0xFF, pixel_memory_size);
 
 						tiff_ifd_t* level_ifd = tiff->level_images_ifd + level_image->pyramid_image_index;
 						u8* jpeg_tables = level_ifd->jpeg_tables;
@@ -149,7 +153,7 @@ void tiff_load_tile_batch_func(i32 logical_thread_index, void* userdata) {
 
 						if (!tile_cache_post_load_result(image, &completion_task)) {
 							if (completion_task.pixel_memory) {
-								free(completion_task.pixel_memory);
+								tile_buffer_release(completion_task.pixel_memory, pixel_memory_size);
 							}
 						}
 

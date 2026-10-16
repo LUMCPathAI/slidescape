@@ -1,4 +1,5 @@
 #include "common.h"
+#include "tile_buffer_pool.h"
 
 #ifdef TARGET_EMSCRIPTEN
 #include <emscripten/emscripten.h>
@@ -138,6 +139,7 @@ typedef struct jpeg_image_decode_state_t {
 	struct jpeg_error_mgr error;
 	jmp_buf jump;
 	u8* output;
+	size_t output_size;
 } jpeg_image_decode_state_t;
 
 bool jpeg_validate_baseline_ycbcr_header(u8* input, u32 input_size, u32 width, u32 height) {
@@ -223,7 +225,8 @@ static u8* jpeg_decode_image_internal(u8* input, u32 input_size,
 	if (!jpeg_start_decompress(decoder) || decoder->output_components != 4)
 		goto failed;
 	size_t stride = (size_t)decoder->output_width * 4;
-	state->output = malloc(stride * decoder->output_height);
+	state->output_size = stride * decoder->output_height;
+	state->output = tile_buffer_acquire(state->output_size);
 	if (!state->output) goto failed;
 	while (decoder->output_scanline < decoder->output_height) {
 		u8* row = state->output + (size_t)decoder->output_scanline * stride;
@@ -238,9 +241,12 @@ static u8* jpeg_decode_image_internal(u8* input, u32 input_size,
 	free(state);
 	return result;
 
+
 failed:
 	jpeg_destroy_decompress(decoder);
-	free(state->output);
+	if (state->output) {
+		tile_buffer_release(state->output, state->output_size);
+	}
 	free(state);
 	return NULL;
 }

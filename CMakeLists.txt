@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.15)
 project(slidescape)
 
 set(CMAKE_C_STANDARD 11)
@@ -10,8 +10,26 @@ endif()
 message(STATUS "CMAKE_BUILD_TYPE = ${CMAKE_BUILD_TYPE}")
 
 option(BUILD_SLIDESCAPE_ARCHIVE "Build the pathology-first archive service" OFF)
+option(BUILD_SLIDESCAPE_BENCHMARKS "Build standalone Slidescape microbenchmarks" OFF)
 option(USE_JPEG_SIMD "Use SIMD code for libjpeg-turbo" ON)
 option(USE_ADDRESS_SANITIZER "Use address sanitizer" OFF)
+
+# TODO: test and enable mimalloc for other platforms
+option(SLIDESCAPE_MSVC_STATIC_RUNTIME "Use the static MSVC runtime (/MT or /MTd)" OFF)
+option(SLIDESCAPE_USE_MIMALLOC "Use a static mimalloc malloc override on Windows/MSVC" OFF)
+set(SLIDESCAPE_MIMALLOC_SOURCE_DIR "${CMAKE_SOURCE_DIR}/deps/mimalloc" CACHE PATH "Path to a mimalloc source checkout")
+
+if(SLIDESCAPE_USE_MIMALLOC)
+    if(NOT (WIN32 AND MSVC))
+        message(FATAL_ERROR "SLIDESCAPE_USE_MIMALLOC currently supports only Windows/MSVC")
+    endif()
+    set(SLIDESCAPE_MSVC_STATIC_RUNTIME ON)
+endif()
+if(MSVC AND SLIDESCAPE_MSVC_STATIC_RUNTIME)
+    # Link the runtime library statically, with or without debug symbols depending on the configuration
+    # see: https://cmake.org/cmake/help/latest/variable/CMAKE_MSVC_RUNTIME_LIBRARY.html#variable:CMAKE_MSVC_RUNTIME_LIBRARY
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 if (APPLE)
     # For macOS: to produce a notarization-ready app bundle, sign with a Developer ID Application certificate, passing cmake flags:
@@ -144,6 +162,33 @@ if (WIN32)
     include_directories("${CMAKE_SOURCE_DIR}/deps/dirent")
 endif()
 
+if(SLIDESCAPE_USE_MIMALLOC)
+    if(NOT EXISTS "${SLIDESCAPE_MIMALLOC_SOURCE_DIR}/CMakeLists.txt" OR
+       NOT EXISTS "${SLIDESCAPE_MIMALLOC_SOURCE_DIR}/src/static.c")
+        message(FATAL_ERROR
+                "mimalloc source not found at '${SLIDESCAPE_MIMALLOC_SOURCE_DIR}'. "
+                "Vendor mimalloc there or set SLIDESCAPE_MIMALLOC_SOURCE_DIR.")
+    endif()
+    set(MI_OVERRIDE ON CACHE BOOL "" FORCE)
+    set(MI_WIN_REDIRECT OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    # Upstream's mimalloc-obj packaging target currently depends on the static
+    # target as well, even though Slidescape links the object target directly.
+    set(MI_BUILD_STATIC ON CACHE BOOL "" FORCE)
+    set(MI_BUILD_OBJECT ON CACHE BOOL "" FORCE)
+    set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(MI_SECURE OFF CACHE STRING "" FORCE)
+    add_subdirectory("${SLIDESCAPE_MIMALLOC_SOURCE_DIR}"
+            "${CMAKE_BINARY_DIR}/mimalloc" EXCLUDE_FROM_ALL)
+    add_compile_definitions(SLIDESCAPE_USE_MIMALLOC=1)
+endif()
+
+function(slidescape_enable_process_allocator target)
+    if(SLIDESCAPE_USE_MIMALLOC)
+        target_link_libraries(${target} PRIVATE mimalloc-obj)
+    endif()
+endfunction()
+
 set(JPEG_SOURCE_FILES jcapimin.c
         wrapper/jcapistd-8.c wrapper/jcapistd-12.c wrapper/jcapistd-16.c
         wrapper/jccoefct-8.c wrapper/jccoefct-12.c
@@ -186,24 +231,6 @@ set(JPEG_SOURCE_FILES jcapimin.c
         jcarith.c
         jdarith.c
 )
-
-## libjpeg-turbo requires these files for JPEG decoding support
-#set(JPEG_SOURCE_FILES
-#        jerror.c    jaricom.c   jcapimin.c  jcmarker.c  jcomapi.c
-#        jdapimin.c  jdapistd.c  jdapistd.c  jdarith.c   jdcoefct.c
-#        jdcolor.c   jddctmgr.c  jdhuff.c    jdinput.c   jdmainct.c
-#        jdmarker.c  jdmaster.c  jdmerge.c   jdphuff.c   jdpostct.c
-#        jdsample.c  jidctflt.c  jidctfst.c  jidctint.c  jidctred.c
-#        jmemmgr.c   jmemnobs.c  jquant1.c   jquant2.c   jutils.c
-#)
-#
-## extra files needed for JPEG compression support
-#set(JPEG_SOURCE_FILES ${JPEG_SOURCE_FILES}
-#        jcapistd.c  jdatadst.c  jcparam.c   jcinit.c    jcmaster.c
-#        jccolor.c   jcsample.c  jcprepct.c  jcdctmgr.c  jcarith.c
-#        jctrans.c   jchuff.c    jccoefct.c  jcmainct.c  jcphuff.c
-#        jfdctflt.c  jfdctfst.c  jfdctint.c
-#)
 
 # https://stackoverflow.com/questions/13103018/how-to-prepend-cmake-current-source-dir-to-all-files-in-variable
 function(prepend_path SOURCE_FILES PREFIX)
@@ -465,6 +492,7 @@ set(SLIDESCAPE_NONGUI_BASE_FILES
         src/core/image_resize.c
         src/core/image_loader.c
         src/core/tile_cache.c
+        src/core/tile_buffer_pool.c
         src/core/tile_loader.c
         src/core/http_request.c
         src/core/http_response_parser.c
@@ -582,8 +610,10 @@ if (WIN32)
     add_executable(slidescape         ${VIEWER_SOURCE_FILES} ${LIBRARY_SOURCE_FILES} resources/icon/icon.rc)
     add_executable(slidescape_console ${VIEWER_SOURCE_FILES} ${LIBRARY_SOURCE_FILES} resources/icon/icon.rc)
 
-    target_link_libraries(slidescape         slidescape_nongui slidescape_jpeg user32 gdi32 winmm imm32 dwmapi ws2_32 psapi shlwapi crypt32)
-    target_link_libraries(slidescape_console slidescape_nongui slidescape_jpeg user32 gdi32 winmm imm32 dwmapi ws2_32 psapi shlwapi crypt32)
+    target_link_libraries(slidescape         PRIVATE user32 gdi32 winmm imm32 dwmapi ws2_32 psapi shlwapi crypt32)
+    target_link_libraries(slidescape_console PRIVATE user32 gdi32 winmm imm32 dwmapi ws2_32 psapi shlwapi crypt32)
+    slidescape_enable_process_allocator(slidescape)
+    slidescape_enable_process_allocator(slidescape_console)
 
     target_compile_definitions(slidescape_console PRIVATE DONT_REGISTER_FILETYPE_ASSOCIATIONS=1) # associate only non-console builds
 
@@ -607,8 +637,8 @@ elseif(APPLE)
     set_source_files_properties(${MACOSX_BUNDLE_ICON_FILE} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
     add_executable(slidescape MACOSX_BUNDLE ${VIEWER_SOURCE_FILES} ${LIBRARY_SOURCE_FILES} ${MACOSX_BUNDLE_ICON_FILE})
     set_target_properties(slidescape PROPERTIES MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/src/Info.plist")
-    target_link_libraries(slidescape slidescape_nongui slidescape_jpeg "-framework Cocoa" "-framework Quartz" "-framework OpenGL" "-framework ApplicationServices" "-framework Security")
-    target_link_libraries(slidescape ${SDL2_LIBRARIES})
+    target_link_libraries(slidescape PRIVATE "-framework Cocoa" "-framework Quartz" "-framework OpenGL" "-framework ApplicationServices" "-framework Security")
+    target_link_libraries(slidescape PRIVATE ${SDL2_LIBRARIES})
     set_target_properties(slidescape PROPERTIES OUTPUT_NAME Slidescape)
 
     # Copy bundled dylibs into the app and rewrite install names so the app can
@@ -669,7 +699,7 @@ else()
     add_executable(slidescape ${VIEWER_SOURCE_FILES} ${LIBRARY_SOURCE_FILES})
     find_package(SDL2 REQUIRED)
     include_directories(${SDL2_INCLUDE_DIRS})
-    target_link_libraries(slidescape slidescape_nongui slidescape_jpeg pthread dl m GL GLEW SDL2)
+    target_link_libraries(slidescape PRIVATE pthread dl m GL GLEW SDL2)
 
     # Create slidescape.desktop and install/uninstall scripts, and copy them to the output directory
     configure_file(resources/slidescape.desktop.in slidescape.desktop)
@@ -681,9 +711,9 @@ else()
             COMMAND chmod +x "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/install_desktop_file.sh"
             COMMAND chmod +x "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/uninstall_desktop_file.sh")
 endif()
-target_link_libraries(slidescape slidescape_tls)
+target_link_libraries(slidescape PRIVATE slidescape_nongui slidescape_jpeg slidescape_tls)
 if (WIN32)
-    target_link_libraries(slidescape_console slidescape_tls)
+    target_link_libraries(slidescape_console PRIVATE slidescape_nongui slidescape_jpeg slidescape_tls)
 endif()
 target_compile_definitions(slidescape PRIVATE IS_SERVER=0)
 
@@ -761,6 +791,7 @@ if (BUILD_SLIDESCAPE_ARCHIVE)
             )
     target_compile_definitions(slidescape_archive PRIVATE IS_SERVER=1)
     target_link_libraries(slidescape_archive PRIVATE slidescape_archive_core slidescape_nongui slidescape_jpeg)
+    slidescape_enable_process_allocator(slidescape_archive)
     if (WIN32)
         target_link_libraries(slidescape_archive PRIVATE ws2_32 winmm)
     endif()
@@ -775,6 +806,7 @@ add_executable(dicom_dict_gen
         src/third_party/lz4.c
         )
 target_compile_definitions(dicom_dict_gen PRIVATE IS_SERVER=1)
+slidescape_enable_process_allocator(dicom_dict_gen)
 
 include(CTest)
 

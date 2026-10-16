@@ -17,6 +17,7 @@
 */
 
 #include "tile_loader.h"
+#include "tile_buffer_pool.h"
 
 #include "dicom_wsi.h"
 #include "mrxs.h"
@@ -196,6 +197,23 @@ static void tile_loader_get_tile_xy(image_t* image, i32 level, i32 tile_index, i
 
 static void tile_loader_post_stale_result(load_tile_task_t* task) {
 	if (!tile_cache_post_stale_result(task->image, task->resource_id, task->level, task->tile_index)) {
+		tile_cache_cancel_decode(task->image, task->level, task->tile_index);
+	}
+}
+
+static void tile_loader_post_failed_result(load_tile_task_t* task) {
+	level_image_t* level_image = task->image->level_images + task->level;
+	tile_cache_result_t result = {
+		.resource_id = task->resource_id,
+		.level = task->level,
+		.tile_index = task->tile_index,
+		.tile_width = level_image->tile_width,
+		.tile_height = level_image->tile_height,
+		.want_gpu_residency = task->need_gpu_residency,
+		.want_cpu_residency = task->need_cpu_residency,
+		.failed = true,
+	};
+	if (!tile_cache_post_load_result(task->image, &result)) {
 		tile_cache_cancel_decode(task->image, task->level, task->tile_index);
 	}
 }
@@ -407,11 +425,18 @@ void load_tile_func(i32 logical_thread_index, void* userdata) {
 	float tile_y_excess = tile_world_pos_y_end - image->height_in_um;
 
 	size_t pixel_memory_size = level_image->tile_width * level_image->tile_height * BYTES_PER_PIXEL;
-	u8* temp_memory = (u8*)malloc(pixel_memory_size);
-
 	u32 image_background_color = image->is_background_black ? 0 : 0xFFFFFFFF;
 	u8 image_background_byte = image->is_background_black ? 0 : 0xFF;
-	memset(temp_memory, image_background_byte, pixel_memory_size);
+	u8* temp_memory = NULL;
+	if (image->backend == IMAGE_BACKEND_OPENSLIDE) {
+		temp_memory = tile_buffer_acquire(pixel_memory_size);
+		if (!temp_memory) {
+			tile_loader_post_failed_result(task);
+			atomic_subtract(&image->refcount, task->refcount_to_decrement);
+			return;
+		}
+		memset(temp_memory, image_background_byte, pixel_memory_size);
+	}
 
 	bool failed = false;
 	bool is_empty = false; // we might 'discover' that the tile is empty for OpenSlide backend
@@ -421,7 +446,7 @@ void load_tile_func(i32 logical_thread_index, void* userdata) {
 		tiff_ifd_t* level_ifd = tiff->level_images_ifd + level_image->pyramid_image_index;
 		u8* pixels = tiff_decode_tile(logical_thread_index, tiff, level_ifd, tile_index, level, tile_x, tile_y);
 		if (pixels) {
-			free(temp_memory);
+			tile_buffer_release(temp_memory, pixel_memory_size);
 			temp_memory = pixels;
 		} else {
 			failed = true;
@@ -430,13 +455,13 @@ void load_tile_func(i32 logical_thread_index, void* userdata) {
 		// Trim the tile if it extends beyond the image size.
 		i32 new_tile_height = level_image->tile_height;
 		i32 pitch = level_image->tile_width * BYTES_PER_PIXEL;
-		if (tile_y_excess > 0) {
+		if (temp_memory && tile_y_excess > 0) {
 			i32 excess_rows = (int)((tile_y_excess / level_image->y_tile_side_in_um) * level_image->tile_height);
 			ASSERT(excess_rows >= 0);
 			new_tile_height = level_image->tile_height - excess_rows;
 			memset(temp_memory + (new_tile_height * pitch), image_background_byte, excess_rows * pitch);
 		}
-		if (tile_x_excess > 0) {
+		if (temp_memory && tile_x_excess > 0) {
 			i32 excess_pixels = (int)((tile_x_excess / level_image->x_tile_side_in_um) * level_image->tile_width);
 			ASSERT(excess_pixels >= 0);
 			i32 new_tile_width = level_image->tile_width - excess_pixels;
@@ -469,7 +494,7 @@ void load_tile_func(i32 logical_thread_index, void* userdata) {
 	} else if (image->backend == IMAGE_BACKEND_DICOM) {
 		u8* pixels = dicom_wsi_decode_tile_to_bgra(&image->dicom, level_image->pyramid_image_index, tile_index);
 		if (pixels) {
-			free(temp_memory);
+			tile_buffer_release(temp_memory, pixel_memory_size);
 			temp_memory = pixels;
 		} else {
 			failed = true;
@@ -477,7 +502,7 @@ void load_tile_func(i32 logical_thread_index, void* userdata) {
 	} else if (image->backend == IMAGE_BACKEND_MRXS) {
 		u8* pixels = mrxs_decode_tile_to_bgra(&image->mrxs, level, tile_index);
 		if (pixels) {
-			free(temp_memory);
+			tile_buffer_release(temp_memory, pixel_memory_size);
 			temp_memory = pixels;
 		} else {
 			failed = true;
@@ -488,7 +513,7 @@ void load_tile_func(i32 logical_thread_index, void* userdata) {
 		failed = true;
 	}
 
-	if (task->invert_colors) {
+	if (temp_memory && task->invert_colors) {
 		u32 pixel_count = level_image->tile_width * level_image->tile_height;
 		u8* pos = temp_memory;
 		for (u32 j = 0; j < pixel_count; ++j) {
@@ -500,7 +525,7 @@ void load_tile_func(i32 logical_thread_index, void* userdata) {
 	}
 
 	if (failed && temp_memory != NULL) {
-		free(temp_memory);
+		tile_buffer_release(temp_memory, pixel_memory_size);
 		temp_memory = NULL;
 	}
 
@@ -518,7 +543,7 @@ void load_tile_func(i32 logical_thread_index, void* userdata) {
 
 	if (!tile_cache_post_load_result(image, &completion_task)) {
 		if (completion_task.pixel_memory) {
-			free(completion_task.pixel_memory);
+			tile_buffer_release(completion_task.pixel_memory, pixel_memory_size);
 		}
 	}
 

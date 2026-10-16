@@ -20,6 +20,7 @@
 
 #include "dicomweb_client.h"
 #include "mathutils.h"
+#include "tile_buffer_pool.h"
 #include "tile_loader.h"
 
 typedef enum tile_cache_completion_event_kind_t {
@@ -71,6 +72,12 @@ struct tile_cache_t {
 	tile_cache_policy_t policy;
 	tile_cache_tile_t* level_tiles[IMAGE_PYRAMID_MAX_LEVELS];
 };
+
+static size_t tile_cache_pixel_size(image_t* image, i32 level) {
+	if (!image || level < 0 || level >= image->level_count) return 0;
+	level_image_t* level_image = image->level_images + level;
+	return (size_t)level_image->tile_width * level_image->tile_height * BYTES_PER_PIXEL;
+}
 
 static int tile_cache_priority_compare(const void* a, const void* b) {
 	return ((load_tile_task_t*)b)->priority - ((load_tile_task_t*)a)->priority;
@@ -379,7 +386,8 @@ void tile_cache_destroy(tile_cache_t* cache) {
 		tile_cache_result_t task = {0};
 		while (tile_cache_poll_load_result(cache->image, &task)) {
 			if (task.pixel_memory) {
-				free(task.pixel_memory);
+				tile_buffer_release(task.pixel_memory,
+				                    (size_t)task.tile_width * task.tile_height * BYTES_PER_PIXEL);
 			}
 		}
 	}
@@ -392,7 +400,8 @@ void tile_cache_destroy(tile_cache_t* cache) {
 			for (i32 tile_index = 0; tile_index < tile_count; ++tile_index) {
 				tile_cache_tile_t* tile = tiles + tile_index;
 				if (tile->pixels) {
-					free(tile->pixels);
+					tile_buffer_release(tile->pixels,
+					                    tile_cache_pixel_size(cache->image, level));
 					tile->pixels = NULL;
 				}
 			}
@@ -623,7 +632,7 @@ void tile_cache_unpin_cpu_tile(image_t* image, i32 level, i32 tile_index, u32 de
 		pixels_to_free = tile_cache_detach_unpinned_cpu_pixels_locked(tile);
 	}
 	platform_mutex_unlock(&cache->lock);
-	free(pixels_to_free);
+	tile_buffer_release(pixels_to_free, tile_cache_pixel_size(image, level));
 }
 
 bool tile_cache_tile_has_cpu_pixels(image_t* image, i32 level, i32 tile_index) {
@@ -761,7 +770,7 @@ void tile_cache_cancel_upload(image_t* image, i32 level, i32 tile_index) {
 	tile_cache_unmark_viewer_inflight_locked(cache, tile);
 	pixels_to_free = tile_cache_release_upload_cpu_pin_locked(tile, true);
 	platform_mutex_unlock(&cache->lock);
-	free(pixels_to_free);
+	tile_buffer_release(pixels_to_free, tile_cache_pixel_size(image, level));
 }
 
 void tile_cache_release_upload_cpu_pin(image_t* image, i32 level, i32 tile_index) {
@@ -773,7 +782,7 @@ void tile_cache_release_upload_cpu_pin(image_t* image, i32 level, i32 tile_index
 	tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, level, tile_index);
 	u8* pixels_to_free = tile_cache_release_upload_cpu_pin_locked(tile, true);
 	platform_mutex_unlock(&cache->lock);
-	free(pixels_to_free);
+	tile_buffer_release(pixels_to_free, tile_cache_pixel_size(image, level));
 }
 
 renderer_texture_handle_t tile_cache_get_gpu_texture(image_t* image, i32 level, i32 tile_index) {
@@ -855,19 +864,19 @@ void tile_cache_store_cpu_pixels(image_t* image, i32 level, i32 tile_index, u8* 
 	}
 	tile_cache_t* cache = image ? image->tile_cache : NULL;
 	if (!cache) {
-		free(pixels);
+		tile_buffer_release(pixels, tile_cache_pixel_size(image, level));
 		return;
 	}
 	platform_mutex_lock(&cache->lock);
 	tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, level, tile_index);
 	if (!tile) {
 		platform_mutex_unlock(&cache->lock);
-		free(pixels);
+		tile_buffer_release(pixels, tile_cache_pixel_size(image, level));
 		return;
 	}
 	if (tile->pixels && tile->pixels != pixels) {
 		platform_mutex_unlock(&cache->lock);
-		free(pixels);
+		tile_buffer_release(pixels, tile_cache_pixel_size(image, level));
 		return;
 	}
 	tile->pixels = pixels;
@@ -885,7 +894,7 @@ void tile_cache_release_cpu_pixels_if_unpinned(image_t* image, i32 level, i32 ti
 	tile_cache_tile_t* tile = tile_cache_get_tile_locked(cache, level, tile_index);
 	u8* pixels_to_free = tile_cache_detach_unpinned_cpu_pixels_locked(tile);
 	platform_mutex_unlock(&cache->lock);
-	free(pixels_to_free);
+	tile_buffer_release(pixels_to_free, tile_cache_pixel_size(image, level));
 }
 
 bool tile_cache_task_is_stale(image_t* image, i32 level, i32 tile_index, i32 generation) {

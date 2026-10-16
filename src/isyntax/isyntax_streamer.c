@@ -28,6 +28,7 @@
 #include "common.h"
 #include "isyntax.h"
 #include "intrinsics.h"
+#include "tile_buffer_pool.h"
 
 #define ISYNTAX_STREAMER_IMPL
 #include "isyntax_streamer.h"
@@ -47,7 +48,9 @@ static void submit_tile_completed(isyntax_streamer_t* streamer, void* tile_pixel
 	//	console_print("[thread %d] Loaded tile: level=%d tile_x=%d tile_y=%d\n", logical_thread_index, level, tile_x, tile_y);
 	if (!completion_queue_post(streamer->tile_completion_queue, streamer->tile_completed_event_kind,
                            &completion_task, sizeof(completion_task))) {
-		ASSERT(!"tile cannot be submitted and will leak");
+		tile_buffer_release((u8*)tile_pixels,
+		                    (size_t)tile_width * tile_height * sizeof(u32));
+		ASSERT(!"tile cannot be submitted");
 	}
 
 }
@@ -66,7 +69,9 @@ static i32 isyntax_load_all_tiles_in_level(isyntax_streamer_t* streamer, i32 sca
 			if (allow_load_tile_on_worker_threads && thread_pool_get_idle_worker_thread_count(isyntax->work_submission_pool) > 0 && tasks_waiting < global_system_info.logical_cpu_count * 10) {
 				isyntax_begin_load_tile(streamer, scale, tile_x, tile_y);
 			} else if (!is_tile_streamer_frame_boundary_passed) {
-                u32* tile_pixels = (u32*)malloc(isyntax->tile_width * isyntax->tile_height * sizeof(u32));
+				size_t tile_size = (size_t)isyntax->tile_width * isyntax->tile_height * sizeof(u32);
+				u32* tile_pixels = (u32*)tile_buffer_acquire(tile_size);
+				if (!tile_pixels) continue;
 				isyntax_load_tile(isyntax, wsi, scale, tile_x, tile_y, isyntax->ll_coeff_block_allocator, tile_pixels, streamer->pixel_format);
 				if (tile_pixels) {
 					submit_tile_completed(streamer, tile_pixels, scale, tile_index, isyntax->tile_width, isyntax->tile_height);
@@ -338,7 +343,12 @@ typedef struct isyntax_load_tile_task_t {
 void isyntax_load_tile_task_func(i32 logical_thread_index, void* userdata) {
 	isyntax_load_tile_task_t* task = (isyntax_load_tile_task_t*) userdata;
     isyntax_t* isyntax = task->streamer.isyntax;
-	u32* tile_pixels = (u32*)malloc(isyntax->tile_width * isyntax->tile_height * sizeof(u32));
+	size_t tile_size = (size_t)isyntax->tile_width * isyntax->tile_height * sizeof(u32);
+	u32* tile_pixels = (u32*)tile_buffer_acquire(tile_size);
+	if (!tile_pixels) {
+		atomic_decrement(&task->streamer.isyntax->refcount);
+		return;
+	}
     isyntax_load_tile(task->streamer.isyntax, task->streamer.wsi,
                       task->scale, task->tile_x, task->tile_y,
                       task->streamer.isyntax->ll_coeff_block_allocator,

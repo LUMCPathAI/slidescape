@@ -19,6 +19,7 @@
 #include "common.h"
 #include "dicom.h"
 #include "dicom_wsi.h"
+#include "tile_buffer_pool.h"
 
 #include "jpeg_decoder.h"
 #include "jpeg2000_decoder.h"
@@ -753,7 +754,8 @@ static u8* dicom_wsi_decode_native_tile_to_bgra(dicom_instance_t* instance, cons
 		return NULL;
 	}
 
-	u8* result = malloc(pixel_count * 4);
+	size_t result_size = pixel_count * 4;
+	u8* result = tile_buffer_acquire(result_size);
 	if (!result) return NULL;
 
 	if (instance->photometric_interpretation == DICOM_PHOTOMETRIC_INTERPRETATION_RGB &&
@@ -773,7 +775,7 @@ static u8* dicom_wsi_decode_native_tile_to_bgra(dicom_instance_t* instance, cons
 			} else {
 				console_print_error("DICOM tile decode: invalid Planar Configuration (%u)\n",
 				                    instance->planar_configuration);
-				free(result);
+				tile_buffer_release(result, result_size);
 				return NULL;
 			}
 			result[i * 4 + 0] = data[b_offset];
@@ -791,7 +793,7 @@ static u8* dicom_wsi_decode_native_tile_to_bgra(dicom_instance_t* instance, cons
 		}
 	} else {
 		console_print_error("DICOM tile decode: unsupported native Photometric Interpretation/sample count\n");
-		free(result);
+		tile_buffer_release(result, result_size);
 		return NULL;
 	}
 

@@ -19,6 +19,7 @@
 #include "common.h"
 #include "viewer.h"
 #include "renderer.h"
+#include "tile_buffer_pool.h"
 #include "renderer_opengl_shader.h"
 #include "tile_cache.h"
 
@@ -226,7 +227,7 @@ void renderer_upload_tile_on_worker_thread(image_t* image, void* tile_pixels, i3
 
 //write data into the mapped buffer, possibly in another thread.
 	memcpy(mapped_buffer, tile_pixels, pixel_memory_size);
-	free(tile_pixels);
+	tile_buffer_release((u8*)tile_pixels, pixel_memory_size);
 
 // after reading is complete back on the main thread
 	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, threadlocal_thread_memory->pbo);
@@ -264,7 +265,8 @@ void renderer_upload_tile_on_worker_thread(image_t* image, void* tile_pixels, i3
 	//	console_print("[thread %d] Loaded tile: level=%d tile_x=%d tile_y=%d\n", logical_thread_index, level, tile_x, tile_y);
 	if (!tile_cache_post_load_result(image, &completion_task)) {
 		if (completion_task.pixel_memory) {
-			free(completion_task.pixel_memory);
+			tile_buffer_release(completion_task.pixel_memory,
+			                    (size_t)tile_width * tile_height * BYTES_PER_PIXEL);
 		}
 	}
 #endif

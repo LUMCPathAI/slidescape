@@ -195,8 +195,7 @@
 #  endif  /* _MSC_VER */
 #endif /* LZ4_FORCE_INLINE */
 
-// Wrappers for using libc versions of malloc(), realloc() and free(), if you really need to.
-// You can use these if you replaced regular malloc with ltalloc (see below).
+// Explicit names for ownership boundaries that return memory allocated by the C runtime.
 FORCE_INLINE void* libc_malloc(size_t size) {
 	return malloc(size);
 }

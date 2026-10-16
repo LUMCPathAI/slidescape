@@ -22,6 +22,7 @@
 #include "lz4.h"
 
 #include "tiff.h"
+#include "tile_buffer_pool.h"
 #include "tif_lzw.h"
 #include "remote.h"
 #include "jpeg_decoder.h"
@@ -1608,7 +1609,7 @@ u8* tiff_decode_tile(i32 logical_thread_index, tiff_t* tiff, tiff_ifd_t* level_i
 //		console_print_verbose("[thread %d] loading tile: level %d, tile %d (%d, %d)\n", logical_thread_index, level, tile_index, tile_x, tile_y);
 
 		size_t pixel_memory_size = level_ifd->tile_width * level_ifd->tile_height * BYTES_PER_PIXEL;
-		u8* pixel_memory = (u8*)malloc(pixel_memory_size);
+		u8* pixel_memory = tile_buffer_acquire(pixel_memory_size);
 		u8* decompressed = NULL; // allocated later if needed
 
 		// Take into account either tiled or multi-strip TIFF files
@@ -1901,7 +1902,7 @@ u8* tiff_decode_tile(i32 logical_thread_index, tiff_t* tiff, tiff_ifd_t* level_i
 		if (false) { decompression_failed:
 			// We'll return NULL in case of failure
 			if (pixel_memory) {
-				free(pixel_memory);
+				tile_buffer_release(pixel_memory, pixel_memory_size);
 				pixel_memory = NULL;
 			}
 		}

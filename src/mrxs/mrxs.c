@@ -19,6 +19,7 @@
 #include "common.h"
 #include "platform.h"
 #include "mrxs.h"
+#include "tile_buffer_pool.h"
 #include "stringutils.h"
 #include "listing.h"
 #include "image_loader.h"
@@ -1325,7 +1326,8 @@ static u8* mrxs_decode_aligned_overlap_tile_to_bgra(mrxs_t* mrxs, i32 level, i32
         return NULL;
     }
 
-    u8* result = malloc(mrxs_level->tile_width * mrxs_level->tile_height * 4);
+    size_t result_size = (size_t)mrxs_level->tile_width * mrxs_level->tile_height * 4;
+    u8* result = tile_buffer_acquire(result_size);
     if (!result) {
         return NULL;
     }
@@ -1341,7 +1343,7 @@ static u8* mrxs_decode_aligned_overlap_tile_to_bgra(mrxs_t* mrxs, i32 level, i32
     float out_bottom = out_global_y + (float)mrxs_level->tile_height;
     i32 divisions_at_level = mrxs->camera_image_divisions_per_slide >> level;
     if (divisions_at_level <= 0) {
-        free(result);
+        tile_buffer_release(result, result_size);
         return NULL;
     }
 
@@ -1404,7 +1406,8 @@ static u8* mrxs_decode_fractional_overlap_tile_to_bgra(mrxs_t* mrxs, i32 level, 
         return NULL;
     }
 
-    u8* result = malloc(mrxs_level->tile_width * mrxs_level->tile_height * 4);
+    size_t result_size = (size_t)mrxs_level->tile_width * mrxs_level->tile_height * 4;
+    u8* result = tile_buffer_acquire(result_size);
     if (!result) {
         return NULL;
     }

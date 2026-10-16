@@ -57,6 +57,7 @@
 #include "image_registration.h"
 #include "renderer.h"
 #include "tile_cache.h"
+#include "tile_buffer_pool.h"
 #include "profiler.h"
 
 
@@ -297,9 +298,11 @@ image_t* get_image_from_resource_id(app_state_t* app_state, i32 resource_id) {
 }
 
 static bool viewer_process_loaded_tile(app_state_t* app_state, image_t* image, tile_cache_result_t* task) {
+	size_t pixel_memory_size = task ?
+			(size_t)task->tile_width * task->tile_height * BYTES_PER_PIXEL : 0;
 	bool submitted_texture_upload = false;
 	if (!image || !task) {
-		if (task && task->pixel_memory) free(task->pixel_memory);
+		if (task && task->pixel_memory) tile_buffer_release(task->pixel_memory, pixel_memory_size);
 		return false;
 	}
 
@@ -309,7 +312,7 @@ static bool viewer_process_loaded_tile(app_state_t* app_state, image_t* image, t
 	 * completion is the boundary where it joins cache-backed texture storage.
 	 */
 	if (!tile_cache_get_or_create(image)) {
-		free(task->pixel_memory);
+		tile_buffer_release(task->pixel_memory, pixel_memory_size);
 		return false;
 	}
 
@@ -352,10 +355,10 @@ static bool viewer_process_loaded_tile(app_state_t* app_state, image_t* image, t
 			tile_cache_release_upload_cpu_pin(image, task->level, task->tile_index);
 		}
 		if (action.free_upload_pixels) {
-			free(action.upload_pixels);
+			tile_buffer_release(action.upload_pixels, pixel_memory_size);
 		}
 	}
-	free(action.pixels_to_free);
+	tile_buffer_release(action.pixels_to_free, pixel_memory_size);
 	return submitted_texture_upload;
 }
 

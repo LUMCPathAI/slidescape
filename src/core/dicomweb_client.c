@@ -15,6 +15,7 @@
 #include "remote.h"
 #include "stringutils.h"
 #include "tile_cache.h"
+#include "tile_buffer_pool.h"
 #include "tile_loader.h"
 #include "viewer.h"
 
@@ -1511,7 +1512,9 @@ static void post_dicomweb_tile_result(image_t* image, const load_tile_task_t* ta
 	result.want_cpu_residency = task->need_cpu_residency;
 	result.failed = frame_number != 0 && pixels == NULL;
 	result.is_empty = frame_number == 0;
-	if (!tile_cache_post_load_result(image, &result) && pixels) free(pixels);
+	if (!tile_cache_post_load_result(image, &result) && pixels) {
+		tile_buffer_release(pixels, (size_t)level->tile_width * level->tile_height * BYTES_PER_PIXEL);
+	}
 }
 
 void dicomweb_load_tile_batch_func(i32 logical_thread_index, void* userdata) {
