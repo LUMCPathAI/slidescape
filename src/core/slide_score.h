@@ -134,6 +134,10 @@ typedef struct slide_score_get_tile_server_result_t {
     char expires_on[256];
 } slide_score_get_tile_server_result_t;
 
+typedef struct slide_score_get_slide_details_result_t {
+	i32 rotation_degrees_clockwise;
+} slide_score_get_slide_details_result_t;
+
 typedef struct slide_score_api_result_t {
     slide_score_api_enum api;
     bool success;
@@ -141,6 +145,7 @@ typedef struct slide_score_api_result_t {
         void* result_generic;
         slide_score_get_image_metadata_result_t get_image_metadata;
         slide_score_get_tile_server_result_t get_tile_server;
+		slide_score_get_slide_details_result_t get_slide_details;
     };
 } slide_score_api_result_t;
 
@@ -149,9 +154,22 @@ typedef struct slide_score_client_t {
     char api_key[4096];
 } slide_score_client_t;
 
+typedef struct slide_score_slide_ref_t {
+	i32 image_id;
+	char name[256];
+} slide_score_slide_ref_t;
+
 typedef struct slide_score_remote_image_t {
     slide_score_client_t client;
     i32 image_id;
+	i32 study_id;
+	i32 case_id;
+	i32 selected_slide_index;
+	i32 rotation_degrees_clockwise;
+	/* Owned by the remote image; ownership transfers into image_t during initialization. */
+	slide_score_slide_ref_t* case_slides;
+	i32 case_slide_count;
+	char case_name[256];
     i32 max_deepzoom_level;
     bool use_qupath_tile_endpoint;
     char qupath_base_path[512];
@@ -188,6 +206,7 @@ slide_score_api_result_t debug_slide_score_api_handle_response(const char* json,
 bool slide_score_request_api(slide_score_client_t* ss, slide_score_api_enum api, const char** par_names, const char** par_values, i32 par_count, slide_score_api_result_t* out_result);
 bool slide_score_refresh_tile_server(slide_score_remote_image_t* remote);
 bool slide_score_open_remote_image(app_state_t* app_state, const char* server_url_or_hostname, const char* api_token, i32 image_id);
+bool slide_score_open_case_slide(app_state_t* app_state, image_t* current_image, i32 slide_index);
 bool slide_score_open_qupath_metadata_url(app_state_t* app_state, const char* uri);
 bool slide_score_uri_is_supported(const char* uri);
 bool slide_score_try_open_uri(app_state_t* app_state, const char* uri, const char* api_token);
@@ -195,6 +214,10 @@ bool slide_score_last_open_succeeded(void);
 slide_score_failure_kind_t slide_score_get_last_failure_kind(void);
 slide_score_failure_kind_t slide_score_classify_http_failure(i32 status_code);
 bool slide_score_failure_requires_api_token(slide_score_failure_kind_t failure_kind);
+bool slide_score_parse_case_images(const char* json, size_t json_length, i32 case_id,
+		slide_score_slide_ref_t** out_slides, i32* out_slide_count,
+		char* out_case_name, size_t out_case_name_size);
+void slide_score_remote_image_destroy(slide_score_remote_image_t* remote);
 bool init_image_from_slide_score(image_t* image, slide_score_remote_image_t* remote, bool is_overlay);
 char* slide_score_build_tile_url(char* buffer, size_t buffer_size, slide_score_remote_image_t* remote, i32 level, i32 tile_x, i32 tile_y);
 char* slide_score_build_qupath_tile_path(char* buffer, size_t buffer_size, slide_score_remote_image_t* remote, i32 level, i32 tile_x, i32 tile_y, i32 tile_width, i32 tile_height, i64 level_width, i64 level_height);

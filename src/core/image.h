@@ -172,6 +172,7 @@ typedef struct image_t {
     bool is_deleted; // TODO: prevent delay due to refcount > 0 when closing WSI (garbage collect off the main thread)
     bool is_enabled;
     bool is_overlay;
+	float initial_rotation;
     bool is_background_black; // if false: background = white (for brightfield)
     union {
         simple_image_t simple;

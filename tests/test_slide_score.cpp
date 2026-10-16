@@ -9,6 +9,7 @@
 
 extern "C" {
 i32 global_next_resource_id = 1000;
+bool show_slide_tray_window;
 
 http_response_t* open_remote_uri_with_extra_headers_and_options(
 		const char* uri, const char* api_token, const char* cookie_header,
@@ -49,6 +50,40 @@ TEST_CASE("Slide Score only requests an API token for credential failures") {
 	CHECK_FALSE(slide_score_failure_requires_api_token(SLIDE_SCORE_FAILURE_TRANSPORT));
 	CHECK_FALSE(slide_score_failure_requires_api_token(SLIDE_SCORE_FAILURE_HTTP));
 	CHECK_FALSE(slide_score_failure_requires_api_token(SLIDE_SCORE_FAILURE_INVALID_RESPONSE));
+}
+
+TEST_CASE("Slide Score case parser sorts slides by name") {
+	const char* json =
+		"[{\"id\":566,\"name\":\"Previous\",\"images\":[]},"
+		"{\"name\":\"01\",\"images\":["
+		"{\"name\":\"01-B\",\"id\":6541},"
+		"{\"id\":6562,\"name\":\"01-A\"}],\"id\":567}]";
+	slide_score_slide_ref_t* slides = nullptr;
+	i32 slide_count = 0;
+	char case_name[256] = {};
+	REQUIRE(slide_score_parse_case_images(json, strlen(json), 567,
+	                                      &slides, &slide_count,
+	                                      case_name, sizeof(case_name)));
+	REQUIRE(slides != nullptr);
+	CHECK(slide_count == 2);
+	CHECK(strcmp(case_name, "01") == 0);
+	CHECK(slides[0].image_id == 6562);
+	CHECK(strcmp(slides[0].name, "01-A") == 0);
+	CHECK(slides[1].image_id == 6541);
+	CHECK(strcmp(slides[1].name, "01-B") == 0);
+	free(slides);
+}
+
+TEST_CASE("Slide Score slide-details parser extracts configured rotation") {
+	const char* json =
+		"{\"success\":true,\"name\":\"01-B\",\"rotate\":90,"
+		"\"width\":34314,\"height\":16886}";
+
+	slide_score_api_result_t result = debug_slide_score_api_handle_response(
+		json, strlen(json), SLIDE_SCORE_API_GET_SLIDE_DETAILS);
+
+	CHECK(result.success);
+	CHECK(result.get_slide_details.rotation_degrees_clockwise == 90);
 }
 
 TEST_CASE("Slide Score metadata parser handles nested metadata and arrays") {
@@ -160,5 +195,17 @@ TEST_CASE("Slide Score URI parser recognizes QuPath metadata with custom scheme"
 	bool got_expected_status = strstr(slide_score_get_last_status(), "QuPath metadata") != NULL;
 	CHECK(recognized);
 	CHECK(got_expected_status);
+	CHECK_FALSE(slide_score_last_open_succeeded());
+}
+
+TEST_CASE("Slide Score URI parser recognizes case-only details links") {
+	app_state_t app_state = {};
+	bool recognized = slide_score_try_open_uri(
+		&app_state,
+		"https://clidipa.slidescore.com/Image/Details?caseId=567&studyId=41",
+		"secret");
+	CHECK(recognized);
+	CHECK(slide_score_get_last_failure_kind() == SLIDE_SCORE_FAILURE_TRANSPORT);
+	CHECK(strstr(slide_score_get_last_status(), "Cases request failed") != nullptr);
 	CHECK_FALSE(slide_score_last_open_succeeded());
 }

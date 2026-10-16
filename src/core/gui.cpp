@@ -531,6 +531,7 @@ static void gui_draw_dicomweb_archive_window(app_state_t* app_state) {
 static i32 gui_get_slide_tray_slide_count(const image_t* image) {
 	if (image->backend == IMAGE_BACKEND_DICOM) return arrlen(image->dicom.slides);
 	if (image->backend == IMAGE_BACKEND_DICOMWEB) return image->dicomweb.available_series_count;
+	if (image->backend == IMAGE_BACKEND_SLIDE_SCORE) return image->slide_score.case_slide_count;
 	if (image->backend == IMAGE_BACKEND_SSI) return image->ssi.folder_slide_count;
 	return 0;
 }
@@ -538,6 +539,7 @@ static i32 gui_get_slide_tray_slide_count(const image_t* image) {
 static i32 gui_get_slide_tray_selected_index(const image_t* image) {
 	if (image->backend == IMAGE_BACKEND_DICOM) return image->dicom.selected_slide_index;
 	if (image->backend == IMAGE_BACKEND_DICOMWEB) return image->dicomweb.selected_series_index;
+	if (image->backend == IMAGE_BACKEND_SLIDE_SCORE) return image->slide_score.selected_slide_index;
 	if (image->backend == IMAGE_BACKEND_SSI) {
 		for (i32 i = 0; i < image->ssi.folder_slide_count; ++i) {
 			if (strcmp(image->ssi.folder_slides[i].id, image->ssi.slide_guid) == 0) return i;
@@ -557,6 +559,23 @@ static void gui_open_slide_tray_slide(app_state_t* app_state, image_t* image, i3
 		                               FILETYPE_HINT_BASE_IMAGE);
 	} else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
 		dicomweb_open_related_series(app_state, image, slide_index);
+	} else if (image->backend == IMAGE_BACKEND_SLIDE_SCORE) {
+		slide_score_slide_ref_t selected = image->slide_score.case_slides[slide_index];
+		char retry_uri[1024];
+		snprintf(retry_uri, sizeof(retry_uri),
+		         "https://%s/Image/Details?imageId=%d&studyId=%d&caseId=%d",
+		         image->slide_score.client.server_name, selected.image_id,
+		         image->slide_score.study_id, image->slide_score.case_id);
+		if (!slide_score_open_case_slide(app_state, image, slide_index)) {
+			copy_cstring(open_uri_slide_score_retry_uri, retry_uri,
+			             sizeof(open_uri_slide_score_retry_uri));
+			copy_cstring(remote_uri, retry_uri, sizeof(remote_uri));
+			copy_cstring(open_uri_status, slide_score_get_last_status(),
+			             sizeof(open_uri_status));
+			show_open_uri_window = true;
+			open_uri_show_api_token_modal = slide_score_failure_requires_api_token(
+				slide_score_get_last_failure_kind());
+		}
 	} else if (image->backend == IMAGE_BACKEND_SSI) {
 		ssi_slide_ref_t* slide = image->ssi.folder_slides + slide_index;
 		ssi_uri_config_t retry_config = {0};
@@ -601,6 +620,7 @@ static void draw_slide_tray_window(app_state_t* app_state) {
 	image_t* image = app_state->loaded_images[0];
 	bool is_local_dicom = image->backend == IMAGE_BACKEND_DICOM;
 	bool is_dicomweb = image->backend == IMAGE_BACKEND_DICOMWEB;
+	bool is_slide_score = image->backend == IMAGE_BACKEND_SLIDE_SCORE;
 	bool is_ssi = image->backend == IMAGE_BACKEND_SSI;
 	i32 slide_count = gui_get_slide_tray_slide_count(image);
 	if (slide_count <= 1) {
@@ -608,9 +628,17 @@ static void draw_slide_tray_window(app_state_t* app_state) {
 		return;
 	}
 
+	ImGuiStyle& style = ImGui::GetStyle();
+	float minimum_width = ImGui::CalcTextSize("Slide tray").x +
+	                      3.0f * ImGui::GetFrameHeight() +
+	                      2.0f * style.WindowPadding.x;
 	ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSizeConstraints(ImVec2(minimum_width, 0.0f),
+	                                    ImVec2(FLT_MAX, FLT_MAX));
 	if (ImGui::Begin("Slide tray", &show_slide_tray_window, ImGuiWindowFlags_AlwaysAutoResize)) {
-		if (is_ssi && image->ssi.folder_slides_compact) {
+		if (is_slide_score && image->slide_score.case_name[0]) {
+			ImGui::Text("Case %s", image->slide_score.case_name);
+		} else if (is_ssi && image->ssi.folder_slides_compact) {
 			ImGui::TextUnformatted(image->ssi.folder_name);
 		} else {
 			ImGui::TextUnformatted("Select a slide:");
@@ -621,9 +649,12 @@ static void draw_slide_tray_window(app_state_t* app_state) {
 			dicomweb_series_ref_t* remote_series =
 				is_dicomweb ? image->dicomweb.available_series + i : NULL;
 			ssi_slide_ref_t* ssi_slide = is_ssi ? image->ssi.folder_slides + i : NULL;
+			slide_score_slide_ref_t* slide_score_slide =
+				is_slide_score ? image->slide_score.case_slides + i : NULL;
 			char remote_label[256];
 			char local_label[640];
 			char ssi_label[640];
+			char slide_score_label[320];
 			const char* label = NULL;
 			if (is_local_dicom) {
 				const char* filename = one_past_last_slash(
@@ -645,6 +676,11 @@ static void draw_slide_tray_window(app_state_t* app_state) {
 				         strcmp(primary, remote_series->description) != 0
 				         ? remote_series->description : "", i);
 				label = remote_label;
+			} else if (is_slide_score) {
+				snprintf(slide_score_label, sizeof(slide_score_label),
+				         "%s##slide_score_slide_%d",
+				         slide_score_slide->name[0] ? slide_score_slide->name : "Slide", i);
+				label = slide_score_label;
 			} else {
 				snprintf(ssi_label, sizeof(ssi_label), "%s##ssi_slide_%d",
 				         image->ssi.folder_slides_compact ? ssi_slide->compact_name
@@ -653,14 +689,17 @@ static void draw_slide_tray_window(app_state_t* app_state) {
 			}
 			bool selected = is_local_dicom ? i == image->dicom.selected_slide_index
 			                              : is_dicomweb ? i == image->dicomweb.selected_series_index
-			                                            : strcmp(ssi_slide->id,
-			                                                     image->ssi.slide_guid) == 0;
+			                              : is_slide_score ? i == image->slide_score.selected_slide_index
+			                                               : strcmp(ssi_slide->id,
+			                                                        image->ssi.slide_guid) == 0;
 			if (ImGui::Selectable(label, selected) && !selected) {
 				gui_open_slide_tray_slide(app_state, image, i);
 				break;
 			}
 			if (ImGui::IsItemHovered()) {
-				if (is_ssi) {
+				if (is_slide_score) {
+					ImGui::SetTooltip("Slide Score image ID: %d", slide_score_slide->image_id);
+				} else if (is_ssi) {
 					ImGui::BeginTooltip();
 					ImGui::Text("Name: %s", ssi_slide->name);
 					if (ssi_slide->barcode[0]) ImGui::Text("Barcode: %s", ssi_slide->barcode);
@@ -1235,6 +1274,8 @@ static void gui_draw_main_menu_bar(app_state_t* app_state) {
 			                          arrlen(app_state->loaded_images[0]->dicom.slides) > 1) ||
 			                         (app_state->loaded_images[0]->backend == IMAGE_BACKEND_DICOMWEB &&
 			                          app_state->loaded_images[0]->dicomweb.available_series_count > 1) ||
+			                         (app_state->loaded_images[0]->backend == IMAGE_BACKEND_SLIDE_SCORE &&
+			                          app_state->loaded_images[0]->slide_score.case_slide_count > 1) ||
 			                         (app_state->loaded_images[0]->backend == IMAGE_BACKEND_SSI &&
 			                          app_state->loaded_images[0]->ssi.folder_slide_count > 1));
 			if (ImGui::MenuItem("Slide tray...", NULL, &show_slide_tray_window,

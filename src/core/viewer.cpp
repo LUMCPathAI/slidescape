@@ -1217,8 +1217,14 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 
 	if (base_image->type == IMAGE_TYPE_WSI) {
 		if (scene->need_zoom_reset && client_width > 0 && client_height > 0) {
-			float times_larger_x = (float)base_image->width_in_pixels / (float)client_width;
-			float times_larger_y = (float)base_image->height_in_pixels / (float)client_height;
+			float abs_cos_rotation = fabsf(cosf(base_image->initial_rotation));
+			float abs_sin_rotation = fabsf(sinf(base_image->initial_rotation));
+			float rotated_width = abs_cos_rotation * (float)base_image->width_in_pixels +
+			                      abs_sin_rotation * (float)base_image->height_in_pixels;
+			float rotated_height = abs_sin_rotation * (float)base_image->width_in_pixels +
+			                       abs_cos_rotation * (float)base_image->height_in_pixels;
+			float times_larger_x = rotated_width / (float)client_width;
+			float times_larger_y = rotated_height / (float)client_height;
 			float times_larger = MAX(times_larger_x, times_larger_y);
 			float desired_zoom_pos = ceilf(log2f(times_larger * 1.1f));
 
@@ -1236,9 +1242,9 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 			init_zoom_state(&scene->zoom, desired_zoom_pos, 1.0f, base_image->mpp_x, base_image->mpp_y);
 			scene->camera.x = base_image->width_in_um / 2.0f;
 			scene->camera.y = base_image->height_in_um / 2.0f;
-			scene->rotation = 0.0f;
-			scene->sin_rotation = 0.0f;
-			scene->cos_rotation = 1.0f;
+			scene->rotation = base_image->initial_rotation;
+			scene->sin_rotation = sinf(scene->rotation);
+			scene->cos_rotation = cosf(scene->rotation);
 
 			scene->need_zoom_reset = false;
 		}

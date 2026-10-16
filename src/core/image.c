@@ -337,8 +337,14 @@ bool init_image_from_slide_score(image_t* image, slide_score_remote_image_t* rem
     image->type = IMAGE_TYPE_WSI;
     image->backend = IMAGE_BACKEND_SLIDE_SCORE;
     image->slide_score = *remote;
+	/* The installed image owns the case list used by the slide tray. */
+	remote->case_slides = NULL;
+	remote->case_slide_count = 0;
     image->is_local = false;
     image->is_freshly_loaded = true;
+	i32 rotation_degrees = remote->rotation_degrees_clockwise % 360;
+	if (rotation_degrees < 0) rotation_degrees += 360;
+	image->initial_rotation = (float)rotation_degrees * (PI_F / 180.0f);
     image->mpp_x = metadata->mpp_x;
     image->mpp_y = metadata->mpp_y;
     image->is_mpp_known = metadata->mpp_x > 0.0f && metadata->mpp_y > 0.0f;
@@ -1771,7 +1777,7 @@ void image_destroy(image_t* image) {
 			} else if (image->backend == IMAGE_BACKEND_MRXS) {
 				mrxs_destroy(&image->mrxs);
 			} else if (image->backend == IMAGE_BACKEND_SLIDE_SCORE) {
-				DUMMY_STATEMENT;
+				slide_score_remote_image_destroy(&image->slide_score);
 			} else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
 				dicomweb_remote_image_destroy(&image->dicomweb);
 			} else if (image->backend == IMAGE_BACKEND_SSI) {

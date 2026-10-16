@@ -25,6 +25,8 @@
 
 #include "json.h"
 
+extern bool show_slide_tray_window;
+
 static void* slide_score_json_alloc(void* user_data, size_t size) {
     (void)user_data;
     return malloc(size);
@@ -37,6 +39,15 @@ web_api_binding_t slide_score_api_get_tile_server_bindings_template[] = {
 };
 web_api_result_descriptor_t slide_score_api_get_tile_server_result_descriptor = {
         slide_score_api_get_tile_server_bindings_template, COUNT(slide_score_api_get_tile_server_bindings_template)
+};
+
+web_api_binding_t slide_score_api_get_slide_details_bindings_template[] = {
+	{"rotate", offsetof(slide_score_get_slide_details_result_t, rotation_degrees_clockwise), FIELD_TYPE_I32},
+	{"Rotate", offsetof(slide_score_get_slide_details_result_t, rotation_degrees_clockwise), FIELD_TYPE_I32},
+};
+web_api_result_descriptor_t slide_score_api_get_slide_details_descriptor = {
+	slide_score_api_get_slide_details_bindings_template,
+	COUNT(slide_score_api_get_slide_details_bindings_template)
 };
 
 web_api_binding_t slide_score_api_get_image_metadata_bindings_template[] = {
@@ -79,6 +90,7 @@ web_api_result_descriptor_t slide_score_api_get_image_metadata_descriptor = {
 
 
 static const web_api_result_descriptor_t* slide_score_api_result_descriptors[SLIDE_SCORE_API_LAST] = {
+		[SLIDE_SCORE_API_GET_SLIDE_DETAILS] = &slide_score_api_get_slide_details_descriptor,
         [SLIDE_SCORE_API_GET_IMAGE_METADATA] = &slide_score_api_get_image_metadata_descriptor,
         [SLIDE_SCORE_API_GET_TILE_SERVER] = &slide_score_api_get_tile_server_result_descriptor,
 };
@@ -308,6 +320,100 @@ static bool slide_score_json_value_is_true(struct json_value_s* value) {
     return value && value->type == json_type_true;
 }
 
+static struct json_value_s* slide_score_json_object_get(
+		struct json_object_s* object, const char* name) {
+	if (!object || !name) return NULL;
+	for (struct json_object_element_s* element = object->start;
+	     element; element = element->next) {
+		if (strcmp(element->name->string, name) == 0) return element->value;
+	}
+	return NULL;
+}
+
+static bool slide_score_json_i32(struct json_value_s* value, i32* out_value) {
+	const char* text = json_scalar_as_string(value);
+	if (!text || !out_value) return false;
+	char* end = NULL;
+	long parsed = strtol(text, &end, 10);
+	if (!end || *end != '\0' || parsed <= 0 || parsed > INT32_MAX) return false;
+	*out_value = (i32)parsed;
+	return true;
+}
+
+static int slide_score_compare_case_slides(const void* left, const void* right) {
+	const slide_score_slide_ref_t* a = (const slide_score_slide_ref_t*)left;
+	const slide_score_slide_ref_t* b = (const slide_score_slide_ref_t*)right;
+	if (a->name[0] != b->name[0]) return a->name[0] ? -1 : 1;
+	i32 comparison = strcasecmp(a->name, b->name);
+	if (comparison) return comparison;
+	return a->image_id < b->image_id ? -1 : a->image_id > b->image_id ? 1 : 0;
+}
+
+bool slide_score_parse_case_images(const char* json, size_t json_length, i32 case_id,
+		slide_score_slide_ref_t** out_slides, i32* out_slide_count,
+		char* out_case_name, size_t out_case_name_size) {
+	if (!json || !out_slides || !out_slide_count || case_id <= 0) return false;
+	*out_slides = NULL;
+	*out_slide_count = 0;
+	if (out_case_name && out_case_name_size) out_case_name[0] = '\0';
+
+	struct json_value_s* root = json_parse_ex(json, json_length, json_parse_flags_default,
+	                                         slide_score_json_alloc, NULL, NULL);
+	if (!root) return false;
+	bool success = false;
+	if (root->type == json_type_array) {
+		struct json_array_s* cases = (struct json_array_s*)root->payload;
+		for (struct json_array_element_s* case_element = cases->start;
+		     case_element; case_element = case_element->next) {
+			if (!case_element->value || case_element->value->type != json_type_object) continue;
+			struct json_object_s* case_object = (struct json_object_s*)case_element->value->payload;
+			i32 parsed_case_id = 0;
+			if (!slide_score_json_i32(slide_score_json_object_get(case_object, "id"),
+			                          &parsed_case_id) || parsed_case_id != case_id) continue;
+
+			struct json_value_s* images_value = slide_score_json_object_get(case_object, "images");
+			if (!images_value || images_value->type != json_type_array) break;
+			struct json_array_s* images = (struct json_array_s*)images_value->payload;
+			i32 capacity = (i32)images->length;
+			if (capacity <= 0) break;
+			slide_score_slide_ref_t* slides = (slide_score_slide_ref_t*)calloc(
+				(size_t)capacity, sizeof(*slides));
+			if (!slides) break;
+
+			i32 count = 0;
+			for (struct json_array_element_s* image_element = images->start;
+			     image_element; image_element = image_element->next) {
+				if (!image_element->value || image_element->value->type != json_type_object) continue;
+				struct json_object_s* image_object = (struct json_object_s*)image_element->value->payload;
+				i32 image_id = 0;
+				if (!slide_score_json_i32(slide_score_json_object_get(image_object, "id"),
+				                          &image_id)) continue;
+				slides[count].image_id = image_id;
+				const char* name = json_scalar_as_string(
+					slide_score_json_object_get(image_object, "name"));
+				if (name) copy_cstring(slides[count].name, name, sizeof(slides[count].name));
+				++count;
+			}
+			if (count <= 0) {
+				free(slides);
+				break;
+			}
+			qsort(slides, (size_t)count, sizeof(*slides), slide_score_compare_case_slides);
+			const char* case_name = json_scalar_as_string(
+				slide_score_json_object_get(case_object, "name"));
+			if (case_name && out_case_name && out_case_name_size) {
+				copy_cstring(out_case_name, case_name, out_case_name_size);
+			}
+			*out_slides = slides;
+			*out_slide_count = count;
+			success = true;
+			break;
+		}
+	}
+	free(root);
+	return success;
+}
+
 static void slide_score_parse_metadata_array(const char* field_name, struct json_value_s* value, slide_score_api_result_t* api_result) {
     if ((strcmp(field_name, "downsamples") != 0 && strcmp(field_name, "Downsamples") != 0) || !value || value->type != json_type_array) return;
 
@@ -389,10 +495,15 @@ slide_score_api_result_t debug_slide_score_api_handle_response(const char* json,
     return parsed_api_result;
 }
 
-bool slide_score_request_api(slide_score_client_t* ss, slide_score_api_enum api, const char** par_names, const char** par_values, i32 par_count, slide_score_api_result_t* out_result) {
-    bool success = false;
+static http_response_t* slide_score_request_api_response(slide_score_client_t* ss,
+		slide_score_api_enum api, const char** par_names, const char** par_values,
+		i32 par_count) {
     web_api_call_t call = slide_score_build_api_call(ss, api, par_names, par_values, par_count);
-    if (!call.is_valid) return false;
+	if (!call.is_valid) {
+		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_INVALID_RESPONSE;
+		slide_score_set_last_status("Slide Score API request is invalid.");
+		return NULL;
+	}
     if (ss->api_key[0] == '\0') {
         console_print_error("Slide Score API request has no API token configured.\n");
     }
@@ -401,24 +512,14 @@ bool slide_score_request_api(slide_score_client_t* ss, slide_score_api_enum api,
     snprintf(url, sizeof(url), "https://%s%s", ss->server_name, (char*)call.url.data);
 	http_response_error_t transport_error = HTTP_RESPONSE_ERROR_NONE;
 	remote_request_options_t options = {
-		.max_response_body_size = MEGABYTES(2),
+		.max_response_body_size = api == SLIDE_SCORE_API_CASES
+		                          ? MEGABYTES(16) : MEGABYTES(2),
 		.out_error = &transport_error,
 	};
     http_response_t* response = open_remote_uri_with_extra_headers_and_options(
 		url, ss->api_key, NULL, &options);
-    if (response) {
-        if (response->status_code >= 200 && response->status_code < 300) {
-            slide_score_api_result_t parsed = debug_slide_score_api_handle_response((const char*)response->buffer.data, response->content_length, api);
-            if (out_result) *out_result = parsed;
-            success = parsed.success || api == SLIDE_SCORE_API_GET_TILE_SERVER;
-			if (success) {
-				slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_NONE;
-			} else {
-				slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_INVALID_RESPONSE;
-				slide_score_set_last_status("Slide Score %s returned an invalid response.",
-				                            slide_score_api_names[api]);
-			}
-        } else {
+	web_api_call_destroy(&call);
+	if (response && (response->status_code < 200 || response->status_code >= 300)) {
 			slide_score_last_failure_kind = slide_score_classify_http_failure(response->status_code);
 			if (slide_score_last_failure_kind == SLIDE_SCORE_FAILURE_AUTHENTICATION) {
 				slide_score_set_last_status("Slide Score rejected the API token (HTTP %d).",
@@ -428,16 +529,38 @@ bool slide_score_request_api(slide_score_client_t* ss, slide_score_api_enum api,
 				                            slide_score_api_names[api], response->status_code);
 			}
             console_print_error("Slide Score API request failed: HTTP %d for %s\n", response->status_code, url);
-        }
         http_response_destroy(response);
-	} else {
+		return NULL;
+	}
+	if (!response) {
 		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_TRANSPORT;
 		slide_score_set_last_status("Slide Score %s request failed: %s.",
 		                            slide_score_api_names[api],
 		                            http_response_error_string(transport_error));
-    }
-    web_api_call_destroy(&call);
-    return success;
+		return NULL;
+	}
+	return response;
+}
+
+bool slide_score_request_api(slide_score_client_t* ss, slide_score_api_enum api, const char** par_names, const char** par_values, i32 par_count, slide_score_api_result_t* out_result) {
+	bool success = false;
+	http_response_t* response = slide_score_request_api_response(
+		ss, api, par_names, par_values, par_count);
+	if (response) {
+		slide_score_api_result_t parsed = debug_slide_score_api_handle_response(
+			(const char*)response->buffer.data, response->content_length, api);
+		if (out_result) *out_result = parsed;
+		success = parsed.success || api == SLIDE_SCORE_API_GET_TILE_SERVER;
+		if (success) {
+			slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_NONE;
+		} else {
+			slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_INVALID_RESPONSE;
+			slide_score_set_last_status("Slide Score %s returned an invalid response.",
+			                            slide_score_api_names[api]);
+		}
+		http_response_destroy(response);
+	}
+	return success;
 }
 
 bool slide_score_refresh_tile_server(slide_score_remote_image_t* remote) {
@@ -534,45 +657,69 @@ static void slide_score_read_api_key(char* buffer, size_t buffer_size) {
     slide_score_read_api_key_file(leaf_filename, buffer, buffer_size);
 }
 
-bool slide_score_open_remote_image(app_state_t* app_state, const char* server_url_or_hostname, const char* api_token, i32 image_id) {
-    // Read API lazily if not provided
-    if (api_token == NULL) {
-        char* api_key = (char*)alloca(4096);
-        api_key[0] = '\0';
-        slide_score_read_api_key(api_key, 4096);
-        api_token = api_key;
-    }
+void slide_score_remote_image_destroy(slide_score_remote_image_t* remote) {
+	if (!remote) return;
+	free(remote->case_slides);
+	remote->case_slides = NULL;
+	remote->case_slide_count = 0;
+}
 
-    slide_score_remote_image_t remote = {};
-    slide_score_client_init(&remote.client, server_url_or_hostname, api_token);
-    remote.image_id = image_id;
-	if (!remote.client.api_key[0]) {
+static bool slide_score_require_api_key(slide_score_remote_image_t* remote) {
+	if (!remote || !remote->client.api_key[0]) {
 		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_CREDENTIALS_REQUIRED;
 		slide_score_set_last_status("A Slide Score API token is required.");
 		return false;
 	}
+	return true;
+}
+
+static bool slide_score_install_remote_image(app_state_t* app_state,
+		slide_score_remote_image_t* remote) {
+	if (!app_state || !remote || remote->image_id <= 0 ||
+	    !slide_score_require_api_key(remote)) return false;
 
     char image_id_str[32];
-    snprintf(image_id_str, sizeof(image_id_str), "%d", image_id);
+	snprintf(image_id_str, sizeof(image_id_str), "%d", remote->image_id);
     const char* names[] = {"imageId"};
     const char* values[] = {image_id_str};
 
     slide_score_api_result_t metadata_result = {};
-    if (!slide_score_request_api(&remote.client, SLIDE_SCORE_API_GET_IMAGE_METADATA, names, values, 1, &metadata_result)) {
+	if (!slide_score_request_api(&remote->client, SLIDE_SCORE_API_GET_IMAGE_METADATA,
+	                             names, values, 1, &metadata_result)) {
         console_print_error("%s\n", slide_score_last_status);
         return false;
     }
-    remote.metadata = metadata_result.get_image_metadata;
-    remote.max_deepzoom_level = ceil_log2_i64(MAX(remote.metadata.level_0_width, remote.metadata.level_0_height));
+	remote->metadata = metadata_result.get_image_metadata;
+	remote->max_deepzoom_level = ceil_log2_i64(
+		MAX(remote->metadata.level_0_width, remote->metadata.level_0_height));
 
-    if (!slide_score_refresh_tile_server(&remote)) {
+	slide_score_api_result_t details_result = {};
+	if (slide_score_request_api(&remote->client, SLIDE_SCORE_API_GET_SLIDE_DETAILS,
+	                            names, values, 1, &details_result)) {
+		remote->rotation_degrees_clockwise =
+			details_result.get_slide_details.rotation_degrees_clockwise;
+	}
+
+	if (!slide_score_refresh_tile_server(remote)) {
         console_print_error("%s\n", slide_score_last_status);
         return false;
     }
 
     image_t* image = (image_t*)calloc(1, sizeof(image_t));
+	if (!image) {
+		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_INVALID_RESPONSE;
+		slide_score_set_last_status("Could not allocate the Slide Score image.");
+		return false;
+	}
     image->resource_id = global_next_resource_id++;
-    bool is_valid = init_image_from_slide_score(image, &remote, false);
+	bool is_valid = init_image_from_slide_score(image, remote, false);
+	if (!is_valid) {
+		free(image);
+		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_INVALID_RESPONSE;
+		slide_score_set_last_status("Slide Score returned unsupported image metadata for image %d.",
+		                            remote->image_id);
+		return false;
+	}
     if (image->is_valid && !image_initialize_runtime(image)) {
         image->is_valid = false;
         is_valid = false;
@@ -580,13 +727,123 @@ bool slide_score_open_remote_image(app_state_t* app_state, const char* server_ur
     if (is_valid) {
         unload_all_images(app_state);
         add_image(app_state, image, true, false);
+		if (image->slide_score.case_slide_count > 1) show_slide_tray_window = true;
 		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_NONE;
-        slide_score_set_last_status("Opened Slide Score image %d.", image_id);
+		slide_score_set_last_status("Opened Slide Score image %d.", image->slide_score.image_id);
     } else {
         image_destroy(image);
         free(image);
     }
     return is_valid;
+}
+
+bool slide_score_open_remote_image(app_state_t* app_state, const char* server_url_or_hostname,
+		const char* api_token, i32 image_id) {
+	if (api_token == NULL) {
+		char* api_key = (char*)alloca(4096);
+		api_key[0] = '\0';
+		slide_score_read_api_key(api_key, 4096);
+		api_token = api_key;
+	}
+
+	slide_score_remote_image_t remote = {};
+	slide_score_client_init(&remote.client, server_url_or_hostname, api_token);
+	remote.image_id = image_id;
+	bool opened = slide_score_install_remote_image(app_state, &remote);
+	slide_score_remote_image_destroy(&remote);
+	return opened;
+}
+
+static bool slide_score_query_case_images(slide_score_remote_image_t* remote) {
+	char study_id_str[32];
+	snprintf(study_id_str, sizeof(study_id_str), "%d", remote->study_id);
+	const char* names[] = {"studyId"};
+	const char* values[] = {study_id_str};
+	http_response_t* response = slide_score_request_api_response(
+		&remote->client, SLIDE_SCORE_API_CASES, names, values, 1);
+	if (!response) return false;
+
+	bool parsed = slide_score_parse_case_images(
+		(const char*)response->buffer.data, response->content_length, remote->case_id,
+		&remote->case_slides, &remote->case_slide_count,
+		remote->case_name, sizeof(remote->case_name));
+	http_response_destroy(response);
+	if (!parsed) {
+		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_INVALID_RESPONSE;
+		slide_score_set_last_status(
+			"Slide Score case %d was not found in study %d or contains no slides.",
+			remote->case_id, remote->study_id);
+	}
+	return parsed;
+}
+
+static bool slide_score_open_case(app_state_t* app_state, const char* server,
+		const char* api_token, i32 study_id, i32 case_id, i32 preferred_image_id) {
+	slide_score_remote_image_t remote = {};
+	slide_score_client_init(&remote.client, server, api_token);
+	remote.study_id = study_id;
+	remote.case_id = case_id;
+	if (!slide_score_require_api_key(&remote) || !slide_score_query_case_images(&remote)) {
+		slide_score_remote_image_destroy(&remote);
+		return false;
+	}
+
+	remote.selected_slide_index = 0;
+	if (preferred_image_id > 0) {
+		bool found = false;
+		for (i32 i = 0; i < remote.case_slide_count; ++i) {
+			if (remote.case_slides[i].image_id == preferred_image_id) {
+				remote.selected_slide_index = i;
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_INVALID_RESPONSE;
+			slide_score_set_last_status(
+				"Slide Score image %d was not listed in case %d.",
+				preferred_image_id, case_id);
+			slide_score_remote_image_destroy(&remote);
+			return false;
+		}
+	}
+	remote.image_id = remote.case_slides[remote.selected_slide_index].image_id;
+	bool opened = slide_score_install_remote_image(app_state, &remote);
+	slide_score_remote_image_destroy(&remote);
+	return opened;
+}
+
+bool slide_score_open_case_slide(app_state_t* app_state, image_t* current_image,
+		i32 slide_index) {
+	if (!app_state || !current_image ||
+	    current_image->backend != IMAGE_BACKEND_SLIDE_SCORE ||
+	    slide_index < 0 || slide_index >= current_image->slide_score.case_slide_count) {
+		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_INVALID_RESPONSE;
+		slide_score_set_last_status("The selected Slide Score case slide is unavailable.");
+		return false;
+	}
+	if (slide_index == current_image->slide_score.selected_slide_index) return true;
+
+	slide_score_remote_image_t remote = {};
+	remote.client = current_image->slide_score.client;
+	remote.study_id = current_image->slide_score.study_id;
+	remote.case_id = current_image->slide_score.case_id;
+	remote.selected_slide_index = slide_index;
+	remote.case_slide_count = current_image->slide_score.case_slide_count;
+	copy_cstring(remote.case_name, current_image->slide_score.case_name,
+	             sizeof(remote.case_name));
+	size_t slides_size = (size_t)remote.case_slide_count * sizeof(*remote.case_slides);
+	remote.case_slides = (slide_score_slide_ref_t*)malloc(slides_size);
+	if (!remote.case_slides) {
+		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_INVALID_RESPONSE;
+		slide_score_set_last_status("Could not copy the Slide Score case slide list.");
+		return false;
+	}
+	memcpy(remote.case_slides, current_image->slide_score.case_slides, slides_size);
+	remote.image_id = remote.case_slides[slide_index].image_id;
+	bool opened = slide_score_install_remote_image(app_state, &remote);
+	slide_score_remote_image_destroy(&remote);
+	return opened;
 }
 
 static bool slide_score_extract_qupath_base_path(const char* path, char* out_base_path, size_t out_base_path_size) {
@@ -796,6 +1053,8 @@ bool slide_score_try_open_uri(app_state_t* app_state, const char* uri, const cha
 	slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_NONE;
 	slide_score_last_status[0] = '\0';
     i32 image_id = 0;
+	i32 study_id = 0;
+	i32 case_id = 0;
     slide_score_uri_parts_t parts = {};
     if (!slide_score_get_uri_parts(uri, &parts)) return false;
 
@@ -805,14 +1064,35 @@ bool slide_score_try_open_uri(app_state_t* app_state, const char* uri, const cha
         return true;
     }
 
-    if (!slide_score_parse_image_id_from_path(parts.path, &image_id)) {
-        slide_score_set_last_status("Slide Score URI recognized, but no image id could be found.");
+	bool has_image_id = slide_score_parse_image_id_from_path(parts.path, &image_id);
+	bool has_study_id = parse_i32_after_key(parts.path, "studyId", &study_id);
+	bool has_case_id = parse_i32_after_key(parts.path, "caseId", &case_id);
+	if (has_case_id && !has_study_id) {
+		slide_score_set_last_status(
+			"Slide Score case links require both a case id and a study id.");
         console_print_error("%s URL: %s\n", slide_score_last_status, uri);
         return true;
     }
+	if (!has_image_id && !has_case_id) {
+		slide_score_set_last_status(
+			"Slide Score URI recognized, but no image or case id could be found.");
+		console_print_error("%s URL: %s\n", slide_score_last_status, uri);
+		return true;
+	}
 
-    slide_score_open_succeeded =
-        slide_score_open_remote_image(app_state, parts.server, api_token, image_id);
+	if (has_case_id) {
+		slide_score_open_succeeded = slide_score_open_case(
+			app_state, parts.server, api_token, study_id, case_id,
+			has_image_id ? image_id : 0);
+		if (!slide_score_open_succeeded && has_image_id) {
+			/* Preserve support for image links if their case context is stale or unavailable. */
+			slide_score_open_succeeded = slide_score_open_remote_image(
+				app_state, parts.server, api_token, image_id);
+		}
+	} else {
+		slide_score_open_succeeded = slide_score_open_remote_image(
+			app_state, parts.server, api_token, image_id);
+	}
     return true;
 }
 
