@@ -37,6 +37,16 @@ TEST_CASE("project_point_on_line_segment clamps to segment endpoints") {
 	CHECK(projected.y == doctest::Approx(0.0f));
 }
 
+TEST_CASE("screen-relative panning vector maps through inverse view rotation") {
+	v2f right_in_world = v2f_rotate(V2F(1.0f, 0.0f), -0.5f * PI_F);
+	v2f down_in_world = v2f_rotate(V2F(0.0f, 1.0f), -0.5f * PI_F);
+
+	CHECK(right_in_world.x == doctest::Approx(0.0f).epsilon(0.0001));
+	CHECK(right_in_world.y == doctest::Approx(-1.0f));
+	CHECK(down_in_world.x == doctest::Approx(1.0f));
+	CHECK(down_in_world.y == doctest::Approx(0.0f).epsilon(0.0001));
+}
+
 TEST_CASE("tile coordinate conversion includes touched boundary tile") {
 	bounds2f world = BOUNDS2F(511.0f, 0.0f, 512.0f, 512.0f);
 	bounds2i tiles = world_bounds_to_tile_bounds(&world, 512.0f, 512.0f, V2F(0.0f, 0.0f));

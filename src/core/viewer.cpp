@@ -1517,13 +1517,14 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
             if (!is_directional_input_consumed) {
                 // Panning using the arrow or WASD keys.
                 float panning_speed = app_state->keyboard_base_panning_speed * 100.0f * delta_time * panning_multiplier;
+                v2f world_panning_velocity = v2f_rotate(scene->panning_velocity, -scene->rotation);
                 bool panning = false;
-                if (scene->panning_velocity.y != 0.0f) {
-                    scene->camera.y += scene->zoom.pixel_height * panning_speed * scene->panning_velocity.y;
+                if (world_panning_velocity.y != 0.0f) {
+                    scene->camera.y += scene->zoom.pixel_height * panning_speed * world_panning_velocity.y;
                     panning = true;
                 }
-                if (scene->panning_velocity.x != 0.0f) {
-                    scene->camera.x += scene->zoom.pixel_height * panning_speed * scene->panning_velocity.x;
+                if (world_panning_velocity.x != 0.0f) {
+                    scene->camera.x += scene->zoom.pixel_height * panning_speed * world_panning_velocity.x;
                     panning = true;
                 }
                 if (panning && app_state->seconds_without_mouse_movement > 0.25f) {

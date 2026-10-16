@@ -139,6 +139,12 @@ FORCE_INLINE v2f v2f_subtract(v2f a, v2f b)                { v2f result = {a.x -
 FORCE_INLINE v2i v2i_subtract(v2i a, v2i b)                { v2i result = {a.x - b.x, a.y - b.y }; return result; }
 FORCE_INLINE float v2f_dot(v2f a, v2f b)                   { return a.x * b.x + a.y * b.y; }
 FORCE_INLINE v2f v2f_scale(float scalar, v2f v)            { v2f result = {v.x * scalar, v.y * scalar }; return result; }
+FORCE_INLINE v2f v2f_rotate(v2f v, float radians) {
+	float c = cosf(radians);
+	float s = sinf(radians);
+	v2f result = {v.x * c - v.y * s, v.x * s + v.y * c};
+	return result;
+}
 FORCE_INLINE v2f v2f_lerp(v2f a, v2f b_minus_a, float t)   { v2f result = v2f_add(a, v2f_scale(t, b_minus_a)); return result; }
 
 // prototypes
