@@ -190,6 +190,7 @@ typedef struct mrxs_plane_t {
 	/* Plane zero borrows levels[].tiles; other planes own these arrays. */
 	mrxs_tile_t* tiles[16];
 	bool level_available[16];
+	u32 index_pages[16]; // Root page offsets, read during metadata opening.
 } mrxs_plane_t;
 
 typedef struct mrxs_decoded_tile_cache_entry_t {
@@ -207,6 +208,9 @@ typedef struct mrxs_t {
     const char** dat_filenames; // NOTE: need free
 	source_file_t* dat_files; // Borrowed views owned by source.
 	source_fs_t* source; // Closed after tile workers and views are released.
+	source_file_t index_file; // Borrowed seekable view; no whole-file allocation.
+	volatile i32 indexing_cancel_requested;
+	double opening_time; // Synchronous image opening, before the indexing job is submitted.
     i32 dat_count;
     i32 hier_count;
     i32 nonhier_count;
@@ -270,6 +274,10 @@ typedef struct directory_info_t directory_info_t;
 bool mrxs_open_from_source(mrxs_t* mrxs, source_fs_t* source, const char* directory);
 bool mrxs_open_from_zip(mrxs_t* mrxs, const char* filename, char* error, size_t error_capacity);
 bool mrxs_open_from_directory(mrxs_t* mrxs, file_info_t* file, directory_info_t* directory);
+/* Opening reads metadata only. Index once, with a single writer, before decoding.
+ * Plane zero must be indexed before other planes at the same level. */
+bool mrxs_index_level(mrxs_t* mrxs, i32 plane, i32 level);
+bool mrxs_index_all(mrxs_t* mrxs);
 void mrxs_init_runtime_cache(mrxs_t* mrxs);
 u8* mrxs_decode_simple_image_to_rgba(mrxs_t* mrxs, mrxs_simple_image_t* image);
 u8* mrxs_decode_tile_to_bgra(mrxs_t* mrxs, i32 plane, i32 level, i32 tile_index);

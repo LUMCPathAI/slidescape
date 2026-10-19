@@ -717,6 +717,9 @@ bool tile_cache_tile_is_busy(image_t* image, i32 plane, i32 level, i32 tile_inde
 }
 
 bool tile_cache_try_begin_decode(image_t* image, i32 plane, i32 level, i32 tile_index, u32 demand_flags, i32 priority, i32 generation) {
+	if (!image_level_index_ready(image, plane, level)) {
+		return false;
+	}
 	tile_cache_t* cache = image ? image->tile_cache : NULL;
 	if (!cache) {
 		return false;
@@ -1049,7 +1052,8 @@ i32 tile_cache_request_viewer_tiles(image_t* image, tile_cache_viewer_request_t*
 
 	for (i32 level = lowest_visible_scale; level <= highest_visible_scale; ++level) {
 		level_image_t* level_image = image->level_images + level;
-		if (!level_image->exists || (level_image->missing_planes & (UINT64_C(1) << plane)) || level_image->needs_indexing) {
+		if (!level_image->exists || (level_image->missing_planes & (UINT64_C(1) << plane)) || level_image->needs_indexing ||
+		    !image_level_index_ready(image, plane, level)) {
 			continue;
 		}
 
@@ -1150,7 +1154,10 @@ wishlist_full:
 
 renderer_texture_handle_t tile_cache_get_focus_texture(image_t* image, i32 level, i32 tile_index) {
 	tile_cache_t* cache = image->tile_cache;
-	if (!cache || get_tile_from_tile_index(image, level, tile_index)->is_empty) return 0;
+	if (!cache || !image_level_index_ready(image, 0, level) ||
+	    get_tile_from_tile_index(image, level, tile_index)->is_empty) {
+		return 0;
+	}
 	platform_mutex_lock(&cache->lock);
 	i32 selected = image->selected_plane;
 	tile_cache_tile_t* tile = tile_cache_find_tile_locked(cache, selected, level, tile_index);

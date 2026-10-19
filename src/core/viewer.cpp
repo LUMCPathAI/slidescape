@@ -713,7 +713,8 @@ void update_and_render_image(app_state_t* app_state, image_t* image) {
 			i32 highest_level_to_draw = ATMOST(highest_visible_scale, global_highest_scale_to_render);
 			for (i32 level = lowest_level_to_draw; level <= highest_level_to_draw; ++level) {
 				level_image_t *drawn_level = image->level_images + level;
-				if (!drawn_level->exists || (drawn_level->missing_planes & (UINT64_C(1) << image->selected_plane))) {
+				if (!drawn_level->exists || (drawn_level->missing_planes & (UINT64_C(1) << image->selected_plane)) ||
+				    !image_level_index_ready(image, 0, level)) {
 					continue;
 				}
 

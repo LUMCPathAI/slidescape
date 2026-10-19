@@ -144,6 +144,7 @@ typedef struct {
     i32 pyramid_image_index;
     bool exists;
 	u64 missing_planes; // Zero for single-plane backends; bit p means this level is absent in plane p.
+	volatile u64 indexed_planes; // MRXS: release/acquire publication of index and shared coverage.
     bool needs_indexing; //TODO: implement
     bool indexing_job_submitted;
 } level_image_t;
@@ -208,6 +209,9 @@ typedef struct image_t {
     simple_image_t macro_image;
     simple_image_t label_image;
     i32 resource_id;
+	volatile i32 indexing_finished; // MRXS job completed, including failure/cancellation.
+	volatile i32 indexing_failed;
+	task_group_t indexing_task;
 	tile_cache_t* tile_cache;
 	volatile i32 refcount;
 	platform_mutex_t lock;
@@ -232,6 +236,17 @@ static inline tile_t* get_tile_from_tile_index(image_t* image, i32 scale, i32 ti
 	return tile;
 }
 
+static inline bool image_level_index_ready(const image_t* image, i32 plane, i32 level) {
+	if (!image || plane < 0 || plane >= ATLEAST(image->plane_count, 1) || plane >= 64 ||
+	    level < 0 || level >= image->level_count) {
+		return false;
+	}
+	return image->backend != IMAGE_BACKEND_MRXS ||
+	       (atomic_load_u64_acquire(&image->level_images[level].indexed_planes) & (UINT64_C(1) << plane)) != 0;
+}
+
+bool image_begin_mrxs_indexing(image_t* image);
+bool image_wait_for_level_index(image_t* image, i32 plane, i32 level);
 float f32_rgb_to_f32_y(float R, float G, float B);
 void image_convert_u8_rgba_to_f32_y(u8* src, float* dest, i32 w, i32 h, i32 components);
 void image_convert_u8_bgra_to_f32_y(u8* src, float* dest, i32 w, i32 h, i32 components);

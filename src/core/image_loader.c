@@ -430,6 +430,7 @@ static void image_load_zip(image_t* image, const file_info_t* file, image_load_o
 }
 
 image_t* image_load_from_file(file_info_t* file, directory_info_t* directory, image_load_options_t* options) {
+	i64 open_start = get_clock();
 	image_load_options_t default_options = {0};
 	default_options.use_builtin_tiff_backend = true;
 	default_options.use_native_mrxs_backend = true;
@@ -553,6 +554,13 @@ image_t* image_load_from_file(file_info_t* file, directory_info_t* directory, im
 
 	if (image->is_valid && !image_initialize_runtime(image)) {
 		image->is_valid = false;
+	}
+
+	if (image->is_valid && image->backend == IMAGE_BACKEND_MRXS) {
+		image->mrxs.opening_time = get_seconds_elapsed(open_start, get_clock());
+		if (!image_begin_mrxs_indexing(image)) {
+			image->is_valid = false;
+		}
 	}
 
 	if (!image->is_valid && image->type == IMAGE_TYPE_WSI) {

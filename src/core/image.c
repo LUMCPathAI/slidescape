@@ -949,29 +949,7 @@ bool init_image_from_mrxs(image_t* image, bool is_overlay) {
 			ASSERT(level_image->x_tile_side_in_um > 0);
 			ASSERT(level_image->y_tile_side_in_um > 0);
 			level_image->origin_offset = V2F(0,0); //mrxs_level->origin_offset;
-			level_image->tiles = (tile_t*) calloc(1, level_image->tile_count * sizeof(tile_t));
-			for (i32 tile_index = 0; tile_index < level_image->tile_count; ++tile_index) {
-				tile_t* tile = level_image->tiles + tile_index;
-				// Facilitate some introspection by storing self-referential information
-				// in the tile_t struct. This is needed for some specific cases where we
-				// pass around pointers to tile_t structs without caring exactly where they
-				// came from.
-				// (Specific example: we use this when exporting a selected region as BigTIFF)
-				tile->tile_index = tile_index;
-				tile->tile_x = tile_index % level_image->width_in_tiles;
-				tile->tile_y = tile_index / level_image->width_in_tiles;
 
-				/* For WSIs with a Z-stack, use plane zero (normally extended focus) as shared coverage. Extra tiles in
-				 * other planes are deliberately skipped; missing tiles are discovered on load.
-				 * Index/decode warnings report mismatches.
-				 * With overlap, stored and display tiles differ, so coverage stays unknown. */
-				if (!mrxs->has_overlapping_tiles && tile_index < mrxs_level->height_in_tiles * mrxs_level->width_in_tiles) {
-					mrxs_tile_t* mrxs_tile = mrxs_level->tiles + tile_index;
-					if (mrxs_tile->hier_entry.length == 0) {
-						tile->is_empty = true;
-					}
-				}
-			}
 			DUMMY_STATEMENT;
 		}
 	}
@@ -1675,9 +1653,105 @@ bool image_read_region(image_t* image, i32 plane, i32 level, i32 x, i32 y, i32 w
 	if (!image || plane < 0 || plane >= ATLEAST(image->plane_count, 1) || !tile_cache_begin_read(image)) {
 		return false;
 	}
-	bool result = image_read_region_impl(image, plane, level, x, y, w, h, dest, desired_pixel_format);
+	bool result = image_wait_for_level_index(image, plane, level) &&
+	              image_read_region_impl(image, plane, level, x, y, w, h, dest, desired_pixel_format);
 	tile_cache_end_read(image);
 	return result;
+}
+
+
+static bool image_init_mrxs_level_tiles(image_t* image, i32 level) {
+	mrxs_t* mrxs = &image->mrxs;
+	mrxs_level_t* source = mrxs->levels + level;
+	level_image_t* dest = image->level_images + level;
+	tile_t* tiles = calloc(dest->tile_count, sizeof(*tiles));
+	if (!tiles) {
+		return false;
+	}
+	for (u64 i = 0; i < dest->tile_count; ++i) {
+		if ((i & 4095) == 0 && atomic_load_acquire(&mrxs->indexing_cancel_requested)) {
+			free(tiles);
+			return false;
+		}
+		tiles[i].tile_index = (u32)i;
+		tiles[i].tile_x = i % dest->width_in_tiles;
+		tiles[i].tile_y = i / dest->width_in_tiles;
+		/* Plane zero defines shared coverage. Extra tiles in other planes are
+		 * deliberately skipped; missing tiles are discovered on load and warned.
+		 * With overlap, stored and display tiles differ, so coverage stays unknown. */
+		if (!mrxs->has_overlapping_tiles) {
+			tiles[i].is_empty = source->tiles[i].hier_entry.length == 0;
+		}
+	}
+	dest->tiles = tiles;
+	return true;
+}
+
+static void image_mrxs_indexing_task(i32 logical_thread_index, void* userdata) {
+	image_t* image = *(image_t**)userdata;
+	mrxs_t* mrxs = &image->mrxs;
+	bool success = true;
+	i64 start = get_clock();
+	for (i32 level = image->level_count - 1; level >= 0 && success; --level) {
+		u64 ready = 0;
+		for (i32 plane = 0; plane < image->plane_count; ++plane) {
+			if (!mrxs_index_level(mrxs, plane, level) ||
+			    (plane == 0 && !image_init_mrxs_level_tiles(image, level))) {
+				success = false;
+				break;
+			}
+			ready |= UINT64_C(1) << plane;
+			atomic_store_u64_release(&image->level_images[level].indexed_planes, ready);
+		}
+	}
+	if (!success && !atomic_load_acquire(&mrxs->indexing_cancel_requested)) {
+		console_print_error("MRXS indexing failed for '%s'; unfinished levels are unavailable.\n", image->name);
+	}
+	atomic_store_release(&image->indexing_failed, !success);
+	const char* indexing_status = "";
+	if (!success) {
+		if (atomic_load_acquire(&mrxs->indexing_cancel_requested)) {
+			indexing_status = " (cancelled)";
+		} else {
+			indexing_status = " (failed)";
+		}
+	}
+	console_print("MRXS '%s': opening %.3f seconds; indexing %.3f seconds%s.\n",
+	              image->name, mrxs->opening_time, get_seconds_elapsed(start, get_clock()),
+	              indexing_status);
+	atomic_store_release(&image->indexing_finished, 1);
+}
+
+bool image_begin_mrxs_indexing(image_t* image) {
+	ASSERT(image->backend == IMAGE_BACKEND_MRXS && image->lock_initialized);
+	thread_pool_t* pool = image->mrxs.work_submission_pool;
+	if (!pool || !atomic_load_acquire(&pool->initialized)) {
+		// Standalone callers without a worker pool still get a usable image.
+		image_mrxs_indexing_task(0, &image);
+		return !atomic_load_acquire(&image->indexing_failed);
+	}
+	return thread_pool_submit_high_priority_task_to_group(pool, &image->indexing_task,
+		image_mrxs_indexing_task, &image, sizeof(image));
+}
+
+bool image_wait_for_level_index(image_t* image, i32 plane, i32 level) {
+	if (!image || plane < 0 || plane >= ATLEAST(image->plane_count, 1) ||
+	    level < 0 || level >= image->level_count) {
+		return false;
+	}
+	if (image->backend != IMAGE_BACKEND_MRXS) {
+		return true;
+	}
+	while (!image_level_index_ready(image, plane, level)) {
+		if (atomic_load_acquire(&image->indexing_finished)) {
+			return image_level_index_ready(image, plane, level);
+		}
+		// No image/cache locks held. Helping also handles pools with zero active workers.
+		if (!thread_pool_do_work(image->mrxs.work_submission_pool)) {
+			platform_sleep(1);
+		}
+	}
+	return true;
 }
 
 
@@ -1721,6 +1795,9 @@ bool image_initialize_runtime(image_t* image) {
 	if (!image || !image->is_valid) {
 		return false;
 	}
+	if (image->backend != IMAGE_BACKEND_MRXS) {
+		atomic_store_release(&image->indexing_finished, 1);
+	}
 	bool initialized_lock = false;
 	if (!image->lock_initialized) {
 		platform_mutex_init(&image->lock);
@@ -1752,6 +1829,10 @@ void image_destroy(image_t* image) {
 		return;
 	}
 	tile_cache_begin_shutdown(image);
+	if (image->backend == IMAGE_BACKEND_MRXS) {
+		atomic_store_release(&image->mrxs.indexing_cancel_requested, 1);
+		thread_pool_wait_for_group(image->mrxs.work_submission_pool, &image->indexing_task);
+	}
 	while (tile_cache_get_active_read_count(image) > 0) {
 		if (thread_pool_is_work_waiting_to_start(&global_thread_pool)) {
 			thread_pool_do_work(&global_thread_pool);

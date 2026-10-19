@@ -476,67 +476,175 @@ static void mrxs_warn_coverage_mismatch(mrxs_t* mrxs, i32 plane, i32 level, i32 
 	}
 }
 
-/* Validate every page before publishing descriptors. The nonhier table is separate. */
-static bool mrxs_read_plane_level(mrxs_t* mrxs, mem_t* index, u32 page, i32 plane, i32 scale) {
+/* Linked index pages require seeks. Reuse a bounded read buffer instead of
+ * loading Index.dat or issuing a system call for every 32-bit field. */
+typedef struct mrxs_index_reader_t {
+	const source_file_t* file;
+	u64 offset;
+	size_t length;
+	u8 buffer[65536];
+} mrxs_index_reader_t;
+
+static bool mrxs_index_read(mrxs_index_reader_t* reader, u64 offset, void* dest, size_t size) {
+	if (offset > reader->file->size || size > reader->file->size - offset) {
+		return false;
+	}
+	u8* out = dest;
+	while (size) {
+		if (!reader->length || offset < reader->offset || offset - reader->offset >= reader->length) {
+			reader->offset = offset;
+			reader->length = (size_t)MIN(sizeof(reader->buffer), reader->file->size - offset);
+			if (source_file_read(reader->file, offset, reader->buffer, reader->length) != SOURCE_READ_OK) {
+				reader->length = 0;
+				return false;
+			}
+		}
+		size_t at = (size_t)(offset - reader->offset);
+		size_t count = MIN(size, reader->length - at);
+		memcpy(out, reader->buffer + at, count);
+		out += count;
+		offset += count;
+		size -= count;
+	}
+	return true;
+}
+
+/* Validate every page before the caller publishes this plane/level. */
+bool mrxs_index_level(mrxs_t* mrxs, i32 plane, i32 scale) {
+	if (plane < 0 || plane >= mrxs->plane_count || scale < 0 || scale >= mrxs->level_count ||
+	    atomic_load_acquire(&mrxs->indexing_cancel_requested)) {
+		return false;
+	}
 	mrxs_level_t* level = mrxs->levels + scale;
-	mrxs_tile_t* tiles = mrxs->planes[plane].tiles[scale];
-	struct { u32 key; bool value; }* visited = NULL;
+	if (mrxs->planes[plane].tiles[scale]) {
+		return true;
+	}
+	if (plane > 0 && !level->tiles) {
+		return false;
+	}
+	u32 page = mrxs->planes[plane].index_pages[scale];
+	if (plane > 0 && !page) {
+		return true;
+	}
+	mrxs_tile_t* tiles = calloc((size_t)level->width_in_tiles * level->height_in_tiles, sizeof(*tiles));
+	if (!tiles) {
+		return false;
+	}
+	mrxs_index_reader_t reader = {.file = &mrxs->index_file};
+	struct {
+		u32 key;
+		bool value;
+	}* visited = NULL;
 	bool success = false;
 	while (page) {
-		if ((u64)page + 8 > index->len || hmget(visited, page)) goto done;
+		if (atomic_load_acquire(&mrxs->indexing_cancel_requested) || hmget(visited, page)) {
+			goto done;
+		}
 		hmput(visited, page, true);
-		u32 count, next;
-		memcpy(&count, index->data + page, 4);
-		memcpy(&next, index->data + page + 4, 4);
-		if ((u64)page + 8 + (u64)count * sizeof(mrxs_hier_entry_t) > index->len) goto done;
-		for (u32 i = 0; i < count; ++i) {
+		u32 entry_count = 0;
+		u32 next_page = 0;
+		if (!mrxs_index_read(&reader, page, &entry_count, sizeof(entry_count)) ||
+		    !mrxs_index_read(&reader, (u64)page + 4, &next_page, sizeof(next_page))) {
+			goto done;
+		}
+		if ((u64)page + 8 + (u64)entry_count * sizeof(mrxs_hier_entry_t) > reader.file->size) {
+			goto done;
+		}
+		for (u32 i = 0; i < entry_count; ++i) {
+			if ((i & 4095) == 0 && atomic_load_acquire(&mrxs->indexing_cancel_requested)) {
+				goto done;
+			}
 			mrxs_hier_entry_t entry;
-			memcpy(&entry, index->data + page + 8 + (u64)i * sizeof(entry), sizeof(entry));
+			if (!mrxs_index_read(&reader, (u64)page + 8 + (u64)i * sizeof(entry), &entry, sizeof(entry))) {
+				goto done;
+			}
 			u32 x = entry.image % mrxs->base_width_in_tiles;
 			u32 y = entry.image / mrxs->base_width_in_tiles;
 			if (y >= mrxs->base_height_in_tiles || entry.file >= mrxs->dat_count ||
-			    (x & ((1u << scale) - 1)) || (y & ((1u << scale) - 1))) goto done;
+			    (x & ((1u << scale) - 1)) || (y & ((1u << scale) - 1))) {
+				goto done;
+			}
 			u64 tile_index = (u64)(y >> scale) * level->width_in_tiles + (x >> scale);
-			/* Plane zero is read first. Report extras without expanding shared viewer coverage. */
-			if (plane > 0 && entry.length && !level->tiles[tile_index].hier_entry.length)
+			/* Plane zero defines coverage; extras do not expand it. */
+			if (plane > 0 && entry.length && !level->tiles[tile_index].hier_entry.length) {
 				mrxs_warn_coverage_mismatch(mrxs, plane, scale, (i32)tile_index, true);
+			}
 			tiles[tile_index].hier_entry = entry;
 		}
-		page = next;
+		page = next_page;
+	}
+	mrxs->planes[plane].tiles[scale] = tiles;
+	if (plane == 0) {
+		level->tiles = tiles;
 	}
 	success = true;
 done:
+	if (!success) {
+		free(tiles);
+	}
 	hmfree(visited);
 	return success;
 }
 
-static bool mrxs_read_focus_pyramids(mrxs_t* mrxs, mem_t* index, u32 root) {
+bool mrxs_index_all(mrxs_t* mrxs) {
+	for (i32 level = mrxs->level_count - 1; level >= 0; --level) {
+		for (i32 plane = 0; plane < mrxs->plane_count; ++plane) {
+			if (!mrxs_index_level(mrxs, plane, level)) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+static bool mrxs_read_focus_metadata(mrxs_t* mrxs, mrxs_index_reader_t* index, u32 root) {
 	i32 focus_hier = -1;
-	u64 stride = 1, zoom_stride = 0, focus_stride = 0, defaults = 0;
+	u64 stride = 1;
+	u64 zoom_stride = 0;
+	u64 focus_stride = 0;
+	u64 defaults = 0;
 	for (i32 i = 0; i < mrxs->hier_count; ++i) {
 		mrxs_hier_t* h = mrxs->hier + i;
-		if (h->val_count <= 0 || h->default_value < 0 || h->default_value >= h->val_count) return false;
-		if (h->name == MRXS_HIER_SLIDE_ZOOM_LEVEL) zoom_stride = stride;
-		else if (h->name == MRXS_HIER_MICROSCOPE_FOCUS_LEVEL) { focus_hier = i; focus_stride = stride; }
-		else defaults += stride * h->default_value;
-		if (stride > UINT32_MAX / (u32)h->val_count) return false;
+		if (h->val_count <= 0 || h->default_value < 0 || h->default_value >= h->val_count) {
+			return false;
+		}
+		if (h->name == MRXS_HIER_SLIDE_ZOOM_LEVEL) {
+			zoom_stride = stride;
+		} else if (h->name == MRXS_HIER_MICROSCOPE_FOCUS_LEVEL) {
+			focus_hier = i;
+			focus_stride = stride;
+		} else {
+			defaults += stride * h->default_value;
+		}
+		if (stride > UINT32_MAX / (u32)h->val_count) {
+			return false;
+		}
 		stride *= h->val_count;
 	}
-	if (!zoom_stride || (u64)root + stride * 4 > index->len) return false;
+	if (!zoom_stride || (u64)root + stride * 4 > index->file->size) {
+		return false;
+	}
 	mrxs_hier_t* focus = focus_hier >= 0 ? mrxs->hier + focus_hier : NULL;
 	mrxs->plane_count = focus ? focus->val_count : 1;
 	/* Bound allocations for malformed metadata; physical planes are normally few. */
-	if (mrxs->plane_count > 64) return false;
+	if (mrxs->plane_count > 64) {
+		return false;
+	}
 	mrxs->planes = calloc(mrxs->plane_count, sizeof(*mrxs->planes));
-	if (!mrxs->planes) return false;
+	if (!mrxs->planes) {
+		return false;
+	}
 	if (focus && mrxs->extended_focus_value < 0) {
-		for (i32 i = 0; i < focus->val_count; ++i)
-			if (focus->val[i].name && strcmp(focus->val[i].name, "ExtFocusLevel") == 0)
+		for (i32 i = 0; i < focus->val_count; ++i) {
+			if (focus->val[i].name && strcmp(focus->val[i].name, "ExtFocusLevel") == 0) {
 				mrxs->extended_focus_value = i;
+			}
+		}
 	}
 	i32 default_focus = focus ? focus->default_value : 0;
-	if (focus && mrxs->extended_focus_value >= 0 && mrxs->extended_focus_value < focus->val_count)
+	if (focus && mrxs->extended_focus_value >= 0 && mrxs->extended_focus_value < focus->val_count) {
 		default_focus = mrxs->extended_focus_value;
+	}
 	for (i32 p = 0; p < mrxs->plane_count; ++p) {
 		mrxs_plane_t* plane = mrxs->planes + p;
 		i32 value = p == 0 ? default_focus : (p <= default_focus ? p - 1 : p);
@@ -554,7 +662,8 @@ static bool mrxs_read_focus_pyramids(mrxs_t* mrxs, mem_t* index, u32 root) {
 		mrxs_plane_t v = mrxs->planes[p];
 		i32 j = p;
 		while (j > 1 && v.offset_known && mrxs->planes[j-1].offset_known && v.offset_um < mrxs->planes[j-1].offset_um) {
-			mrxs->planes[j] = mrxs->planes[j-1]; --j;
+			mrxs->planes[j] = mrxs->planes[j-1];
+			--j;
 		}
 		mrxs->planes[j] = v;
 	}
@@ -562,64 +671,47 @@ static bool mrxs_read_focus_pyramids(mrxs_t* mrxs, mem_t* index, u32 root) {
 	for (i32 p = 0; p < mrxs->plane_count; ++p) {
 		mrxs_plane_t* plane = mrxs->planes + p;
 		if (!plane->is_extended_focus && (plane->hier_value == mrxs->zero_focus_value ||
-		    (plane->offset_known && plane->offset_um == 0))) mrxs->zero_plane = p;
+		    (plane->offset_known && plane->offset_um == 0))) {
+			mrxs->zero_plane = p;
+		}
 		for (i32 l = 0; l < mrxs->level_count; ++l) {
-			mrxs_level_t* level = mrxs->levels + l;
 			u64 record = defaults + zoom_stride * l + focus_stride * plane->hier_value;
-			u32 page; memcpy(&page, index->data + root + record * 4, 4);
+			u32 page;
+			if (!mrxs_index_read(index, (u64)root + record * 4, &page, 4)) {
+				return false;
+			}
+			plane->index_pages[l] = page;
 			plane->level_available[l] = page != 0;
-			if (p == 0) plane->tiles[l] = level->tiles;
-			else if (page) plane->tiles[l] = calloc((size_t)level->width_in_tiles * level->height_in_tiles, sizeof(mrxs_tile_t));
-			if (page && (!plane->tiles[l] || !mrxs_read_plane_level(mrxs, index, page, p, l))) return false;
 		}
 	}
 	return true;
 }
 
-bool mrxs_read_stitching_intensity_level(mrxs_t* mrxs, mem_t* index_dat, mrxs_nonhier_val_t* nonhier_val) {
-    i32 page_count = 0; // the first page doesn't count, it always has 0 entries
-    for (;;) {
-        u32 entry_count = 0;
-        u32 next_ptr = 0;
-        mem_read(&entry_count, index_dat, 4);
-        mem_read(&next_ptr, index_dat, 4);
-        if (entry_count > 0) {
-            // read entries
-            for (i32 j = 0; j < entry_count; ++j) {
-                mrxs_nonhier_entry_t entry = {};
-                mem_read(&entry, index_dat, sizeof(entry));
-                mrxs->stitching_intensity_layer_entry = entry;
-                DUMMY_STATEMENT;
-                return true; // only one (relevant) entry is expected
-            }
-        }
-        if (next_ptr != 0 && next_ptr < index_dat->len) {
-            mem_seek(index_dat, next_ptr);
-            ++page_count;
-        } else {
-            break; // last page reached
-        }
-    }
-    return false;
-}
-
-bool mrxs_read_nonhier_first_entry(mem_t* index_dat, mrxs_nonhier_entry_t* out_entry) {
-    for (;;) {
-        u32 entry_count = 0;
-        u32 next_ptr = 0;
-        mem_read(&entry_count, index_dat, 4);
-        mem_read(&next_ptr, index_dat, 4);
-        if (entry_count > 0) {
-            mem_read(out_entry, index_dat, sizeof(*out_entry));
-            return true;
-        }
-        if (next_ptr != 0 && next_ptr < index_dat->len) {
-            mem_seek(index_dat, next_ptr);
-        } else {
-            break;
-        }
-    }
-    return false;
+static bool mrxs_read_nonhier_first_entry(mrxs_index_reader_t* reader, u32 page, mrxs_nonhier_entry_t* entry) {
+	struct {
+		u32 key;
+		bool value;
+	}* visited = NULL;
+	bool success = false;
+	while (page) {
+		if (hmget(visited, page)) {
+			break;
+		}
+		hmput(visited, page, true);
+		u32 entry_count = 0;
+		u32 next_page = 0;
+		if (!mrxs_index_read(reader, page, &entry_count, sizeof(entry_count)) ||
+		    !mrxs_index_read(reader, (u64)page + 4, &next_page, sizeof(next_page))) {
+			break;
+		}
+		if (entry_count > 0) {
+			success = mrxs_index_read(reader, (u64)page + 8, entry, sizeof(*entry));
+			break;
+		}
+		page = next_page;
+	}
+	hmfree(visited);
+	return success;
 }
 
 bool mrxs_load_slide_position_file(mrxs_t* mrxs) {
@@ -754,139 +846,136 @@ static bool mrxs_prepare_overlap_geometry(mrxs_t* mrxs) {
 }
 
 bool mrxs_open_from_source(mrxs_t* mrxs, source_fs_t* source, const char* directory) {
-    bool success = false;
+	bool success = false;
 	mrxs->source = source;
-	if (!source || !directory) return false;
+	if (!source || !directory) {
+		return false;
+	}
 
 	i64 start = get_clock();
 	mrxs->extended_focus_value = -1;
 	mrxs->zero_focus_value = -1;
-    mem_t* slidedat_ini = mrxs_read_metadata(source, directory, "Slidedat.ini");
+	mem_t* slidedat_ini = mrxs_read_metadata(source, directory, "Slidedat.ini");
+	if (!slidedat_ini) {
+		return false;
+	}
+	bool parsed = mrxs_parse_slidedat_ini(mrxs, slidedat_ini);
+	free(slidedat_ini);
+	if (!parsed) {
+		return false;
+	}
 
-    if (slidedat_ini) {
-        if (mrxs_parse_slidedat_ini(mrxs, slidedat_ini)) {
-            mem_t* index_dat = mrxs_read_metadata(source, directory, mrxs->index_dat_filename);
-	        if (index_dat) {
-		        i64 index_parse_start = get_clock();
-		        char version[6] = {};
-                char slide_id[33] = {};
-                u32 hier_root = 0;
-                u32 nonhier_root = 0;
-                mem_read(version, index_dat, 5);
-                mem_read(slide_id, index_dat, 32);
-                mem_read(&hier_root, index_dat, 4);
-                mem_read(&nonhier_root, index_dat, 4);
+	char path[SOURCE_PATH_CAPACITY];
+	if (!mrxs_source_path(path, sizeof(path), directory, mrxs->index_dat_filename) ||
+	    !source_fs_open_file(source, path, &mrxs->index_file)) {
+		return false;
+	}
+	mrxs_index_reader_t reader = {.file = &mrxs->index_file};
 
-                bool failed = false;
-                if (hier_root > 0 && hier_root < index_dat->len) {
+	// Read the Index.dat header. Keep the identifying fields available for debugging.
+	char version[6] = {0};
+	char slide_id[33] = {0};
+	u32 hier_root = 0;
+	u32 nonhier_root = 0;
+	if (!mrxs_index_read(&reader, 0, version, 5) ||
+	    !mrxs_index_read(&reader, 5, slide_id, 32) ||
+	    !mrxs_index_read(&reader, 37, &hier_root, sizeof(hier_root)) ||
+	    !mrxs_index_read(&reader, 41, &nonhier_root, sizeof(nonhier_root))) {
+		return false;
+	}
+	if (hier_root == 0 || hier_root >= mrxs->index_file.size ||
+	    nonhier_root == 0 || nonhier_root >= mrxs->index_file.size) {
+		return false;
+	}
 
-					// Initialize some basic stuff
-					mrxs_hier_t* hier_zoom_levels = mrxs->hier + mrxs->slide_zoom_level_hier_index;
-					mrxs->level_count = hier_zoom_levels->val_count;
-					if (mrxs->level_count <= 0 || mrxs->level_count > COUNT(mrxs->levels) ||
-					    mrxs->base_width_in_tiles <= 0 || mrxs->base_height_in_tiles <= 0 ||
-					    (u64)mrxs->base_width_in_tiles * mrxs->base_height_in_tiles > INT32_MAX) goto label_failed;
-					for (i32 i = 0; i < mrxs->level_count; ++i) {
-						mrxs_level_t* level = mrxs->levels + i;
-						level->width_in_tiles = (mrxs->base_width_in_tiles + (1 << i) - 1) >> i;
-						level->height_in_tiles = (mrxs->base_height_in_tiles + (1 << i) - 1) >> i;
-						u32 tile_count = level->width_in_tiles * level->height_in_tiles;
-						level->tiles = calloc(tile_count, sizeof(mrxs_tile_t ));
-						if (!level->tiles) goto label_failed;
-					}
+	// Initialize pyramid dimensions; tile indexes will be populated separately.
+	mrxs_hier_t* hier_zoom_levels = mrxs->hier + mrxs->slide_zoom_level_hier_index;
+	mrxs->level_count = hier_zoom_levels->val_count;
+	if (mrxs->level_count <= 0 || mrxs->level_count > COUNT(mrxs->levels) ||
+	    mrxs->base_width_in_tiles <= 0 || mrxs->base_height_in_tiles <= 0 ||
+	    (u64)mrxs->base_width_in_tiles * mrxs->base_height_in_tiles > INT32_MAX) {
+		return false;
+	}
+	for (i32 i = 0; i < mrxs->level_count; ++i) {
+		mrxs_level_t* level = mrxs->levels + i;
+		level->width_in_tiles = (mrxs->base_width_in_tiles + (1 << i) - 1) >> i;
+		level->height_in_tiles = (mrxs->base_height_in_tiles + (1 << i) - 1) >> i;
+	}
 
-                    // Additional initialization to deal with slides with overlapping images
-                    mrxs_level_t* base_level = mrxs->levels + 0;
-                    mrxs->has_overlapping_tiles = (base_level->overlap_x != 0.0f || base_level->overlap_y != 0.0f);
-                    if (mrxs->has_overlapping_tiles) {
-                        // Calculate the actual width and height of the image
-                        float base_width = 0.0f;
-                        for (i32 i = 0; i < base_level->width_in_tiles; ++i) {
-                            base_width += base_level->tile_width;
-                            if ((i + 1) % mrxs->camera_image_divisions_per_slide == 0 && i != base_level->width_in_tiles - 1) {
-                                base_width -= base_level->overlap_x;
-                            }
-                        }
-                        float base_height = 0.0f;
-                        for (i32 i = 0; i < base_level->height_in_tiles; ++i) {
-                            base_height += base_level->tile_height;
-                            if ((i + 1) % mrxs->camera_image_divisions_per_slide == 0 && i != base_level->height_in_tiles - 1) {
-                                base_height -= base_level->overlap_y;
-                            }
-                        }
-                        mrxs->base_width_in_pixels = roundf(base_width);
-                        mrxs->base_height_in_pixels = roundf(base_height);
+	// Account for overlap between camera images.
+	mrxs_level_t* base_level = mrxs->levels;
+	mrxs->has_overlapping_tiles = base_level->overlap_x != 0.0f || base_level->overlap_y != 0.0f;
+	mrxs->base_width_in_pixels = base_level->width_in_tiles * base_level->tile_width;
+	mrxs->base_height_in_pixels = base_level->height_in_tiles * base_level->tile_height;
+	if (mrxs->has_overlapping_tiles) {
+		i32 divisions = mrxs->camera_image_divisions_per_slide;
+		if (divisions <= 0) {
+			return false;
+		}
+		// Calculate the actual width and height of the image
+		float base_width = 0.0f;
+		for (i32 i = 0; i < base_level->width_in_tiles; ++i) {
+			base_width += base_level->tile_width;
+			if ((i + 1) % mrxs->camera_image_divisions_per_slide == 0 && i != base_level->width_in_tiles - 1) {
+				base_width -= base_level->overlap_x;
+			}
+		}
+		float base_height = 0.0f;
+		for (i32 i = 0; i < base_level->height_in_tiles; ++i) {
+			base_height += base_level->tile_height;
+			if ((i + 1) % mrxs->camera_image_divisions_per_slide == 0 && i != base_level->height_in_tiles - 1) {
+				base_height -= base_level->overlap_y;
+			}
+		}
+		mrxs->base_width_in_pixels = roundf(base_width);
+		mrxs->base_height_in_pixels = roundf(base_height);
+	}
+	if (!mrxs_read_focus_metadata(mrxs, &reader, hier_root)) {
+		return false;
+	}
 
-                    } else {
-                        mrxs->base_width_in_pixels = base_level->width_in_tiles * base_level->tile_width;
-                        mrxs->base_height_in_pixels = base_level->height_in_tiles * base_level->tile_height;
-                    }
-
-					if (!mrxs_read_focus_pyramids(mrxs, index_dat, hier_root)) goto label_failed;
-
-                } else {
-					label_failed:
-					failed = true;
-                    // TODO: error condition
-                }
-
-                if (!failed && nonhier_root > 0 && nonhier_root < index_dat->len) {
-                    mem_seek(index_dat, nonhier_root);
-
-                    // There is one record stored for each HIER_i_VAL_j combination (all in a flat array)
-                    i32 record_index = 0;
-                    for (i32 nonhier_index = 0; nonhier_index < mrxs->nonhier_count; ++nonhier_index) {
-                        mrxs_nonhier_t* nonhier = mrxs->nonhier + nonhier_index;
-                        for (i32 val_index = 0; val_index < nonhier->val_count; ++val_index, ++record_index) {
-                            mrxs_nonhier_val_t* nonhier_val = nonhier->val + val_index;
-
-                            mem_seek(index_dat, nonhier_root + record_index * sizeof(u32));
-                            u32 record_ptr = 0;
-                            mem_read(&record_ptr, index_dat, 4);
-                            mem_seek(index_dat, record_ptr);
-                            if (nonhier->name == MRXS_NONHIER_STITCHING_INTENSITY_LAYER && nonhier_val->type == MRXS_NONHIER_VAL_STITCHING_INTENSITY_LEVEL) {
-                                if (!mrxs_read_stitching_intensity_level(mrxs, index_dat, nonhier_val)) {
-                                    goto label_failed;
-                                }
-                            } else if (nonhier->name == MRXS_NONHIER_SCAN_DATA_LAYER) {
-                                mrxs_simple_image_t* image = NULL;
-                                if (nonhier_val->type == MRXS_NONHIER_VAL_SCANDATALAYER_SCANMAP) {
-                                    image = &mrxs->scanmap_image;
-                                } else if (nonhier_val->type == MRXS_NONHIER_VAL_SCANDATALAYER_STAGEPOSITIONMAP) {
-                                    image = &mrxs->stageposmap_image;
-                                } else if (nonhier_val->type == MRXS_NONHIER_VAL_SCANDATALAYER_SLIDETHUMBNAIL) {
-                                    image = &mrxs->thumbnail_image;
-                                } else if (nonhier_val->type == MRXS_NONHIER_VAL_SCANDATALAYER_SLIDEBARCODE) {
-                                    image = &mrxs->barcode_image;
-                                }
-                                if (image) {
-                                    mrxs_read_nonhier_first_entry(index_dat, &image->entry);
-                                }
-                            }
-
-                        }
-                    }
-
-					success = true;
-                } else {
-                    failed = true;
-                    // TODO: error condition
-                }
-
-                free(index_dat);
-
-		        console_print_verbose("Parsing index took %g seconds.\n", get_seconds_elapsed(index_parse_start, get_clock()));
-            }
-        }
-        free(slidedat_ini);
-    }
-	i64 clock_index_loaded = get_clock();
-	console_print_verbose("Slidedat.ini and index loaded in %g seconds.\n", get_seconds_elapsed(start, clock_index_loaded));
+	// Nonhierarchical records describe stitching data and associated images.
+	u64 record_index = 0;
+	for (i32 nonhier_index = 0; nonhier_index < mrxs->nonhier_count; ++nonhier_index) {
+		mrxs_nonhier_t* nonhier = mrxs->nonhier + nonhier_index;
+		for (i32 val_index = 0; val_index < nonhier->val_count; ++val_index, ++record_index) {
+			mrxs_nonhier_val_t* nonhier_val = nonhier->val + val_index;
+			u32 page;
+			if (!mrxs_index_read(&reader, nonhier_root + record_index * 4, &page, sizeof(page))) {
+				return false;
+			}
+			if (nonhier->name == MRXS_NONHIER_STITCHING_INTENSITY_LAYER &&
+			    nonhier_val->type == MRXS_NONHIER_VAL_STITCHING_INTENSITY_LEVEL) {
+				if (!mrxs_read_nonhier_first_entry(&reader, page, &mrxs->stitching_intensity_layer_entry)) {
+					return false;
+				}
+			} else if (nonhier->name == MRXS_NONHIER_SCAN_DATA_LAYER) {
+				mrxs_simple_image_t* image = NULL;
+				if (nonhier_val->type == MRXS_NONHIER_VAL_SCANDATALAYER_SCANMAP) {
+					image = &mrxs->scanmap_image;
+				} else if (nonhier_val->type == MRXS_NONHIER_VAL_SCANDATALAYER_STAGEPOSITIONMAP) {
+					image = &mrxs->stageposmap_image;
+				} else if (nonhier_val->type == MRXS_NONHIER_VAL_SCANDATALAYER_SLIDETHUMBNAIL) {
+					image = &mrxs->thumbnail_image;
+				} else if (nonhier_val->type == MRXS_NONHIER_VAL_SCANDATALAYER_SLIDEBARCODE) {
+					image = &mrxs->barcode_image;
+				}
+				if (image) {
+					mrxs_read_nonhier_first_entry(&reader, page, &image->entry);
+				}
+			}
+		}
+	}
+	success = true;
+	i64 clock_metadata_opened = get_clock();
+	console_print_verbose("MRXS metadata opened in %g seconds.\n", get_seconds_elapsed(start, clock_metadata_opened));
 
 	if (success) {
 		ASSERT(mrxs->dat_filenames && mrxs->dat_count > 0);
 		mrxs->dat_files = calloc((size_t)mrxs->dat_count, sizeof(*mrxs->dat_files));
-		if (!mrxs->dat_files) return false;
+		if (!mrxs->dat_files) {
+			return false;
+		}
 		for (i32 i = 0; i < mrxs->dat_count; ++i) {
 			char path[SOURCE_PATH_CAPACITY];
 			if (!mrxs_source_path(path, sizeof(path), directory, mrxs->dat_filenames[i]) ||
@@ -897,19 +986,18 @@ bool mrxs_open_from_source(mrxs_t* mrxs, source_fs_t* source, const char* direct
 			}
 		}
 
-        console_print_verbose("Opening file handles to %d dat files took %g seconds.\n", mrxs->dat_count, get_seconds_elapsed(clock_index_loaded, get_clock()));
+		console_print_verbose("Opening file handles to %d dat files took %g seconds.\n", mrxs->dat_count, get_seconds_elapsed(clock_metadata_opened, get_clock()));
 
-        if (success && mrxs->has_overlapping_tiles) {
-            // Load the slide position file
-            if (mrxs_load_slide_position_file(mrxs)) {
-                mrxs_prepare_overlap_geometry(mrxs);
-            }
-        }
+		if (success && mrxs->has_overlapping_tiles) {
+			// Load the slide position file
+			if (mrxs_load_slide_position_file(mrxs)) {
+				mrxs_prepare_overlap_geometry(mrxs);
+			}
+		}
 
+	}
 
-    }
-
-    return success;
+	return success;
 }
 
 bool mrxs_open_from_directory(mrxs_t* mrxs, file_info_t* file, directory_info_t* directory) {

@@ -187,7 +187,7 @@ bool archive_mrxs_adapter_open(archive_mrxs_adapter_t* adapter,
 	directory.is_directory =
 		directory.is_valid && S_ISDIR(directory_info.st_mode);
 	if (!directory.is_directory ||
-	    !mrxs_open_from_directory(&adapter->slide, &directory, NULL)) {
+	    !mrxs_open_from_directory(&adapter->slide, &directory, NULL) || !mrxs_index_all(&adapter->slide)) {
 		archive_mrxs_set_error(error, error_capacity,
 		                       "built-in MRXS reader rejected '%s'",
 		                       mrxs_path);
@@ -512,7 +512,13 @@ bool archive_mrxs_adapter_open_zip(archive_mrxs_adapter_t* adapter, const char* 
 	memset(adapter, 0, sizeof(*adapter));
 	adapter->is_zip = true;
 	if (!mrxs_open_from_zip(&adapter->slide, path, error, capacity)) {
-		archive_mrxs_adapter_close(adapter); return false;
+		archive_mrxs_adapter_close(adapter);
+		return false;
+	}
+	if (!mrxs_index_all(&adapter->slide)) {
+		archive_mrxs_set_error(error, capacity, "built-in MRXS reader could not index '%s'", path);
+		archive_mrxs_adapter_close(adapter);
+		return false;
 	}
 	return archive_mrxs_validate(adapter, path, error, capacity);
 }

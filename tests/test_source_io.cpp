@@ -3,6 +3,7 @@
 #include "miniz.h"
 #include "mrxs.h"
 #include "image_loader.h"
+#include "tile_cache.h"
 #include "test_temp.h"
 #include "archive_ingest.h"
 #include "archive_instance_provider.h"
@@ -359,6 +360,8 @@ TEST_CASE("native MRXS opens and decodes a nested stored ZIP without an mrxs thu
 	mrxs_t slide = {};
 	char error[256];
 	REQUIRE_MESSAGE(mrxs_open_from_zip(&slide, temp.path, error, sizeof(error)), error);
+	CHECK(slide.levels[0].tiles == nullptr);
+	REQUIRE(mrxs_index_all(&slide));
 	CHECK(slide.level_count == 1);
 	CHECK(slide.base_width_in_pixels == 2);
 	CHECK(slide.base_height_in_pixels == 2);
@@ -1074,6 +1077,8 @@ TEST_CASE("MRXS focus pyramids use mixed radix addressing and retain extended fo
 	mrxs_t slide = {};
 	char error[256] = {};
 	REQUIRE_MESSAGE(mrxs_open_from_zip(&slide, temp.path, error, sizeof(error)), error);
+	CHECK(slide.levels[0].tiles == nullptr);
+	REQUIRE(mrxs_index_all(&slide));
 	CHECK(slide.plane_count == 4);
 	CHECK(slide.zero_plane == 2);
 	CHECK(slide.planes[0].is_extended_focus);
@@ -1133,6 +1138,7 @@ TEST_CASE("MRXS shared coverage ignores extra physical-plane tiles and caps warn
 	image_load_options_t options = {};
 	image_t* image = image_load_from_file(&info, nullptr, &options);
 	REQUIRE(image);
+	REQUIRE(image_wait_for_level_index(image, image->plane_count - 1, 0));
 	CHECK(image->mrxs.extra_tile_warning_count == 5); // Eight extra entries, only five warnings.
 	CHECK(image->level_images[0].tiles[1].is_empty);
 	u8* decoded = mrxs_decode_tile_to_bgra(&image->mrxs, 2, 0, 1);
@@ -1149,7 +1155,141 @@ TEST_CASE("MRXS focus indexes reject cycles out of range tiles and truncated pag
 	for (int damage = 1; damage <= 3; ++damage) {
 		source_test_file temp(tiny_mrxs_focus_zip(damage));
 		mrxs_t slide = {}; char error[256] = {};
-		CHECK_FALSE(mrxs_open_from_zip(&slide, temp.path, error, sizeof(error)));
+		REQUIRE(mrxs_open_from_zip(&slide, temp.path, error, sizeof(error)));
+		CHECK_FALSE(mrxs_index_all(&slide));
 		mrxs_destroy(&slide);
+	}
+}
+
+// No automatic consumers: tests can inspect the queued job before letting it run.
+struct mrxs_test_pool {
+	thread_pool_t pool = {};
+	mrxs_test_pool() {
+		init_global_system_info(false);
+		if (!threadlocal_thread_memory) {
+			init_thread_memory(&global_system_info);
+		}
+		i32 count = global_system_info.suggested_total_thread_count;
+		global_system_info.suggested_total_thread_count = 1;
+		init_thread_pool(&pool, 8, true, false, nullptr);
+		global_system_info.suggested_total_thread_count = count;
+	}
+	~mrxs_test_pool() {
+		thread_pool_destroy(&pool);
+	}
+};
+
+TEST_CASE("MRXS indexing is one high priority job and region reads wait for it") {
+	REQUIRE(archive_instance_provider_initialize());
+	for (bool focus : {false, true}) {
+		mrxs_test_pool worker;
+		source_test_file temp(focus ? tiny_mrxs_focus_zip() : tiny_mrxs_zip());
+		file_info_t info = viewer_get_file_info(temp.path);
+		info.type = VIEWER_FILE_TYPE_ZIP;
+		image_load_options_t options = {};
+		options.thread_pool = &worker.pool;
+		CHECK(thread_pool_submit_task(&worker.pool, dummy_work_queue_callback, nullptr, 0));
+		image_t* image = image_load_from_file(&info, nullptr, &options);
+		REQUIRE(image);
+		CHECK(work_queue_get_entry_count(worker.pool.high_priority_queue) == 1);
+		CHECK_FALSE(task_group_is_complete(&image->indexing_task));
+		CHECK_FALSE(atomic_load_acquire(&image->indexing_finished));
+		CHECK(image->level_images[0].tiles == nullptr);
+		CHECK_FALSE(tile_cache_try_begin_decode(image, 0, 0, 0, 0, 0, 0));
+		CHECK(tile_cache_get_focus_texture(image, 0, 0) == 0);
+		u8 pixels[16] = {};
+		CHECK(image_read_region(image, 0, 0, 0, 0, 2, 2, pixels, PIXEL_FORMAT_U8_BGRA));
+		CHECK(atomic_load_acquire(&image->indexing_finished));
+		CHECK_FALSE(atomic_load_acquire(&image->indexing_failed));
+		CHECK(task_group_is_complete(&image->indexing_task));
+		CHECK(work_queue_get_entry_count(worker.pool.queue) == 1); // Indexing overtook normal work.
+		for (int level = 0; level < image->level_count; ++level) {
+			for (int plane = 0; plane < image->plane_count; ++plane) {
+				CHECK(image_level_index_ready(image, plane, level));
+			}
+		}
+		image_destroy(image);
+		free(image);
+	}
+}
+
+struct mrxs_index_gate {
+	source_file_t file;
+	u64 offset;
+	std::atomic<bool> entered{false};
+	std::atomic<bool> release{false};
+};
+
+static source_read_result_t gated_mrxs_index_read(void* context, u64 offset, void* data, size_t size) {
+	auto* gate = (mrxs_index_gate*)context;
+	if (offset == gate->offset) {
+		gate->entered.store(true);
+		while (!gate->release.load()) {
+			platform_sleep(1);
+		}
+	}
+	return source_file_read(&gate->file, offset, data, size);
+}
+
+TEST_CASE("MRXS publishes coarse levels before fine indexes finish") {
+	mrxs_test_pool worker;
+	source_test_file temp(tiny_mrxs_focus_zip());
+	file_info_t info = viewer_get_file_info(temp.path);
+	info.type = VIEWER_FILE_TYPE_ZIP;
+	image_load_options_t options = {};
+	options.thread_pool = &worker.pool;
+	image_t* image = image_load_from_file(&info, nullptr, &options);
+	REQUIRE(image);
+	mrxs_index_gate gate;
+	gate.file = image->mrxs.index_file;
+	gate.offset = image->mrxs.planes[0].index_pages[0];
+	source_blob_t blob = {gate.file.size, &gate, gated_mrxs_index_read, nullptr};
+	CHECK(source_file_view(&blob, 0, blob.size, &image->mrxs.index_file));
+	std::thread indexing([&] {
+		init_thread_memory(&global_system_info);
+		thread_pool_do_work(&worker.pool);
+		destroy_thread_memory();
+	});
+	i64 start = get_clock();
+	while (!gate.entered.load() && get_seconds_elapsed(start, get_clock()) < 5) {
+		platform_sleep(1);
+	}
+	CHECK(gate.entered.load());
+	for (int plane = 0; plane < image->plane_count; ++plane) {
+		CHECK(image_level_index_ready(image, plane, 1));
+		CHECK_FALSE(image_level_index_ready(image, plane, 0));
+	}
+	CHECK_FALSE(atomic_load_acquire(&image->indexing_finished));
+	gate.release.store(true);
+	indexing.join();
+	CHECK(image_wait_for_level_index(image, 3, 0));
+	image_destroy(image);
+	free(image);
+}
+
+TEST_CASE("MRXS pending indexing can be cancelled and malformed indexes terminate waiting reads") {
+	for (int damage = 0; damage <= 3; ++damage) {
+		mrxs_test_pool worker;
+		source_test_file temp(tiny_mrxs_focus_zip(damage));
+		file_info_t info = viewer_get_file_info(temp.path);
+		info.type = VIEWER_FILE_TYPE_ZIP;
+		image_load_options_t options = {};
+		options.thread_pool = &worker.pool;
+		image_t* image = image_load_from_file(&info, nullptr, &options);
+		REQUIRE(image);
+		if (damage) {
+			u8 pixels[16] = {};
+			CHECK_FALSE(image_read_region(image, 0, 0, 0, 0, 2, 2, pixels, PIXEL_FORMAT_U8_BGRA));
+			CHECK(atomic_load_acquire(&image->indexing_finished));
+			CHECK(atomic_load_acquire(&image->indexing_failed));
+			CHECK_FALSE(image_level_index_ready(image, 0, 0));
+			CHECK(image->level_images[0].tiles == nullptr);
+			if (damage == 3) {
+				CHECK(image_level_index_ready(image, 0, 1));
+			}
+		}
+		image_destroy(image);
+		free(image);
+		CHECK_FALSE(thread_pool_is_work_in_progress(&worker.pool));
 	}
 }

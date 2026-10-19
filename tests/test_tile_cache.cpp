@@ -602,6 +602,7 @@ static void tile_cache_test_stack_init(tile_cache_test_image_t* fixture) {
 	tile_cache_destroy(fixture->image.tile_cache);
 	image_t* image = &fixture->image;
 	image->backend = IMAGE_BACKEND_MRXS;
+	image->level_images[0].indexed_planes = UINT64_MAX;
 	image->plane_count = image->mrxs.plane_count = 4;
 	image->mrxs.level_count = 1;
 	image->mrxs.levels[0].width_in_tiles = image->mrxs.levels[0].height_in_tiles = 1;
