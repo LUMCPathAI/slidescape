@@ -437,15 +437,15 @@ TEST_CASE("DICOMweb expands TILED_SPARSE frames into a dense tile map") {
 	CHECK(metadata.frame_numbers[2] == 2);
 	CHECK(metadata.frame_numbers[3] == 3);
 
-	dicomweb_remote_image_t remote = {};
-	remote.instances = (dicomweb_instance_metadata_t*)calloc(
-		1, sizeof(*remote.instances));
-	REQUIRE(remote.instances != nullptr);
-	remote.instances[0] = metadata;
-	remote.instance_count = 1;
-	remote.instance_capacity = 1;
 	image_t image = {};
-	REQUIRE(init_image_from_dicomweb(&image, &remote, false));
+	dicomweb_remote_image_t* remote = &image.dicomweb;
+	remote->instances = (dicomweb_instance_metadata_t*)calloc(
+		1, sizeof(*remote->instances));
+	REQUIRE(remote->instances != nullptr);
+	remote->instances[0] = metadata;
+	remote->instance_count = 1;
+	remote->instance_capacity = 1;
+	REQUIRE(init_image_from_dicomweb(&image, false));
 	REQUIRE(image.level_images[0].tile_count == 4);
 	CHECK_FALSE(image.level_images[0].tiles[0].is_empty);
 	CHECK(image.level_images[0].tiles[1].is_empty);

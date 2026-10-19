@@ -532,6 +532,85 @@ struct source_test_directory {
 	}
 };
 
+static int loader_openslide_handle;
+static int loader_openslide_closes;
+static bool loader_openslide_succeeds;
+static openslide_t* WINAPI loader_openslide_open(const char*) {
+	return loader_openslide_succeeds ? (openslide_t*)&loader_openslide_handle : nullptr;
+}
+static void WINAPI loader_openslide_close(openslide_t* handle) {
+	CHECK(handle == (openslide_t*)&loader_openslide_handle);
+	++loader_openslide_closes;
+}
+static const char* WINAPI loader_openslide_error(openslide_t*) { return nullptr; }
+static i32 WINAPI loader_openslide_levels(openslide_t*) { return 1; }
+static void WINAPI loader_openslide_dimensions(openslide_t*, i64* w, i64* h) { *w = *h = 2; }
+static void WINAPI loader_openslide_level_dimensions(openslide_t* handle, i32, i64* w, i64* h) {
+	loader_openslide_dimensions(handle, w, h);
+}
+static double WINAPI loader_openslide_downsample(openslide_t*, i32) { return 1.0; }
+static const char* const* WINAPI loader_openslide_names(openslide_t*) { return nullptr; }
+static const char* WINAPI loader_openslide_property(openslide_t*, const char*) { return nullptr; }
+
+TEST_CASE("partial native MRXS failure releases backend storage before OpenSlide fallback") {
+	source_test_directory root;
+	source_test_file zip(tiny_mrxs_zip());
+	source_fs_t* source = source_fs_open_zip(zip.path, nullptr, 0);
+	REQUIRE(source);
+	mem_t* ini = source_fs_read_entire(source, "wrapper/slide/Slidedat.ini", MEGABYTES(1));
+	REQUIRE(ini);
+	std::string ini_path = std::string(root.path) + "/Slidedat.ini";
+	FILE* fp = fopen(ini_path.c_str(), "wb"); REQUIRE(fp);
+	REQUIRE(fwrite(ini->data, 1, ini->len, fp) == ini->len);
+	REQUIRE(fclose(fp) == 0);
+	free(ini);
+	source_fs_close(source);
+	// Metadata allocates backend state, but the missing Index.dat prevents opening.
+	file_info_t file = viewer_get_file_info(root.path);
+	file.type = VIEWER_FILE_TYPE_MRXS;
+	directory_info_t directory = {};
+
+	struct restore_openslide_t {
+		openslide_api saved = openslide;
+		~restore_openslide_t() { openslide = saved; }
+	} restore;
+	openslide = {};
+	openslide.open = loader_openslide_open;
+	openslide.close = loader_openslide_close;
+	openslide.get_error = loader_openslide_error;
+	openslide.get_level_count = loader_openslide_levels;
+	openslide.get_level0_dimensions = loader_openslide_dimensions;
+	openslide.get_level_dimensions = loader_openslide_level_dimensions;
+	openslide.get_level_downsample = loader_openslide_downsample;
+	openslide.get_property_names = loader_openslide_names;
+	openslide.get_property_value = loader_openslide_property;
+	openslide.get_associated_image_names = loader_openslide_names;
+	for (bool succeeds : {false, true}) {
+		loader_openslide_succeeds = succeeds;
+		loader_openslide_closes = 0;
+		image_load_options_t options = {};
+		options.use_native_mrxs_backend = true;
+		options.openslide_available = true;
+		options.openslide_loading_done = true;
+		image_t* image = image_load_from_file(&file, &directory, &options);
+		REQUIRE(image);
+		CHECK(image->backend == IMAGE_BACKEND_OPENSLIDE);
+		CHECK(image->is_valid == succeeds);
+		CHECK(loader_openslide_closes == 0);
+		if (succeeds) {
+			CHECK(image->plane_count == 1);
+			CHECK(image->level_count == 1);
+			CHECK(image->tile_cache != nullptr);
+			image_destroy(image);
+			CHECK(loader_openslide_closes == 1);
+		} else {
+			CHECK(image->openslide_wsi.osr == nullptr);
+			CHECK(image->tile_cache == nullptr);
+		}
+		free(image);
+	}
+}
+
 TEST_CASE("archive owns MRXS ZIP bytes and serves metadata and frames without mounting the bundle") {
 	source_test_directory root;
 	auto bytes = tiny_mrxs_zip(false, false, true);

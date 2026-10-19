@@ -497,22 +497,31 @@ bool open_remote_slide(app_state_t *app_state, const char *hostname, i32 portno,
 #endif
 //	fwrite(read_buffer, total_bytes_read, 1, stdout);
 
-		tiff_t tiff = {0};
-		if (tiff_deserialize(&tiff, mem_buffer.data, mem_buffer.used_size)) {
-			tiff.is_remote = true;
-			tiff.location = (network_location_t){ .hostname = hostname, .portno = portno, .filename = filename };
+		image_t* image = (image_t*)calloc(1, sizeof(image_t));
+		if (!image) { memrw_destroy(&mem_buffer); return false; }
+		image->type = IMAGE_TYPE_WSI;
+		image->backend = IMAGE_BACKEND_TIFF;
+		tiff_t* tiff = &image->tiff;
+		if (tiff_deserialize(tiff, mem_buffer.data, mem_buffer.used_size)) {
+			tiff->is_remote = true;
+			tiff->location = (network_location_t){ .hostname = hostname, .portno = portno, .filename = filename };
 
-			unload_all_images(app_state);
-			image_t* image = (image_t*)calloc(1, sizeof(image_t));
-			bool is_valid = init_image_from_tiff(image, tiff, false, NULL);
+			bool is_valid = init_image_from_tiff(image, false, NULL);
 			if (image->is_valid && !image_initialize_runtime(image)) {
 				image->is_valid = false;
 				is_valid = false;
 			}
-			add_image(app_state, image, true, false);
+			if (is_valid) {
+				unload_all_images(app_state);
+				add_image(app_state, image, true, false);
+			} else {
+				image_destroy(image);
+				free(image);
+			}
 			success = is_valid;
 		} else {
-			tiff_destroy(&tiff);
+			image_destroy(image);
+			free(image);
 		}
 
 	}

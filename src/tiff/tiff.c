@@ -1209,7 +1209,7 @@ bool32 tiff_deserialize(tiff_t* tiff, u8* buffer, u64 buffer_size) {
 	POP_DATA(sizeof(tiff_serial_header_t));
 	tiff_serial_header_t* serial_header = (tiff_serial_header_t*) data;
 	*tiff = (tiff_t) {0};
-	tiff->is_remote = 0; // set later
+	tiff->is_remote = 1; // Deserialized IFDs use calloc, including on partial failure.
 	tiff->location = (network_location_t){0}; // set later
 	tiff->filesize = serial_header->filesize;
 	tiff->bytesize_of_offsets = serial_header->bytesize_of_offsets;
@@ -1368,7 +1368,7 @@ void tiff_destroy(tiff_t* tiff) {
 	source_fs_close(tiff->source); tiff->source = NULL;
 	tiff->file = (source_file_t){0};
 
-	for (i32 i = 0; i < tiff->ifd_count; ++i) {
+	for (i32 i = 0; tiff->ifds && i < tiff->ifd_count; ++i) {
 		tiff_ifd_t* ifd = tiff->ifds + i;
 		if (ifd->tile_offsets) free(ifd->tile_offsets);
 		if (ifd->tile_byte_counts) free(ifd->tile_byte_counts);

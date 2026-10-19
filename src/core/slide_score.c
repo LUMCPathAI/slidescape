@@ -673,8 +673,22 @@ static bool slide_score_require_api_key(slide_score_remote_image_t* remote) {
 	return true;
 }
 
+static image_t* slide_score_create_image(void) {
+	image_t* image = (image_t*)calloc(1, sizeof(image_t));
+	if (!image) {
+		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_INVALID_RESPONSE;
+		slide_score_set_last_status("Could not allocate the Slide Score image.");
+		return NULL;
+	}
+	image->type = IMAGE_TYPE_WSI;
+	image->backend = IMAGE_BACKEND_SLIDE_SCORE;
+	image->resource_id = global_next_resource_id++;
+	return image;
+}
+
 static bool slide_score_install_remote_image(app_state_t* app_state,
-		slide_score_remote_image_t* remote) {
+		image_t* image) {
+	slide_score_remote_image_t* remote = &image->slide_score;
 	if (!app_state || !remote || remote->image_id <= 0 ||
 	    !slide_score_require_api_key(remote)) return false;
 
@@ -705,16 +719,8 @@ static bool slide_score_install_remote_image(app_state_t* app_state,
         return false;
     }
 
-    image_t* image = (image_t*)calloc(1, sizeof(image_t));
-	if (!image) {
-		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_INVALID_RESPONSE;
-		slide_score_set_last_status("Could not allocate the Slide Score image.");
-		return false;
-	}
-    image->resource_id = global_next_resource_id++;
-	bool is_valid = init_image_from_slide_score(image, remote, false);
+	bool is_valid = init_image_from_slide_score(image, false);
 	if (!is_valid) {
-		free(image);
 		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_INVALID_RESPONSE;
 		slide_score_set_last_status("Slide Score returned unsupported image metadata for image %d.",
 		                            remote->image_id);
@@ -730,9 +736,6 @@ static bool slide_score_install_remote_image(app_state_t* app_state,
 		if (image->slide_score.case_slide_count > 1) show_slide_tray_window = true;
 		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_NONE;
 		slide_score_set_last_status("Opened Slide Score image %d.", image->slide_score.image_id);
-    } else {
-        image_destroy(image);
-        free(image);
     }
     return is_valid;
 }
@@ -746,11 +749,13 @@ bool slide_score_open_remote_image(app_state_t* app_state, const char* server_ur
 		api_token = api_key;
 	}
 
-	slide_score_remote_image_t remote = {};
-	slide_score_client_init(&remote.client, server_url_or_hostname, api_token);
-	remote.image_id = image_id;
-	bool opened = slide_score_install_remote_image(app_state, &remote);
-	slide_score_remote_image_destroy(&remote);
+	image_t* image = slide_score_create_image();
+	if (!image) return false;
+	slide_score_remote_image_t* remote = &image->slide_score;
+	slide_score_client_init(&remote->client, server_url_or_hostname, api_token);
+	remote->image_id = image_id;
+	bool opened = slide_score_install_remote_image(app_state, image);
+	if (!opened) { image_destroy(image); free(image); }
 	return opened;
 }
 
@@ -779,21 +784,24 @@ static bool slide_score_query_case_images(slide_score_remote_image_t* remote) {
 
 static bool slide_score_open_case(app_state_t* app_state, const char* server,
 		const char* api_token, i32 study_id, i32 case_id, i32 preferred_image_id) {
-	slide_score_remote_image_t remote = {};
-	slide_score_client_init(&remote.client, server, api_token);
-	remote.study_id = study_id;
-	remote.case_id = case_id;
-	if (!slide_score_require_api_key(&remote) || !slide_score_query_case_images(&remote)) {
-		slide_score_remote_image_destroy(&remote);
+	image_t* image = slide_score_create_image();
+	if (!image) return false;
+	slide_score_remote_image_t* remote = &image->slide_score;
+	slide_score_client_init(&remote->client, server, api_token);
+	remote->study_id = study_id;
+	remote->case_id = case_id;
+	if (!slide_score_require_api_key(remote) || !slide_score_query_case_images(remote)) {
+		image_destroy(image);
+		free(image);
 		return false;
 	}
 
-	remote.selected_slide_index = 0;
+	remote->selected_slide_index = 0;
 	if (preferred_image_id > 0) {
 		bool found = false;
-		for (i32 i = 0; i < remote.case_slide_count; ++i) {
-			if (remote.case_slides[i].image_id == preferred_image_id) {
-				remote.selected_slide_index = i;
+		for (i32 i = 0; i < remote->case_slide_count; ++i) {
+			if (remote->case_slides[i].image_id == preferred_image_id) {
+				remote->selected_slide_index = i;
 				found = true;
 				break;
 			}
@@ -803,13 +811,14 @@ static bool slide_score_open_case(app_state_t* app_state, const char* server,
 			slide_score_set_last_status(
 				"Slide Score image %d was not listed in case %d.",
 				preferred_image_id, case_id);
-			slide_score_remote_image_destroy(&remote);
+			image_destroy(image);
+			free(image);
 			return false;
 		}
 	}
-	remote.image_id = remote.case_slides[remote.selected_slide_index].image_id;
-	bool opened = slide_score_install_remote_image(app_state, &remote);
-	slide_score_remote_image_destroy(&remote);
+	remote->image_id = remote->case_slides[remote->selected_slide_index].image_id;
+	bool opened = slide_score_install_remote_image(app_state, image);
+	if (!opened) { image_destroy(image); free(image); }
 	return opened;
 }
 
@@ -824,25 +833,29 @@ bool slide_score_open_case_slide(app_state_t* app_state, image_t* current_image,
 	}
 	if (slide_index == current_image->slide_score.selected_slide_index) return true;
 
-	slide_score_remote_image_t remote = {};
-	remote.client = current_image->slide_score.client;
-	remote.study_id = current_image->slide_score.study_id;
-	remote.case_id = current_image->slide_score.case_id;
-	remote.selected_slide_index = slide_index;
-	remote.case_slide_count = current_image->slide_score.case_slide_count;
-	copy_cstring(remote.case_name, current_image->slide_score.case_name,
-	             sizeof(remote.case_name));
-	size_t slides_size = (size_t)remote.case_slide_count * sizeof(*remote.case_slides);
-	remote.case_slides = (slide_score_slide_ref_t*)malloc(slides_size);
-	if (!remote.case_slides) {
+	image_t* image = slide_score_create_image();
+	if (!image) return false;
+	slide_score_remote_image_t* remote = &image->slide_score;
+	remote->client = current_image->slide_score.client;
+	remote->study_id = current_image->slide_score.study_id;
+	remote->case_id = current_image->slide_score.case_id;
+	remote->selected_slide_index = slide_index;
+	remote->case_slide_count = current_image->slide_score.case_slide_count;
+	copy_cstring(remote->case_name, current_image->slide_score.case_name,
+	             sizeof(remote->case_name));
+	size_t slides_size = (size_t)remote->case_slide_count * sizeof(*remote->case_slides);
+	remote->case_slides = (slide_score_slide_ref_t*)malloc(slides_size);
+	if (!remote->case_slides) {
 		slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_INVALID_RESPONSE;
 		slide_score_set_last_status("Could not copy the Slide Score case slide list.");
+		image_destroy(image);
+		free(image);
 		return false;
 	}
-	memcpy(remote.case_slides, current_image->slide_score.case_slides, slides_size);
-	remote.image_id = remote.case_slides[slide_index].image_id;
-	bool opened = slide_score_install_remote_image(app_state, &remote);
-	slide_score_remote_image_destroy(&remote);
+	memcpy(remote->case_slides, current_image->slide_score.case_slides, slides_size);
+	remote->image_id = remote->case_slides[slide_index].image_id;
+	bool opened = slide_score_install_remote_image(app_state, image);
+	if (!opened) { image_destroy(image); free(image); }
 	return opened;
 }
 
@@ -895,15 +908,21 @@ bool slide_score_open_qupath_metadata_url(app_state_t* app_state, const char* ur
         return false;
     }
 
-    slide_score_remote_image_t remote = {};
-    slide_score_client_init(&remote.client, server, NULL);
-    remote.use_qupath_tile_endpoint = true;
-    if (!parse_i32_after_key(path, "/i/", &remote.image_id)) {
+    image_t* image = slide_score_create_image();
+	if (!image) return false;
+	slide_score_remote_image_t* remote = &image->slide_score;
+    slide_score_client_init(&remote->client, server, NULL);
+    remote->use_qupath_tile_endpoint = true;
+    if (!parse_i32_after_key(path, "/i/", &remote->image_id)) {
         console_print_error("Slide Score QuPath link recognized, but no image id could be found: %s\n", uri);
+        image_destroy(image);
+        free(image);
         return false;
     }
-    if (!slide_score_extract_qupath_base_path(path, remote.qupath_base_path, sizeof(remote.qupath_base_path))) {
+    if (!slide_score_extract_qupath_base_path(path, remote->qupath_base_path, sizeof(remote->qupath_base_path))) {
         console_print_error("Slide Score QuPath link recognized, but no metadata base path could be found: %s\n", uri);
+        image_destroy(image);
+        free(image);
         return false;
     }
 
@@ -919,6 +938,8 @@ bool slide_score_open_qupath_metadata_url(app_state_t* app_state, const char* ur
         slide_score_set_last_status("Slide Score failed to retrieve QuPath metadata: %s.",
 		                            http_response_error_string(transport_error));
         console_print_error("%s\n", slide_score_last_status);
+        image_destroy(image);
+        free(image);
         return false;
     }
 
@@ -927,17 +948,17 @@ bool slide_score_open_qupath_metadata_url(app_state_t* app_state, const char* ur
         slide_score_api_result_t parsed = debug_slide_score_api_handle_response((const char*)response->buffer.data,
                                                                                 response->content_length,
                                                                                 SLIDE_SCORE_API_GET_IMAGE_METADATA);
-        remote.metadata = parsed.get_image_metadata;
-        remote.max_deepzoom_level = ceil_log2_i64(MAX(remote.metadata.level_0_width, remote.metadata.level_0_height));
+        remote->metadata = parsed.get_image_metadata;
+        remote->max_deepzoom_level = ceil_log2_i64(MAX(remote->metadata.level_0_width, remote->metadata.level_0_height));
 
-        if (!slide_score_validate_qupath_link(&remote)) {
+        if (!slide_score_validate_qupath_link(remote)) {
             http_response_destroy(response);
+            image_destroy(image);
+            free(image);
             return false;
         }
 
-        image_t* image = (image_t*)calloc(1, sizeof(image_t));
-        image->resource_id = global_next_resource_id++;
-        bool is_valid = init_image_from_slide_score(image, &remote, false);
+        bool is_valid = init_image_from_slide_score(image, false);
         if (image->is_valid && !image_initialize_runtime(image)) {
             image->is_valid = false;
             is_valid = false;
@@ -946,11 +967,8 @@ bool slide_score_open_qupath_metadata_url(app_state_t* app_state, const char* ur
             unload_all_images(app_state);
             add_image(app_state, image, true, false);
 			slide_score_last_failure_kind = SLIDE_SCORE_FAILURE_NONE;
-            slide_score_set_last_status("Opened Slide Score QuPath link for image %d.", remote.image_id);
+            slide_score_set_last_status("Opened Slide Score QuPath link for image %d.", remote->image_id);
             success = true;
-        } else {
-            image_destroy(image);
-            free(image);
         }
     } else {
 		slide_score_last_failure_kind = slide_score_classify_http_failure(response->status_code);
@@ -959,6 +977,7 @@ bool slide_score_open_qupath_metadata_url(app_state_t* app_state, const char* ur
     }
 
     http_response_destroy(response);
+    if (!success) { image_destroy(image); free(image); }
     return success;
 }
 

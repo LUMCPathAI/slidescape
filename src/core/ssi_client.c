@@ -860,35 +860,15 @@ void ssi_close_remote_image(ssi_remote_image_t* remote) {
 	remote->folder_slide_count = 0;
 }
 
-static image_t* ssi_create_initialized_image(ssi_remote_image_t* remote,
-		bool preserve_session_on_failure) {
+static image_t* ssi_create_image(void) {
 	image_t* image = (image_t*)calloc(1, sizeof(image_t));
 	if (!image) {
 		ssi_set_status("Could not allocate the SSI image.");
 		return NULL;
 	}
+	image->type = IMAGE_TYPE_WSI;
+	image->backend = IMAGE_BACKEND_SSI;
 	image->resource_id = global_next_resource_id++;
-	bool valid = init_image_from_ssi(image, remote, false);
-	if (image->backend == IMAGE_BACKEND_SSI) {
-		remote->session_open = false;
-		remote->slide_open = false;
-		remote->slide_attributes_json = NULL;
-		remote->slide_attributes_json_size = 0;
-		remote->all_properties_json = NULL;
-		remote->all_properties_json_size = 0;
-		remote->folder_slides = NULL;
-		remote->folder_slide_count = 0;
-	}
-	if (valid && !image_initialize_runtime(image)) valid = false;
-	if (!valid) {
-		ssi_set_status("Could not initialize the SSI image pyramid.");
-		if (image->backend == IMAGE_BACKEND_SSI) {
-			if (preserve_session_on_failure) image->ssi.session_open = false;
-			image_destroy(image);
-		}
-		free(image);
-		return NULL;
-	}
 	return image;
 }
 
@@ -931,15 +911,21 @@ bool ssi_open_remote_image(app_state_t* app_state, const char* api_url,
 		ssi_last_failure_kind = SSI_FAILURE_CREDENTIALS_REQUIRED;
 		return false;
 	}
-	ssi_remote_image_t remote = {0};
-	if (!ssi_parse_endpoint(api_url, &remote.endpoint)) {
+	image_t* image = ssi_create_image();
+	if (!image) { ssi_last_failure_kind = SSI_FAILURE_OTHER; return false; }
+	ssi_remote_image_t* remote = &image->ssi;
+	if (!ssi_parse_endpoint(api_url, &remote->endpoint)) {
 		ssi_set_status("Expected a secure SSI API URL ending in /SSI.");
 		ssi_last_failure_kind = SSI_FAILURE_OTHER;
+		image_destroy(image);
+		free(image);
 		return false;
 	}
 	if (strlen(slide_guid) != 32) {
 		ssi_set_status("SSI slide identifiers must contain 32 hexadecimal characters.");
 		ssi_last_failure_kind = SSI_FAILURE_OTHER;
+		image_destroy(image);
+		free(image);
 		return false;
 	}
 	for (i32 i = 0; i < 32; ++i) {
@@ -948,46 +934,50 @@ bool ssi_open_remote_image(app_state_t* app_state, const char* api_url,
 		      (c >= 'A' && c <= 'F'))) {
 			ssi_set_status("SSI slide identifiers must contain 32 hexadecimal characters.");
 			ssi_last_failure_kind = SSI_FAILURE_OTHER;
+			image_destroy(image);
+			free(image);
 			return false;
 		}
 	}
-	memcpy(remote.slide_guid, slide_guid, 33);
-	ssi_copy_display_name(remote.display_name, sizeof(remote.display_name), caption);
-	copy_cstring(remote.api_url, api_url, sizeof(remote.api_url));
-	copy_cstring(remote.slide_center_url, slide_center_url, sizeof(remote.slide_center_url));
+	memcpy(remote->slide_guid, slide_guid, 33);
+	ssi_copy_display_name(remote->display_name, sizeof(remote->display_name), caption);
+	copy_cstring(remote->api_url, api_url, sizeof(remote->api_url));
+	copy_cstring(remote->slide_center_url, slide_center_url, sizeof(remote->slide_center_url));
 
 	bool session_opened = false;
 	if (existing_session_id && existing_session_id[0]) {
-		session_opened = ssi_connect_session(&remote, slide_center_url,
+		session_opened = ssi_connect_session(remote, slide_center_url,
 		                                     existing_session_id);
-		if (!session_opened && remote.failure_kind == SSI_FAILURE_SESSION_EXPIRED &&
+		if (!session_opened && remote->failure_kind == SSI_FAILURE_SESSION_EXPIRED &&
 		    username && username[0] && password && password[0]) {
 			console_print_verbose(
 				"SSI mview session is unavailable; creating a replacement session "
 				"with the cached credentials.\n");
-			remote.failure_kind = SSI_FAILURE_NONE;
-			remote.session_id[0] = '\0';
-			session_opened = ssi_create_session(&remote, slide_center_url,
+			remote->failure_kind = SSI_FAILURE_NONE;
+			remote->session_id[0] = '\0';
+			session_opened = ssi_create_session(remote, slide_center_url,
 			                                    username, password);
 		}
 	} else {
-		session_opened = ssi_create_session(&remote, slide_center_url,
+		session_opened = ssi_create_session(remote, slide_center_url,
 		                                    username, password);
 	}
 	bool opened = session_opened &&
-	              ssi_open_slide(&remote) &&
-	              ssi_get_required_slide_data(&remote);
+	              ssi_open_slide(remote) &&
+	              ssi_get_required_slide_data(remote);
 	if (!opened) {
-		ssi_last_failure_kind = remote.failure_kind != SSI_FAILURE_NONE
-		                        ? remote.failure_kind : SSI_FAILURE_OTHER;
-		ssi_close_remote_image(&remote);
+		ssi_last_failure_kind = remote->failure_kind != SSI_FAILURE_NONE
+		                        ? remote->failure_kind : SSI_FAILURE_OTHER;
+		image_destroy(image);
+		free(image);
 		return false;
 	}
 
-	image_t* image = ssi_create_initialized_image(&remote, false);
-	if (!image) {
+	if (!init_image_from_ssi(image, false) || !image_initialize_runtime(image)) {
+		ssi_set_status("Could not initialize the SSI image pyramid.");
 		ssi_last_failure_kind = SSI_FAILURE_OTHER;
-		if (remote.session_open) ssi_close_remote_image(&remote);
+		image_destroy(image);
+		free(image);
 		return false;
 	}
 	ssi_install_image(app_state, image, total_start_clock);
@@ -1009,48 +999,54 @@ bool ssi_open_folder_slide(app_state_t* app_state, image_t* current_image,
 	}
 	ssi_slide_ref_t selected = current_image->ssi.folder_slides[slide_index];
 	if (strcmp(selected.id, current_image->ssi.slide_guid) == 0) return true;
-	ssi_remote_image_t remote = {0};
-	remote.endpoint = current_image->ssi.endpoint;
-	copy_cstring(remote.api_url, current_image->ssi.api_url, sizeof(remote.api_url));
-	copy_cstring(remote.slide_center_url, current_image->ssi.slide_center_url,
-	             sizeof(remote.slide_center_url));
-	copy_cstring(remote.session_id, current_image->ssi.session_id,
-	             sizeof(remote.session_id));
-	copy_cstring(remote.slide_guid, selected.id, sizeof(remote.slide_guid));
-	ssi_copy_display_name(remote.display_name, sizeof(remote.display_name), selected.name);
-	remote.session_open = current_image->ssi.session_open;
-	if (!remote.session_open) {
+	image_t* image = ssi_create_image();
+	if (!image) { ssi_last_failure_kind = SSI_FAILURE_OTHER; return false; }
+	ssi_remote_image_t* remote = &image->ssi;
+	remote->endpoint = current_image->ssi.endpoint;
+	copy_cstring(remote->api_url, current_image->ssi.api_url, sizeof(remote->api_url));
+	copy_cstring(remote->slide_center_url, current_image->ssi.slide_center_url,
+	             sizeof(remote->slide_center_url));
+	copy_cstring(remote->session_id, current_image->ssi.session_id,
+	             sizeof(remote->session_id));
+	copy_cstring(remote->slide_guid, selected.id, sizeof(remote->slide_guid));
+	ssi_copy_display_name(remote->display_name, sizeof(remote->display_name), selected.name);
+	remote->session_open = current_image->ssi.session_open;
+	if (!remote->session_open) {
 		ssi_set_status("The SSI session is no longer available.");
 		ssi_last_failure_kind = SSI_FAILURE_SESSION_EXPIRED;
+		image_destroy(image);
+		free(image);
 		return false;
 	}
-	bool opened = ssi_open_slide(&remote) &&
-	              ssi_get_required_slide_data(&remote);
+	bool opened = ssi_open_slide(remote) &&
+	              ssi_get_required_slide_data(remote);
 	if (!opened) {
-		ssi_last_failure_kind = remote.failure_kind != SSI_FAILURE_NONE
-		                        ? remote.failure_kind : SSI_FAILURE_OTHER;
-		remote.session_open = false;
-		ssi_close_remote_image(&remote);
+		ssi_last_failure_kind = remote->failure_kind != SSI_FAILURE_NONE
+		                        ? remote->failure_kind : SSI_FAILURE_OTHER;
+		remote->session_open = false;
+		image_destroy(image);
+		free(image);
 		return false;
 	}
 	if (current_image->ssi.folder_slide_count > 0) {
 		size_t folder_slides_size = (size_t)current_image->ssi.folder_slide_count *
-		                            sizeof(*remote.folder_slides);
-		remote.folder_slides = (ssi_slide_ref_t*)malloc(folder_slides_size);
-		if (remote.folder_slides) {
-			memcpy(remote.folder_slides, current_image->ssi.folder_slides,
+		                            sizeof(*remote->folder_slides);
+		remote->folder_slides = (ssi_slide_ref_t*)malloc(folder_slides_size);
+		if (remote->folder_slides) {
+			memcpy(remote->folder_slides, current_image->ssi.folder_slides,
 			       folder_slides_size);
-			remote.folder_slide_count = current_image->ssi.folder_slide_count;
-			copy_cstring(remote.folder_name, current_image->ssi.folder_name,
-			             sizeof(remote.folder_name));
-			remote.folder_slides_compact = current_image->ssi.folder_slides_compact;
+			remote->folder_slide_count = current_image->ssi.folder_slide_count;
+			copy_cstring(remote->folder_name, current_image->ssi.folder_name,
+			             sizeof(remote->folder_name));
+			remote->folder_slides_compact = current_image->ssi.folder_slides_compact;
 		}
 	}
-	image_t* image = ssi_create_initialized_image(&remote, true);
-	if (!image) {
+	if (!init_image_from_ssi(image, false) || !image_initialize_runtime(image)) {
+		ssi_set_status("Could not initialize the SSI image pyramid.");
 		ssi_last_failure_kind = SSI_FAILURE_OTHER;
-		remote.session_open = false;
-		ssi_close_remote_image(&remote);
+		remote->session_open = false;
+		image_destroy(image);
+		free(image);
 		return false;
 	}
 	/* Transfer session ownership before destroying the previous slide image. */

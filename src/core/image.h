@@ -175,6 +175,8 @@ typedef struct image_t {
     bool is_overlay;
 	float initial_rotation;
     bool is_background_black; // if false: background = white (for brightfield)
+    // Set type/backend before opening in this storage, so partial loads can be destroyed.
+    // Never move an opened backend or an image with initialized runtime state.
     union {
         simple_image_t simple;
         tiff_t tiff;
@@ -235,15 +237,17 @@ void image_convert_u8_rgba_to_f32_y(u8* src, float* dest, i32 w, i32 h, i32 comp
 void image_convert_u8_bgra_to_f32_y(u8* src, float* dest, i32 w, i32 h, i32 components);
 const char* get_image_backend_name(image_t* image);
 const char* get_image_descriptive_type_name(image_t* image);
-bool init_image_from_tiff(image_t* image, tiff_t tiff, bool is_overlay, image_t* parent_image);
+// These helpers derive image metadata from a backend already opened in image storage.
+// Initialize image runtime before submitting any image background jobs.
+bool init_image_from_tiff(image_t* image, bool is_overlay, image_t* parent_image);
 u8* decode_associated_image_from_isyntax(isyntax_t* isyntax, isyntax_image_t* image);
-bool init_image_from_isyntax(image_t* image, isyntax_t* isyntax, bool is_overlay);
-bool init_image_from_dicom(image_t* image, dicom_series_t* dicom, bool is_overlay);
-bool init_image_from_dicomweb(image_t* image, const dicomweb_remote_image_t* remote, bool is_overlay);
-bool init_image_from_ssi(image_t* image, const ssi_remote_image_t* remote, bool is_overlay);
-bool init_image_from_mrxs(image_t* image, mrxs_t* mrxs, bool is_overlay);
-bool init_image_from_stbi(image_t* image, simple_image_t* simple, bool is_overlay);
-void init_image_from_openslide(image_t* image, wsi_t* wsi, bool is_overlay);
+bool init_image_from_isyntax(image_t* image, bool is_overlay);
+bool init_image_from_dicom(image_t* image, bool is_overlay);
+bool init_image_from_dicomweb(image_t* image, bool is_overlay);
+bool init_image_from_ssi(image_t* image, bool is_overlay);
+bool init_image_from_mrxs(image_t* image, bool is_overlay);
+bool init_image_from_stbi(image_t* image, bool is_overlay);
+void init_image_from_openslide(image_t* image, bool is_overlay);
 void unload_openslide_wsi(wsi_t* wsi);
 bool image_initialize_runtime(image_t* image);
 void image_set_ssi_close_callback(void (*callback)(ssi_remote_image_t* remote));

@@ -151,36 +151,36 @@ static void image_change_resolution(image_t* image, float mpp_x, float mpp_y) {
 
 // TODO: write 'drivers' / interfaces to be queried, instead of this copy-pasta
 
-bool init_image_from_tiff(image_t* image, tiff_t tiff, bool is_overlay, image_t* parent_image) {
+bool init_image_from_tiff(image_t* image, bool is_overlay, image_t* parent_image) {
     image->type = IMAGE_TYPE_WSI;
     image->backend = IMAGE_BACKEND_TIFF;
-    image->tiff = tiff;
+    tiff_t* tiff = &image->tiff;
     image->is_freshly_loaded = true;
 
-    image->mpp_x = tiff.mpp_x;
-    image->mpp_y = tiff.mpp_y;
-    image->is_mpp_known = tiff.is_mpp_known;
-    ASSERT(tiff.main_image_ifd);
-    image->tile_width = tiff.main_image_ifd->tile_width;
-    image->tile_height = tiff.main_image_ifd->tile_height;
-    image->width_in_pixels = tiff.main_image_ifd->image_width;
-    image->width_in_um = tiff.main_image_ifd->image_width * tiff.mpp_x;
-    image->height_in_pixels = tiff.main_image_ifd->image_height;
-    image->height_in_um = tiff.main_image_ifd->image_height * tiff.mpp_y;
+    image->mpp_x = tiff->mpp_x;
+    image->mpp_y = tiff->mpp_y;
+    image->is_mpp_known = tiff->is_mpp_known;
+    ASSERT(tiff->main_image_ifd);
+    image->tile_width = tiff->main_image_ifd->tile_width;
+    image->tile_height = tiff->main_image_ifd->tile_height;
+    image->width_in_pixels = tiff->main_image_ifd->image_width;
+    image->width_in_um = tiff->main_image_ifd->image_width * tiff->mpp_x;
+    image->height_in_pixels = tiff->main_image_ifd->image_height;
+    image->height_in_um = tiff->main_image_ifd->image_height * tiff->mpp_y;
 
     image->clip_rects[0] = RECT2F(0.0f, 0.0f, image->width_in_um, image->height_in_um);
     image->clip_rect_count = 1;
 
     // TODO: fix code duplication with tiff_deserialize()
-    if (tiff.level_image_ifd_count > 0 && tiff.main_image_ifd->tile_width) {
+    if (tiff->level_image_ifd_count > 0 && tiff->main_image_ifd->tile_width) {
 
-        if (tiff.main_image_ifd->is_tiled) {
+        if (tiff->main_image_ifd->is_tiled) {
 
             // This is a tiled image (as we expect most WSIs to be).
             // We need to fill out the level_image_t structures to initialize the backend-agnostic image_t
 
             memset(image->level_images, 0, sizeof(image->level_images));
-            image->level_count = tiff.max_downsample_level + 1;
+            image->level_count = tiff->max_downsample_level + 1;
 
             if (image->level_count > WSI_MAX_LEVELS) {
                 fatal_error();
@@ -188,14 +188,14 @@ bool init_image_from_tiff(image_t* image, tiff_t tiff, bool is_overlay, image_t*
 
             i32 ifd_index = 0;
             i32 next_ifd_index_to_check_for_match = 0;
-            tiff_ifd_t* ifd = tiff.level_images_ifd + ifd_index;
+            tiff_ifd_t* ifd = tiff->level_images_ifd + ifd_index;
             for (i32 level_index = 0; level_index < image->level_count; ++level_index) {
                 level_image_t* level_image = image->level_images + level_index;
 
                 i32 wanted_downsample_level = level_index;
                 bool found_ifd = false;
-                for (ifd_index = next_ifd_index_to_check_for_match; ifd_index < tiff.level_image_ifd_count; ++ifd_index) {
-                    ifd = tiff.level_images_ifd + ifd_index;
+                for (ifd_index = next_ifd_index_to_check_for_match; ifd_index < tiff->level_image_ifd_count; ++ifd_index) {
+                    ifd = tiff->level_images_ifd + ifd_index;
                     if (ifd->downsample_level == wanted_downsample_level) {
                         // match!
                         found_ifd = true;
@@ -260,19 +260,19 @@ bool init_image_from_tiff(image_t* image, tiff_t tiff, bool is_overlay, image_t*
                     level_image->tile_height = image->tile_height;
                     level_image->um_per_pixel_x = image->mpp_x * level_image->downsample_factor;
                     level_image->um_per_pixel_y = image->mpp_y * level_image->downsample_factor;
-                    level_image->x_tile_side_in_um = level_image->um_per_pixel_x * (float)tiff.main_image_ifd->tile_width;
-                    level_image->y_tile_side_in_um = level_image->um_per_pixel_y * (float)tiff.main_image_ifd->tile_height;
+                    level_image->x_tile_side_in_um = level_image->um_per_pixel_x * (float)tiff->main_image_ifd->tile_width;
+                    level_image->y_tile_side_in_um = level_image->um_per_pixel_y * (float)tiff->main_image_ifd->tile_height;
                 }
                 DUMMY_STATEMENT;
             }
-        } else if (tiff.is_ndpi) {
+        } else if (tiff->is_ndpi) {
             DUMMY_STATEMENT;
         } else {
             // The image is NOT tiled
             memset(image->level_images, 0, sizeof(image->level_images));
             image->level_count = 1;
             level_image_t* level_image = image->level_images + 0;
-            tiff_ifd_t* ifd = tiff.main_image_ifd;
+            tiff_ifd_t* ifd = tiff->main_image_ifd;
             level_image->exists = true;
             level_image->pyramid_image_index = 0;
             level_image->downsample_factor = ifd->downsample_factor;
@@ -327,7 +327,8 @@ static inline i64 ceil_div_f64(i64 a, double b) {
     return (i64)ceil((double)a / b);
 }
 
-bool init_image_from_slide_score(image_t* image, slide_score_remote_image_t* remote, bool is_overlay) {
+bool init_image_from_slide_score(image_t* image, bool is_overlay) {
+	slide_score_remote_image_t* remote = &image->slide_score;
     (void)is_overlay;
     slide_score_get_image_metadata_result_t* metadata = &remote->metadata;
     if (metadata->level_0_width <= 0 || metadata->level_0_height <= 0 || metadata->tile_width <= 0 || metadata->tile_height <= 0) {
@@ -336,10 +337,6 @@ bool init_image_from_slide_score(image_t* image, slide_score_remote_image_t* rem
 
     image->type = IMAGE_TYPE_WSI;
     image->backend = IMAGE_BACKEND_SLIDE_SCORE;
-    image->slide_score = *remote;
-	/* The installed image owns the case list used by the slide tray. */
-	remote->case_slides = NULL;
-	remote->case_slide_count = 0;
     image->is_local = false;
     image->is_freshly_loaded = true;
 	i32 rotation_degrees = remote->rotation_degrees_clockwise % 360;
@@ -403,14 +400,15 @@ bool init_image_from_slide_score(image_t* image, slide_score_remote_image_t* rem
     return true;
 }
 
-bool init_image_from_ssi(image_t* image, const ssi_remote_image_t* remote, bool is_overlay) {
+bool init_image_from_ssi(image_t* image, bool is_overlay) {
+	if (!image) return false;
+	ssi_remote_image_t* remote = &image->ssi;
 	(void)is_overlay;
-	if (!image || !remote || remote->properties.width <= 0 || remote->properties.height <= 0) {
+	if (remote->properties.width <= 0 || remote->properties.height <= 0) {
 		return false;
 	}
 	image->type = IMAGE_TYPE_WSI;
 	image->backend = IMAGE_BACKEND_SSI;
-	image->ssi = *remote;
 	image->is_local = false;
 	image->is_freshly_loaded = true;
 	image->is_background_black = !remote->properties.is_brightfield;
@@ -481,11 +479,10 @@ u8* decode_associated_image_from_isyntax(isyntax_t* isyntax, isyntax_image_t* im
 
 }
 
-bool init_image_from_isyntax(image_t* image, isyntax_t* isyntax, bool is_overlay) {
+bool init_image_from_isyntax(image_t* image, bool is_overlay) {
     image->type = IMAGE_TYPE_WSI;
     image->backend = IMAGE_BACKEND_ISYNTAX;
-    image->isyntax = *isyntax;
-    isyntax = &image->isyntax;
+    isyntax_t* isyntax = &image->isyntax;
     image->is_freshly_loaded = true;
 
     image->mpp_x = isyntax->mpp_x;
@@ -621,13 +618,10 @@ bool init_image_from_isyntax(image_t* image, isyntax_t* isyntax, bool is_overlay
     return image->is_valid;
 }
 
-bool init_image_from_dicom(image_t* image, dicom_series_t* dicom, bool is_overlay) {
+bool init_image_from_dicom(image_t* image, bool is_overlay) {
     image->type = IMAGE_TYPE_WSI;
     image->backend = IMAGE_BACKEND_DICOM;
-    image->dicom = *dicom;
-    dicom = &image->dicom;
-    // Lazy pixel indexing must retain the moved series, not the loader's stack copy.
-    for (i32 i = 0; i < arrlen(dicom->instances); ++i) dicom->instances[i].series = dicom;
+    dicom_series_t* dicom = &image->dicom;
     image->is_freshly_loaded = true;
 
     dicom_instance_t* base_level_instance = dicom->wsi.level_instances[0];
@@ -781,9 +775,11 @@ bool init_image_from_dicom(image_t* image, dicom_series_t* dicom, bool is_overla
     return image->is_valid;
 }
 
-bool init_image_from_dicomweb(image_t* image, const dicomweb_remote_image_t* remote, bool is_overlay) {
+bool init_image_from_dicomweb(image_t* image, bool is_overlay) {
+	if (!image) return false;
+	dicomweb_remote_image_t* remote = &image->dicomweb;
 	(void)is_overlay;
-	if (!image || !remote || remote->instance_count <= 0) return false;
+	if (remote->instance_count <= 0) return false;
 	const dicomweb_instance_metadata_t* base = remote->instances;
 	if (!base->rows || !base->columns || !base->total_pixel_matrix_columns ||
 	    !base->total_pixel_matrix_rows || !base->frame_numbers ||
@@ -791,7 +787,6 @@ bool init_image_from_dicomweb(image_t* image, const dicomweb_remote_image_t* rem
 
 	image->type = IMAGE_TYPE_WSI;
 	image->backend = IMAGE_BACKEND_DICOMWEB;
-	image->dicomweb = *remote;
 	image->is_local = false;
 	image->is_freshly_loaded = true;
 	image->mpp_x = base->is_mpp_known ? base->mpp_x : 1.0f;
@@ -871,14 +866,13 @@ bool init_image_from_dicomweb(image_t* image, const dicomweb_remote_image_t* rem
 	return image->is_valid;
 }
 
-bool init_image_from_mrxs(image_t* image, mrxs_t* mrxs, bool is_overlay) {
+bool init_image_from_mrxs(image_t* image, bool is_overlay) {
 	image->type = IMAGE_TYPE_WSI;
 	image->backend = IMAGE_BACKEND_MRXS;
-	image->mrxs = *mrxs;
+	mrxs_t* mrxs = &image->mrxs;
 	image->plane_count = mrxs->plane_count;
 	image->zstack_plane = mrxs->zero_plane;
 	image->plane_approach_direction = -1;
-	mrxs = &image->mrxs;
 	mrxs_init_runtime_cache(mrxs);
 	image->is_freshly_loaded = true;
 
@@ -1038,11 +1032,10 @@ bool init_image_from_mrxs(image_t* image, mrxs_t* mrxs, bool is_overlay) {
 	return image->is_valid;
 }
 
-bool init_image_from_stbi(image_t* image, simple_image_t* simple, bool is_overlay) {
+bool init_image_from_stbi(image_t* image, bool is_overlay) {
     image->type = IMAGE_TYPE_WSI;
     image->backend = IMAGE_BACKEND_STBI;
-    image->simple = *simple;
-    simple = &image->simple;
+    simple_image_t* simple = &image->simple;
     image->is_freshly_loaded = true;
 
     image->mpp_x = 1.0f;
@@ -1100,12 +1093,12 @@ bool init_image_from_stbi(image_t* image, simple_image_t* simple, bool is_overla
 
 // TODO: solve issue on macOS with OpenSlide backend, not all tiles displaying properly (Retina screen related maybe?)
 
-void init_image_from_openslide(image_t* image, wsi_t* wsi, bool is_overlay) {
+void init_image_from_openslide(image_t* image, bool is_overlay) {
     image->type = IMAGE_TYPE_WSI;
     image->backend = IMAGE_BACKEND_OPENSLIDE;
 	image->plane_count = 1;
 	image->selected_plane = image->zstack_plane = 0;
-    image->openslide_wsi = *wsi;
+    wsi_t* wsi = &image->openslide_wsi;
     image->is_freshly_loaded = true;
     image->mpp_x = wsi->mpp_x;
     image->mpp_y = wsi->mpp_y;

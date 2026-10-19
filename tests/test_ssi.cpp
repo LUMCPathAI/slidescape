@@ -99,12 +99,12 @@ TEST_CASE("SSI parses base properties and maps normalized viewer tiles") {
 	CHECK(geometry.tile_y_min == 1);
 	CHECK(geometry.tile_y_max == 2);
 
-	ssi_remote_image_t remote = {};
-	REQUIRE(ssi_parse_endpoint("https://slidecenter.example.test/SSI", &remote.endpoint));
-	remote.properties = properties;
-	strcpy(remote.slide_token, "32fd90e7-9c1f-4685-9033-f8de2a383d6e");
 	image_t image = {};
-	REQUIRE(init_image_from_ssi(&image, &remote, false));
+	ssi_remote_image_t* remote = &image.ssi;
+	REQUIRE(ssi_parse_endpoint("https://slidecenter.example.test/SSI", &remote->endpoint));
+	remote->properties = properties;
+	strcpy(remote->slide_token, "32fd90e7-9c1f-4685-9033-f8de2a383d6e");
+	REQUIRE(init_image_from_ssi(&image, false));
 	CHECK(image.origin_offset.x == 0.0f);
 	CHECK(image.origin_offset.y == 0.0f);
 	CHECK(image.level_images[0].origin_offset.x == 0.0f);
@@ -116,14 +116,14 @@ TEST_CASE("SSI parses base properties and maps normalized viewer tiles") {
 		free(image.level_images[level].tiles);
 	}
 	char path[1024];
-	REQUIRE(ssi_build_tile_path(path, sizeof(path), &remote, 0, 7, 7));
+	REQUIRE(ssi_build_tile_path(path, sizeof(path), remote, 0, 7, 7));
 	CHECK(strstr(path, "x1=7&y1=7&x2=7&y2=7") != nullptr);
-	REQUIRE(ssi_build_tile_rectangle_path(path, sizeof(path), &remote, 0, 7, 5, 10, 6));
+	REQUIRE(ssi_build_tile_rectangle_path(path, sizeof(path), remote, 0, 7, 5, 10, 6));
 	CHECK(strstr(path, "x1=7&y1=5&x2=10&y2=6") != nullptr);
-	CHECK_FALSE(ssi_build_tile_rectangle_path(path, sizeof(path), &remote, 0, 7, 5, 20, 6));
+	CHECK_FALSE(ssi_build_tile_rectangle_path(path, sizeof(path), remote, 0, 7, 5, 20, 6));
 	CHECK(strstr(path, "magnification=0") != nullptr);
-	CHECK_FALSE(ssi_build_tile_path(path, sizeof(path), &remote, 0, 0, 0));
-	REQUIRE(ssi_build_tile_path(path, sizeof(path), &remote, 1, 4, 4));
+	CHECK_FALSE(ssi_build_tile_path(path, sizeof(path), remote, 0, 0, 0));
+	REQUIRE(ssi_build_tile_path(path, sizeof(path), remote, 1, 4, 4));
 	CHECK(strstr(path, "x1=4&y1=4&x2=4&y2=4") != nullptr);
 	CHECK(strstr(path, "magnification=1") != nullptr);
 }

@@ -1146,28 +1146,41 @@ fail:
 }
 
 static image_t* dicomweb_prepare_configured_series(
-	dicomweb_remote_image_t remote, const remote_request_options_t* request_options,
+	dicomweb_remote_image_t config, const remote_request_options_t* request_options,
 	i32* http_status, char* message, size_t message_size) {
 	if (http_status) *http_status = 0;
+	image_t* image = (image_t*)calloc(1, sizeof(image_t));
+	if (!image) {
+		dicomweb_remote_image_destroy(&config);
+		copy_cstring(message, "Could not allocate the DICOMweb image.", message_size);
+		return NULL;
+	}
+	image->type = IMAGE_TYPE_WSI;
+	image->backend = IMAGE_BACKEND_DICOMWEB;
+	// Adopt request configuration before opening metadata in its final storage.
+	image->dicomweb = config;
+	dicomweb_remote_image_t* remote = &image->dicomweb;
 	i64 open_start = get_clock();
-	remote.open_start_clock = open_start;
-	remote.first_tile_upload_reported = false;
-	load_available_series(&remote, request_options);
+	remote->open_start_clock = open_start;
+	remote->first_tile_upload_reported = false;
+	load_available_series(remote, request_options);
 	char path[1400];
 	i32 length = snprintf(path, sizeof(path), "%s/studies/%s/series/%s/instances%s",
-	                      remote.root, remote.study_instance_uid, remote.series_instance_uid,
+	                      remote->root, remote->study_instance_uid, remote->series_instance_uid,
 	                      DICOMWEB_INSTANCE_INCLUDE_FIELDS);
 	if (length <= 0 || length >= sizeof(path)) {
 		copy_cstring(message, "DICOMweb series path is too long.", message_size);
-		dicomweb_remote_image_destroy(&remote);
+		image_destroy(image);
+		free(image);
 		return NULL;
 	}
 	dicomweb_instance_ref_t* refs = NULL;
 	i32 ref_count = 0;
-	if (!dicomweb_query_instance_refs_all(&remote, path, request_options,
+	if (!dicomweb_query_instance_refs_all(remote, path, request_options,
 	                                      &refs, &ref_count, http_status,
 	                                      message, message_size)) {
-		dicomweb_remote_image_destroy(&remote);
+		image_destroy(image);
+		free(image);
 		return NULL;
 	}
 	double discovery_ms = get_seconds_elapsed(open_start, get_clock()) * 1000.0;
@@ -1191,15 +1204,15 @@ static image_t* dicomweb_prepare_configured_series(
 			continue;
 		}
 		const char* study_uid = refs[i].study_instance_uid[0]
-		                        ? refs[i].study_instance_uid : remote.study_instance_uid;
+		                        ? refs[i].study_instance_uid : remote->study_instance_uid;
 		const char* series_uid = refs[i].series_instance_uid[0]
-		                         ? refs[i].series_instance_uid : remote.series_instance_uid;
-		if (!dicomweb_build_instance_metadata_path(path, sizeof(path), remote.root,
+		                         ? refs[i].series_instance_uid : remote->series_instance_uid;
+		if (!dicomweb_build_instance_metadata_path(path, sizeof(path), remote->root,
 		                                           study_uid, series_uid,
 		                                           refs[i].sop_instance_uid)) continue;
 		i64 metadata_start = get_clock();
 		http_response_t* response = dicomweb_get_with_options(
-			&remote, path, try_compact_metadata ? DICOMWEB_COMPACT_METADATA_MEDIA_TYPE : "application/dicom+json",
+			remote, path, try_compact_metadata ? DICOMWEB_COMPACT_METADATA_MEDIA_TYPE : "application/dicom+json",
 			false, request_options);
 		/* Archives may reject the extension or ignore Accept and return DICOM
 		 * JSON. IDC returns 500 for this unsupported media type. Retry once with
@@ -1210,7 +1223,7 @@ static image_t* dicomweb_prepare_configured_series(
 		     response->status_code == 501)) {
 			http_response_destroy(response);
 			try_compact_metadata = false;
-			response = dicomweb_get_with_options(&remote, path, "application/dicom+json", false, request_options);
+			response = dicomweb_get_with_options(remote, path, "application/dicom+json", false, request_options);
 		}
 		metadata_http_ms += get_seconds_elapsed(metadata_start, get_clock()) * 1000.0;
 		if (!response || response->status_code < 200 || response->status_code >= 300) {
@@ -1237,13 +1250,14 @@ static image_t* dicomweb_prepare_configured_series(
 		metadata_parse_ms += get_seconds_elapsed(parse_start, get_clock()) * 1000.0;
 		if (parsed && strcmp(metadata.image_flavor, "VOLUME") == 0 &&
 		    metadata.frame_numbers && metadata.frame_map_count) {
-			if (dicomweb_remote_reserve_instances(&remote, remote.instance_count + 1)) {
-				remote.instances[remote.instance_count++] = metadata;
+			if (dicomweb_remote_reserve_instances(remote, remote->instance_count + 1)) {
+				remote->instances[remote->instance_count++] = metadata;
 			} else {
 				dicomweb_instance_metadata_destroy(&metadata);
 				free(refs);
 				http_response_destroy(response);
-				dicomweb_remote_image_destroy(&remote);
+				image_destroy(image);
+				free(image);
 				copy_cstring(message, "Out of memory while opening DICOMweb metadata.", message_size);
 				return NULL;
 			}
@@ -1255,7 +1269,7 @@ static image_t* dicomweb_prepare_configured_series(
 		http_response_destroy(response);
 	}
 	free(refs);
-	if (remote.instance_count == 0) {
+	if (remote->instance_count == 0) {
 		if (metadata_request_failures > 0) {
 			if (last_metadata_http_status) {
 				if (http_status) *http_status = last_metadata_http_status;
@@ -1278,23 +1292,17 @@ static image_t* dicomweb_prepare_configured_series(
 			         "DICOMweb series has no supported tiled VOLUME instances (%d inspected).",
 			         unsupported_instances);
 		}
-		dicomweb_remote_image_destroy(&remote);
+		image_destroy(image);
+		free(image);
 		return NULL;
 	}
-	qsort(remote.instances, remote.instance_count, sizeof(remote.instances[0]),
+	qsort(remote->instances, remote->instance_count, sizeof(remote->instances[0]),
 	      compare_instance_width_descending);
 
 	i64 image_start = get_clock();
-	image_t* image = (image_t*)calloc(1, sizeof(image_t));
-	if (!image || !init_image_from_dicomweb(image, &remote, false) ||
-	    !image_initialize_runtime(image)) {
-		if (image) {
-			if (image->backend == IMAGE_BACKEND_DICOMWEB) image_destroy(image);
-			else dicomweb_remote_image_destroy(&remote);
-			free(image);
-		} else {
-			dicomweb_remote_image_destroy(&remote);
-		}
+	if (!init_image_from_dicomweb(image, false) || !image_initialize_runtime(image)) {
+		image_destroy(image);
+		free(image);
 		copy_cstring(message, "DICOMweb pyramid metadata is unsupported or inconsistent.",
 		             message_size);
 		return NULL;
@@ -1304,7 +1312,7 @@ static image_t* dicomweb_prepare_configured_series(
 		metadata_http_ms, (unsigned long long)metadata_bytes, metadata_parse_ms,
 		get_seconds_elapsed(image_start, get_clock()) * 1000.0);
 	snprintf(message, message_size, "Opened DICOMweb series with %d pyramid instances.",
-	         remote.instance_count);
+	         remote->instance_count);
 	return image;
 }
 

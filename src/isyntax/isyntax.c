@@ -3355,10 +3355,12 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 		if (seektable != NULL) free(seektable);
 		isyntax_image_t* wsi_image = isyntax->images + isyntax->wsi_image_index;
 		if (wsi_image->image_type == ISYNTAX_IMAGE_TYPE_WSI) {
-			if (wsi_image->data_chunks != NULL) free(wsi_image->data_chunks);
+			free(wsi_image->data_chunks);
+			wsi_image->data_chunks = NULL;
 			for (i32 i = 0; i < wsi_image->level_count; ++i) {
 				isyntax_level_t* level = wsi_image->levels + i;
-				if (level->tiles != NULL) free(level->tiles);
+				free(level->tiles);
+				level->tiles = NULL;
 			}
 		}
 		if (isyntax->open_flags & LIBISYNTAX_OPEN_FLAG_READ_BARCODE_ONLY && isyntax->is_barcode_read) {

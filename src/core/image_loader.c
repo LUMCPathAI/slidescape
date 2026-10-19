@@ -337,10 +337,10 @@ static bool image_try_load_with_openslide(image_t* image, const char* filename, 
 
 	image->type = IMAGE_TYPE_WSI;
 	image->backend = IMAGE_BACKEND_OPENSLIDE;
-	wsi_t wsi = {0};
-	load_openslide_wsi(&wsi, filename, options->openslide_loading_done, options->thread_pool);
-	if (wsi.osr) {
-		init_image_from_openslide(image, &wsi, is_overlay);
+	wsi_t* wsi = &image->openslide_wsi;
+	load_openslide_wsi(wsi, filename, options->openslide_loading_done, options->thread_pool);
+	if (wsi->osr) {
+		init_image_from_openslide(image, is_overlay);
 		return image->is_valid;
 	}
 	return false;
@@ -396,27 +396,33 @@ static void image_load_zip(image_t* image, const file_info_t* file, image_load_o
 		scanned = source_fs_list(source, "", image_zip_discover, &found);
 	}
 	if (scanned && found.mrxs_count == 1) {
-		mrxs_t mrxs = {0};
-		mrxs_set_thread_pool(&mrxs, options->thread_pool);
-		if (mrxs_open_from_source(&mrxs, source, found.mrxs_directory))
-			init_image_from_mrxs(image, &mrxs, options->is_overlay);
-		else mrxs_destroy(&mrxs);
+		image->type = IMAGE_TYPE_WSI;
+		image->backend = IMAGE_BACKEND_MRXS;
+		mrxs_t* mrxs = &image->mrxs;
+		mrxs_set_thread_pool(mrxs, options->thread_pool);
+		if (mrxs_open_from_source(mrxs, source, found.mrxs_directory)) {
+			init_image_from_mrxs(image, options->is_overlay);
+		}
 	} else if (scanned && found.dicom_count && !found.tiff_count) {
-		dicom_series_t dicom = {0};
-		if (dicom_open_from_source(&dicom, source, file->full_filename, file->zip_member[0] ? file->zip_member : NULL)) {
-			init_image_from_dicom(image, &dicom, options->is_overlay);
+		image->type = IMAGE_TYPE_WSI;
+		image->backend = IMAGE_BACKEND_DICOM;
+		dicom_series_t* dicom = &image->dicom;
+		if (dicom_open_from_source(dicom, source, file->full_filename, file->zip_member[0] ? file->zip_member : NULL)) {
+			init_image_from_dicom(image, options->is_overlay);
 			/* Keep annotation sidecars distinct when switching slides in one ZIP. */
-			const dicom_ui_t* uid = &dicom.slides[dicom.selected_slide_index].series_instance_uid;
+			const dicom_ui_t* uid = &dicom->slides[dicom->selected_slide_index].series_instance_uid;
 			char name[sizeof(image->name)];
 			int basename_capacity = (int)(sizeof(name) - sizeof(uid->value) - sizeof("-series-.zip"));
 			snprintf(name, sizeof(name), "%.*s-series-%.*s.zip", basename_capacity, image->name, (int)uid->len, uid->value);
 			copy_cstring(image->name, name, sizeof(image->name));
-		} else dicom_destroy(&dicom);
+		}
 	} else if (scanned && found.tiff_count == 1 && !found.dicom_count) {
-		tiff_t tiff = {0};
-		if (open_tiff_from_source(&tiff, source, found.tiff_member))
-			init_image_from_tiff(image, tiff, options->is_overlay, options->parent_image);
-		else tiff_destroy(&tiff);
+		image->type = IMAGE_TYPE_WSI;
+		image->backend = IMAGE_BACKEND_TIFF;
+		tiff_t* tiff = &image->tiff;
+		if (open_tiff_from_source(tiff, source, found.tiff_member)) {
+			init_image_from_tiff(image, options->is_overlay, options->parent_image);
+		}
 	} else {
 		console_print_error("ZIP has no supported slide, or has ambiguous multiple MRXS/TIFF slides or mixed formats\n");
 		source_fs_close(source);
@@ -432,6 +438,7 @@ image_t* image_load_from_file(file_info_t* file, directory_info_t* directory, im
 	if (!options->thread_pool) options->thread_pool = &global_thread_pool;
 
 	image_t* image = (image_t*)calloc(1, sizeof(image_t));
+	if (!image) return NULL;
 	image->is_local = true;
 	image->resource_id = options->resource_id;
 
@@ -459,27 +466,32 @@ image_t* image_load_from_file(file_info_t* file, directory_info_t* directory, im
 		if (image->simple.pixels) {
 			image->is_freshly_loaded = true;
 			image->is_valid = true;
-			init_image_from_stbi(image, &image->simple, is_overlay);
+			init_image_from_stbi(image, is_overlay);
 		}
 	} else if (options->use_builtin_tiff_backend && (file->type == VIEWER_FILE_TYPE_TIFF /*|| file->type == VIEWER_FILE_TYPE_NDPI*/)) {
 		// Try to open as TIFF, using the built-in backend
-		tiff_t tiff = {0};
-		if (open_tiff_file(&tiff, filename)) {
-			init_image_from_tiff(image, tiff, is_overlay, parent_image);
+		image->type = IMAGE_TYPE_WSI;
+		image->backend = IMAGE_BACKEND_TIFF;
+		tiff_t* tiff = &image->tiff;
+		if (open_tiff_file(tiff, filename)) {
+			init_image_from_tiff(image, is_overlay, parent_image);
 		} else {
-			tiff_destroy(&tiff);
 			image->is_valid = false;
 		}
 	} else if (file->type == VIEWER_FILE_TYPE_ISYNTAX) {
 		// Try to open as iSyntax
-		isyntax_t isyntax = {0};
-		isyntax_set_thread_pool(&isyntax, options->thread_pool);
-		if (isyntax_open(&isyntax, filename, LIBISYNTAX_OPEN_FLAG_INIT_ALLOCATORS)) {
-			init_image_from_isyntax(image, &isyntax, is_overlay);
+		image->type = IMAGE_TYPE_WSI;
+		image->backend = IMAGE_BACKEND_ISYNTAX;
+		isyntax_t* isyntax = &image->isyntax;
+		isyntax_set_thread_pool(isyntax, options->thread_pool);
+		if (isyntax_open(isyntax, filename, LIBISYNTAX_OPEN_FLAG_INIT_ALLOCATORS)) {
+			init_image_from_isyntax(image, is_overlay);
 		}
 	} else if (file->type == VIEWER_FILE_TYPE_DICOM) {
 		if (file->is_regular_file) {
-			dicom_series_t dicom = {0};
+			image->type = IMAGE_TYPE_WSI;
+			image->backend = IMAGE_BACKEND_DICOM;
+			dicom_series_t* dicom = &image->dicom;
 			directory_info_t parent_directory = {0};
 			directory_info_t* dicom_directory = directory;
 			if (!dicom_directory) {
@@ -487,23 +499,23 @@ image_t* image_load_from_file(file_info_t* file, directory_info_t* directory, im
 				dicom_directory = &parent_directory;
 			}
 			if (dicom_directory->is_valid &&
-			    dicom_open_from_directory(&dicom, dicom_directory, file)) {
-				init_image_from_dicom(image, &dicom, is_overlay);
-			} else {
-				dicom_destroy(&dicom);
+			    dicom_open_from_directory(dicom, dicom_directory, file)) {
+				init_image_from_dicom(image, is_overlay);
 			}
 			viewer_directory_info_destroy(&parent_directory);
 		} else if (file->is_directory && directory) {
-			dicom_series_t dicom = {0};
-			if (dicom_open_from_directory(&dicom, directory, NULL)) {
-				init_image_from_dicom(image, &dicom, is_overlay);
-			} else {
-				dicom_destroy(&dicom);
+			image->type = IMAGE_TYPE_WSI;
+			image->backend = IMAGE_BACKEND_DICOM;
+			dicom_series_t* dicom = &image->dicom;
+			if (dicom_open_from_directory(dicom, directory, NULL)) {
+				init_image_from_dicom(image, is_overlay);
 			}
 		}
 	} else if (options->use_native_mrxs_backend && file->type == VIEWER_FILE_TYPE_MRXS) {
-		mrxs_t mrxs = {0};
-		mrxs_set_thread_pool(&mrxs, options->thread_pool);
+		image->type = IMAGE_TYPE_WSI;
+		image->backend = IMAGE_BACKEND_MRXS;
+		mrxs_t* mrxs = &image->mrxs;
+		mrxs_set_thread_pool(mrxs, options->thread_pool);
 		bool opened_successfully = false;
 		if (file->is_regular_file) {
 			// Strip .mrxs extension to get the name of the corresponding slide folder
@@ -521,16 +533,17 @@ image_t* image_load_from_file(file_info_t* file, directory_info_t* directory, im
 			}
 			file_info_t slide_dir_file_info = viewer_get_file_info(basename);
 			if (slide_dir_file_info.is_directory) {
-				opened_successfully = mrxs_open_from_directory(&mrxs, &slide_dir_file_info, NULL);
+				opened_successfully = mrxs_open_from_directory(mrxs, &slide_dir_file_info, NULL);
 			}
 		} else if (file->is_directory && directory) {
 			// We directly opened the slide folder instead of the .mrxs
-			opened_successfully = mrxs_open_from_directory(&mrxs, file, NULL);
+			opened_successfully = mrxs_open_from_directory(mrxs, file, NULL);
 		}
 		if (opened_successfully) {
-			init_image_from_mrxs(image, &mrxs, is_overlay);
+			init_image_from_mrxs(image, is_overlay);
 		} else {
-			mrxs_destroy(&mrxs);
+			// Destruction clears the union storage before OpenSlide reuses it.
+			mrxs_destroy(mrxs);
 			image_try_load_with_openslide(image, filename, options, is_overlay);
 		}
 	} else {
@@ -540,6 +553,11 @@ image_t* image_load_from_file(file_info_t* file, directory_info_t* directory, im
 
 	if (image->is_valid && !image_initialize_runtime(image)) {
 		image->is_valid = false;
+	}
+
+	if (!image->is_valid && image->type == IMAGE_TYPE_WSI) {
+		// Failed loads still own any partially constructed backend and image data.
+		image_destroy(image);
 	}
 
 	return image;

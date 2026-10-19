@@ -218,7 +218,7 @@ bool slide_score_parse_case_images(const char* json, size_t json_length, i32 cas
 		slide_score_slide_ref_t** out_slides, i32* out_slide_count,
 		char* out_case_name, size_t out_case_name_size);
 void slide_score_remote_image_destroy(slide_score_remote_image_t* remote);
-bool init_image_from_slide_score(image_t* image, slide_score_remote_image_t* remote, bool is_overlay);
+bool init_image_from_slide_score(image_t* image, bool is_overlay);
 char* slide_score_build_tile_url(char* buffer, size_t buffer_size, slide_score_remote_image_t* remote, i32 level, i32 tile_x, i32 tile_y);
 char* slide_score_build_qupath_tile_path(char* buffer, size_t buffer_size, slide_score_remote_image_t* remote, i32 level, i32 tile_x, i32 tile_y, i32 tile_width, i32 tile_height, i64 level_width, i64 level_height);
 const char* slide_score_get_last_status(void);
