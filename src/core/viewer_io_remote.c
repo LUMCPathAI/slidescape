@@ -67,9 +67,9 @@ void tiff_load_tile_batch_func(i32 logical_thread_index, void* userdata) {
 				i32 tile_x = tile_index % level_image->width_in_tiles;
 				i32 tile_y = tile_index / level_image->width_in_tiles;
 				if (task->may_discard_if_stale &&
-				    tile_cache_task_is_stale(image, level, tile_index, task->generation)) {
-					if (!tile_cache_post_stale_result(image, task->resource_id, level, tile_index)) {
-						tile_cache_cancel_decode(image, level, tile_index);
+				    tile_cache_task_is_stale(image, 0, level, tile_index, task->generation)) {
+					if (!tile_cache_post_stale_result(image, 0, task->resource_id, level, tile_index)) {
+						tile_cache_cancel_decode(image, 0, level, tile_index);
 					}
 					continue;
 				}
@@ -118,7 +118,7 @@ void tiff_load_tile_batch_func(i32 logical_thread_index, void* userdata) {
 						size_t pixel_memory_size = level_image->tile_width * level_image->tile_height * BYTES_PER_PIXEL;
 						u8* pixel_memory = tile_buffer_acquire(pixel_memory_size);
 						if (!pixel_memory) {
-							tile_cache_cancel_decode(image, task->level, task->tile_index);
+							tile_cache_cancel_decode(image, 0, task->level, task->tile_index);
 							continue;
 						}
 						memset(pixel_memory, 0xFF, pixel_memory_size);
@@ -176,7 +176,7 @@ void tiff_load_tile_batch_func(i32 logical_thread_index, void* userdata) {
 			write_barrier;
 			for (i32 i = 0; i < batch_size; ++i) {
 				load_tile_task_t* task = batch->tile_tasks + i;
-				tile_cache_store_gpu_texture(image, task->level, task->tile_index, new_textures[i]);
+				tile_cache_store_gpu_texture(image, 0, task->level, task->tile_index, new_textures[i]);
 			}
 #endif
 

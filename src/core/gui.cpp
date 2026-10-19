@@ -1088,6 +1088,17 @@ simple_image_t* gui_find_associated_image(app_state_t* app_state, bool find_labe
 	return NULL;
 }
 
+static image_t* gui_find_focus_image(app_state_t* app_state) {
+	i32 index = app_state->scene.active_layer;
+	if (index < 0 || index >= arrlen(app_state->loaded_images) || !app_state->loaded_images[index]->is_enabled)
+		index = app_state->base_image_index;
+	if (index < 0 || index >= arrlen(app_state->loaded_images)) return NULL;
+	image_t* image = app_state->loaded_images[index];
+	if (image->backend != IMAGE_BACKEND_MRXS || image->plane_count <= 1 ||
+	    !image->mrxs.planes[0].is_extended_focus) return NULL;
+	return image;
+}
+
 typedef struct associated_image_window_constraints_t {
 	float aspect_ratio;
 	float decoration_width;
@@ -1269,15 +1280,20 @@ static void gui_draw_main_menu_bar(app_state_t* app_state) {
 			bool has_macro_image = gui_find_associated_image(app_state, false) != NULL;
 			if (ImGui::MenuItem("Label image", "L", &show_label_image_window, has_label_image)) {}
 			if (ImGui::MenuItem("Macro image", "O", &show_macro_image_window, has_macro_image)) {}
+			bool has_focus_stack = gui_find_focus_image(app_state) != NULL;
+			bool focus_ticked = has_focus_stack && show_focus_window;
+			if (ImGui::MenuItem("Focus...", NULL, &focus_ticked, has_focus_stack)) {
+				show_focus_window = focus_ticked;
+			}
 			bool has_related_slides = has_image_loaded &&
-			                        ((app_state->loaded_images[0]->backend == IMAGE_BACKEND_DICOM &&
-			                          arrlen(app_state->loaded_images[0]->dicom.slides) > 1) ||
-			                         (app_state->loaded_images[0]->backend == IMAGE_BACKEND_DICOMWEB &&
-			                          app_state->loaded_images[0]->dicomweb.available_series_count > 1) ||
-			                         (app_state->loaded_images[0]->backend == IMAGE_BACKEND_SLIDE_SCORE &&
-			                          app_state->loaded_images[0]->slide_score.case_slide_count > 1) ||
-			                         (app_state->loaded_images[0]->backend == IMAGE_BACKEND_SSI &&
-			                          app_state->loaded_images[0]->ssi.folder_slide_count > 1));
+			                          ((app_state->loaded_images[0]->backend == IMAGE_BACKEND_DICOM &&
+			                            arrlen(app_state->loaded_images[0]->dicom.slides) > 1) ||
+			                           (app_state->loaded_images[0]->backend == IMAGE_BACKEND_DICOMWEB &&
+			                            app_state->loaded_images[0]->dicomweb.available_series_count > 1) ||
+			                           (app_state->loaded_images[0]->backend == IMAGE_BACKEND_SLIDE_SCORE &&
+			                            app_state->loaded_images[0]->slide_score.case_slide_count > 1) ||
+			                           (app_state->loaded_images[0]->backend == IMAGE_BACKEND_SSI &&
+			                            app_state->loaded_images[0]->ssi.folder_slide_count > 1));
 			if (ImGui::MenuItem("Slide tray...", NULL, &show_slide_tray_window,
 			                    has_related_slides)) {}
 			ImGui::Separator();
@@ -1381,22 +1397,38 @@ static void gui_draw_main_menu_bar(app_state_t* app_state) {
 
 }
 
-// TODO
-typedef struct image_layer_t {
-	i32 index;
-	char name[512];
-	v2f origin_offset; // TODO: transfer from image->origin_offset
-	image_backend_enum backend;
-	bool is_loaded;
-	bool enabled;
-	bool is_mask;
-	bool uses_lut;
-} image_layer_t;
 
-typedef struct annotation_layer_t {
-	i32 index;
-	char name[512];
-} annotation_layer_t;
+static void gui_draw_focus_control(app_state_t* app_state) {
+	if (!show_focus_window) return;
+	image_t* image = gui_find_focus_image(app_state);
+	if (!image) return;
+	ImGui::SetNextWindowPos(ImVec2(20.0f, 80.0f), ImGuiCond_FirstUseEver);
+	if (!ImGui::Begin("Focus", &show_focus_window, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse)) {
+		ImGui::End();
+		return;
+	}
+	bool stack = image->selected_plane != 0;
+	if (ImGui::RadioButton("Extended focus", !stack)) image_select_plane(image, 0);
+	ImGui::SameLine();
+	if (ImGui::RadioButton("Z-stack", stack)) image_select_plane(image, image->zstack_plane);
+	if (image->selected_plane != 0) {
+		i32 plane = image->selected_plane;
+		mrxs_plane_t* focus = image->mrxs.planes + plane;
+		char label[96];
+		if (focus->offset_known) snprintf(label, sizeof(label), "z = %+.2f \xC2\xB5m", focus->offset_um);
+		else snprintf(label, sizeof(label), "Plane %d", plane);
+		ImGui::SetNextItemWidth(260.0f);
+		if (ImGui::SliderInt("##focus_plane", &plane, 1, image->plane_count - 1, label)) {
+			image_select_plane(image, plane);
+		}
+		/*mrxs_plane_t* first = image->mrxs.planes + 1;
+		mrxs_plane_t* last = image->mrxs.planes + image->plane_count - 1;
+		if (first->offset_known && last->offset_known)
+			ImGui::Text("%+.2f \xC2\xB5m                 %+.2f \xC2\xB5m", first->offset_um, last->offset_um);
+		if (ImGui::Button("Zero plane")) image_select_plane(image, image->mrxs.zero_plane);*/
+	}
+	ImGui::End();
+}
 
 void draw_layers_window(app_state_t* app_state) {
 	if (!show_layers_window) return;
@@ -2873,6 +2905,7 @@ void gui_draw(app_state_t* app_state, input_t* input, i32 client_width, i32 clie
 
 
 
+	gui_draw_focus_control(app_state);
 	if (show_layers_window) {
 		draw_layers_window(app_state);
 	}

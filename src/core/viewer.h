@@ -180,6 +180,7 @@ typedef struct scene_t {
 } scene_t;
 
 typedef struct pixel_transfer_state_t {
+	i32 plane;
 	u32 pbo;
 	renderer_texture_handle_t texture;
 	i32 texture_width;

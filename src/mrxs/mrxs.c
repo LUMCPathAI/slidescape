@@ -67,7 +67,7 @@ static void mrxs_slidedat_ini_parse_section_name(mrxs_t* mrxs, char* section_nam
 		    }
 		    for (i32 j = 0; j < hier->val_count; ++j) {
 			    mrxs_hier_val_t* hier_val = hier->val + j;
-			    if (!hier_val->is_ini_section_parsed && strcmp(section_name, hier_val->section) == 0) {
+			    if (!hier_val->is_ini_section_parsed && hier_val->section && strcmp(section_name, hier_val->section) == 0) {
 				    *section = MRXS_SECTION_LAYER_N_LEVEL_N_SECTION;
 				    *layer = i;
 				    *level = j;
@@ -87,7 +87,7 @@ static void mrxs_slidedat_ini_parse_section_name(mrxs_t* mrxs, char* section_nam
 		    }
 		    for (i32 j = 0; j < nonhier->val_count; ++j) {
 			    mrxs_nonhier_val_t* nonhier_val = nonhier->val + j;
-			    if (!nonhier_val->is_ini_section_parsed && strcmp(section_name, nonhier_val->section) == 0) {
+			    if (!nonhier_val->is_ini_section_parsed && nonhier_val->section && strcmp(section_name, nonhier_val->section) == 0) {
 				    *section = MRXS_SECTION_NONHIERLAYER_N_LEVEL_N_SECTION;
 				    *layer = i;
 				    *level = j;
@@ -227,6 +227,8 @@ bool mrxs_parse_slidedat_ini(mrxs_t* mrxs, mem_t* slidedat_ini) {
                                 } else if (strcmp(key_part2, "COUNT") == 0) {
                                     hier->val_count = atoi(value);
                                     hier->val = calloc(hier->val_count, sizeof(mrxs_hier_val_t));
+                                } else if (strcmp(key_part2, "DEFAULT") == 0) {
+                                    hier->default_value = atoi(value);
                                 } else if (strcmp(key_part2, "SECTION") == 0) {
                                     hier->section = mrxs_string_pool_push(mrxs, value);
                                 } else if (strncmp(key_part2, "VAL_", 3) == 0) {
@@ -353,6 +355,10 @@ bool mrxs_parse_slidedat_ini(mrxs_t* mrxs, mem_t* slidedat_ini) {
 						if (layer != -1 && level != -1) {
 							mrxs_hier_t* hier = mrxs->hier + layer;
 							mrxs_hier_val_t* hier_val = hier->val + level;
+							if (hier->name == MRXS_HIER_MICROSCOPE_FOCUS_LEVEL && strcmp(key, "OFFSET_IN_MICROMETERS") == 0) {
+								hier_val->offset_um = strtof(value, NULL);
+								hier_val->offset_known = isfinite(hier_val->offset_um);
+							}
 
 							if (hier_val->type == MRXS_HIER_VAL_ZOOMLEVEL) {
 								mrxs_level_t* mrxs_level = mrxs->levels + hier_val->index;
@@ -374,6 +380,13 @@ bool mrxs_parse_slidedat_ini(mrxs_t* mrxs, mem_t* slidedat_ini) {
                                     mrxs_level->image_format = mrxs_ini_parse_image_format(value);
 								}
 							}
+						}
+					} break;
+
+                    case MRXS_SECTION_LAYER_N_SECTION: {
+						if (mrxs->hier[layer].name == MRXS_HIER_MICROSCOPE_FOCUS_LEVEL) {
+							if (strcmp(key, "EXTENDED_FOCUS_LEVEL") == 0) mrxs->extended_focus_value = atoi(value);
+							if (strcmp(key, "ZERO_FOCUS_LEVEL") == 0) mrxs->zero_focus_value = atoi(value);
 						}
 					} break;
 
@@ -450,43 +463,114 @@ bool mrxs_parse_slidedat_ini(mrxs_t* mrxs, mem_t* slidedat_ini) {
     return success;
 }
 
-bool mrxs_read_index_dat_slide_zoom_level(mrxs_t* mrxs, mem_t* index_dat, mrxs_hier_val_t* hier_val) {
-	i32 scale = hier_val->index;
-	if (!(scale >= 0 && scale < mrxs->level_count)) {
-		return false;
-	}
-	mrxs_level_t* level = mrxs->levels + scale;
-
-	i32 page_count = 0; // the first page doesn't count, it always has 0 entries
-	for (;;) {
-		u32 entry_count = 0;
-		u32 next_ptr = 0;
-		mem_read(&entry_count, index_dat, 4);
-		mem_read(&next_ptr, index_dat, 4);
-		if (entry_count > 0) {
-			// read entries
-			for (i32 j = 0; j < entry_count; ++j) {
-				mrxs_hier_entry_t entry = {};
-				mem_read(&entry, index_dat, sizeof(entry));
-				i32 tile_index_x = entry.image % mrxs->base_width_in_tiles;
-				i32 tile_index_y = entry.image / mrxs->base_width_in_tiles;
-				tile_index_x >>= scale;
-				tile_index_y >>= scale;
-				if (tile_index_x < level->width_in_tiles && tile_index_y < level->height_in_tiles) {
-					mrxs_tile_t* tile = level->tiles + tile_index_y * level->width_in_tiles + tile_index_x;
-					tile->hier_entry = entry;
-					DUMMY_STATEMENT;
-				} else {
-					DUMMY_STATEMENT;
-				}
-				DUMMY_STATEMENT;
-			}
+/* Index parsing and tile workers share a per-slide limit of five warnings per kind. */
+static void mrxs_warn_coverage_mismatch(mrxs_t* mrxs, i32 plane, i32 level, i32 tile_index, bool extra) {
+	volatile i32* count = extra ? &mrxs->extra_tile_warning_count : &mrxs->missing_tile_warning_count;
+	for (i32 i = 0; i < 5; ++i) {
+		if (atomic_compare_exchange(count, i + 1, i)) {
+			console_print("Warning: MRXS plane %d, level %d, tile %d is %s compared with plane zero.%s\n",
+			              plane, level, tile_index, extra ? "extra" : "missing",
+			              i == 4 ? " Further warnings of this kind are suppressed for this slide." : "");
+			break;
 		}
-		if (next_ptr != 0 && next_ptr < index_dat->len) {
-			mem_seek(index_dat, next_ptr);
-			++page_count;
-		} else {
-			break; // last page reached
+	}
+}
+
+/* Validate every page before publishing descriptors. The nonhier table is separate. */
+static bool mrxs_read_plane_level(mrxs_t* mrxs, mem_t* index, u32 page, i32 plane, i32 scale) {
+	mrxs_level_t* level = mrxs->levels + scale;
+	mrxs_tile_t* tiles = mrxs->planes[plane].tiles[scale];
+	struct { u32 key; bool value; }* visited = NULL;
+	bool success = false;
+	while (page) {
+		if ((u64)page + 8 > index->len || hmget(visited, page)) goto done;
+		hmput(visited, page, true);
+		u32 count, next;
+		memcpy(&count, index->data + page, 4);
+		memcpy(&next, index->data + page + 4, 4);
+		if ((u64)page + 8 + (u64)count * sizeof(mrxs_hier_entry_t) > index->len) goto done;
+		for (u32 i = 0; i < count; ++i) {
+			mrxs_hier_entry_t entry;
+			memcpy(&entry, index->data + page + 8 + (u64)i * sizeof(entry), sizeof(entry));
+			u32 x = entry.image % mrxs->base_width_in_tiles;
+			u32 y = entry.image / mrxs->base_width_in_tiles;
+			if (y >= mrxs->base_height_in_tiles || entry.file >= mrxs->dat_count ||
+			    (x & ((1u << scale) - 1)) || (y & ((1u << scale) - 1))) goto done;
+			u64 tile_index = (u64)(y >> scale) * level->width_in_tiles + (x >> scale);
+			/* Plane zero is read first. Report extras without expanding shared viewer coverage. */
+			if (plane > 0 && entry.length && !level->tiles[tile_index].hier_entry.length)
+				mrxs_warn_coverage_mismatch(mrxs, plane, scale, (i32)tile_index, true);
+			tiles[tile_index].hier_entry = entry;
+		}
+		page = next;
+	}
+	success = true;
+done:
+	hmfree(visited);
+	return success;
+}
+
+static bool mrxs_read_focus_pyramids(mrxs_t* mrxs, mem_t* index, u32 root) {
+	i32 focus_hier = -1;
+	u64 stride = 1, zoom_stride = 0, focus_stride = 0, defaults = 0;
+	for (i32 i = 0; i < mrxs->hier_count; ++i) {
+		mrxs_hier_t* h = mrxs->hier + i;
+		if (h->val_count <= 0 || h->default_value < 0 || h->default_value >= h->val_count) return false;
+		if (h->name == MRXS_HIER_SLIDE_ZOOM_LEVEL) zoom_stride = stride;
+		else if (h->name == MRXS_HIER_MICROSCOPE_FOCUS_LEVEL) { focus_hier = i; focus_stride = stride; }
+		else defaults += stride * h->default_value;
+		if (stride > UINT32_MAX / (u32)h->val_count) return false;
+		stride *= h->val_count;
+	}
+	if (!zoom_stride || (u64)root + stride * 4 > index->len) return false;
+	mrxs_hier_t* focus = focus_hier >= 0 ? mrxs->hier + focus_hier : NULL;
+	mrxs->plane_count = focus ? focus->val_count : 1;
+	/* Bound allocations for malformed metadata; physical planes are normally few. */
+	if (mrxs->plane_count > 64) return false;
+	mrxs->planes = calloc(mrxs->plane_count, sizeof(*mrxs->planes));
+	if (!mrxs->planes) return false;
+	if (focus && mrxs->extended_focus_value < 0) {
+		for (i32 i = 0; i < focus->val_count; ++i)
+			if (focus->val[i].name && strcmp(focus->val[i].name, "ExtFocusLevel") == 0)
+				mrxs->extended_focus_value = i;
+	}
+	i32 default_focus = focus ? focus->default_value : 0;
+	if (focus && mrxs->extended_focus_value >= 0 && mrxs->extended_focus_value < focus->val_count)
+		default_focus = mrxs->extended_focus_value;
+	for (i32 p = 0; p < mrxs->plane_count; ++p) {
+		mrxs_plane_t* plane = mrxs->planes + p;
+		i32 value = p == 0 ? default_focus : (p <= default_focus ? p - 1 : p);
+		plane->hier_value = value;
+		if (focus) {
+			plane->name = focus->val[value].name;
+			plane->offset_um = focus->val[value].offset_um;
+			plane->offset_known = focus->val[value].offset_known;
+			plane->is_extended_focus = value == mrxs->extended_focus_value ||
+				(plane->name && strcmp(plane->name, "ExtFocusLevel") == 0);
+		}
+	}
+	/* Keep the default at zero; order physical planes by their relative offset. */
+	for (i32 p = 2; p < mrxs->plane_count; ++p) {
+		mrxs_plane_t v = mrxs->planes[p];
+		i32 j = p;
+		while (j > 1 && v.offset_known && mrxs->planes[j-1].offset_known && v.offset_um < mrxs->planes[j-1].offset_um) {
+			mrxs->planes[j] = mrxs->planes[j-1]; --j;
+		}
+		mrxs->planes[j] = v;
+	}
+	mrxs->zero_plane = mrxs->plane_count > 1 ? 1 : 0;
+	for (i32 p = 0; p < mrxs->plane_count; ++p) {
+		mrxs_plane_t* plane = mrxs->planes + p;
+		if (!plane->is_extended_focus && (plane->hier_value == mrxs->zero_focus_value ||
+		    (plane->offset_known && plane->offset_um == 0))) mrxs->zero_plane = p;
+		for (i32 l = 0; l < mrxs->level_count; ++l) {
+			mrxs_level_t* level = mrxs->levels + l;
+			u64 record = defaults + zoom_stride * l + focus_stride * plane->hier_value;
+			u32 page; memcpy(&page, index->data + root + record * 4, 4);
+			plane->level_available[l] = page != 0;
+			if (p == 0) plane->tiles[l] = level->tiles;
+			else if (page) plane->tiles[l] = calloc((size_t)level->width_in_tiles * level->height_in_tiles, sizeof(mrxs_tile_t));
+			if (page && (!plane->tiles[l] || !mrxs_read_plane_level(mrxs, index, page, p, l))) return false;
 		}
 	}
 	return true;
@@ -675,6 +759,8 @@ bool mrxs_open_from_source(mrxs_t* mrxs, source_fs_t* source, const char* direct
 	if (!source || !directory) return false;
 
 	i64 start = get_clock();
+	mrxs->extended_focus_value = -1;
+	mrxs->zero_focus_value = -1;
     mem_t* slidedat_ini = mrxs_read_metadata(source, directory, "Slidedat.ini");
 
     if (slidedat_ini) {
@@ -697,12 +783,16 @@ bool mrxs_open_from_source(mrxs_t* mrxs, source_fs_t* source, const char* direct
 					// Initialize some basic stuff
 					mrxs_hier_t* hier_zoom_levels = mrxs->hier + mrxs->slide_zoom_level_hier_index;
 					mrxs->level_count = hier_zoom_levels->val_count;
+					if (mrxs->level_count <= 0 || mrxs->level_count > COUNT(mrxs->levels) ||
+					    mrxs->base_width_in_tiles <= 0 || mrxs->base_height_in_tiles <= 0 ||
+					    (u64)mrxs->base_width_in_tiles * mrxs->base_height_in_tiles > INT32_MAX) goto label_failed;
 					for (i32 i = 0; i < mrxs->level_count; ++i) {
 						mrxs_level_t* level = mrxs->levels + i;
 						level->width_in_tiles = (mrxs->base_width_in_tiles + (1 << i) - 1) >> i;
 						level->height_in_tiles = (mrxs->base_height_in_tiles + (1 << i) - 1) >> i;
 						u32 tile_count = level->width_in_tiles * level->height_in_tiles;
 						level->tiles = calloc(tile_count, sizeof(mrxs_tile_t ));
+						if (!level->tiles) goto label_failed;
 					}
 
                     // Additional initialization to deal with slides with overlapping images
@@ -732,25 +822,7 @@ bool mrxs_open_from_source(mrxs_t* mrxs, source_fs_t* source, const char* direct
                         mrxs->base_height_in_pixels = base_level->height_in_tiles * base_level->tile_height;
                     }
 
-	                // There is one record stored for each HIER_i_VAL_j combination (all in a flat array)
-					i32 record_index = 0;
-	                for (i32 hier_index = 0; hier_index < mrxs->hier_count; ++hier_index) {
-		                mrxs_hier_t* hier = mrxs->hier + hier_index;
-		                for (i32 val_index = 0; val_index < hier->val_count; ++val_index, ++record_index) {
-			                mrxs_hier_val_t* hier_val = hier->val + val_index;
-
-			                mem_seek(index_dat, hier_root + record_index * sizeof(u32));
-			                u32 record_ptr = 0;
-			                mem_read(&record_ptr, index_dat, 4);
-			                mem_seek(index_dat, record_ptr);
-							if (hier->name == MRXS_HIER_SLIDE_ZOOM_LEVEL && hier_val->type == MRXS_HIER_VAL_ZOOMLEVEL) {
-								if (!mrxs_read_index_dat_slide_zoom_level(mrxs, index_dat, hier_val)) {
-									goto label_failed;
-								}
-							}
-
-		                }
-	                }
+					if (!mrxs_read_focus_pyramids(mrxs, index_dat, hier_root)) goto label_failed;
 
                 } else {
 					label_failed:
@@ -970,14 +1042,20 @@ u8* mrxs_decode_simple_image_to_rgba(mrxs_t* mrxs, mrxs_simple_image_t* image) {
     return result;
 }
 
-static u8* mrxs_decode_stored_tile_to_bgra(mrxs_t* mrxs, i32 level, i32 stored_tile_index) {
+static u8* mrxs_decode_stored_tile_to_bgra(mrxs_t* mrxs, i32 plane, i32 level, i32 stored_tile_index) {
     u8* result = NULL;
     if (!(level >= 0 && level < mrxs->level_count)) {
         return NULL;
     }
     mrxs_level_t* mrxs_level = mrxs->levels + level;
     if (stored_tile_index >= 0 && stored_tile_index < mrxs_level->width_in_tiles * mrxs_level->height_in_tiles) {
-        mrxs_tile_t* tile = mrxs_level->tiles + stored_tile_index;
+        mrxs_tile_t* tiles = mrxs->planes ? mrxs->planes[plane].tiles[level] : mrxs_level->tiles;
+        if (!tiles || !tiles[stored_tile_index].hier_entry.length) {
+			if (plane > 0 && mrxs_level->tiles && mrxs_level->tiles[stored_tile_index].hier_entry.length)
+				mrxs_warn_coverage_mismatch(mrxs, plane, level, stored_tile_index, false);
+			return NULL;
+		}
+        mrxs_tile_t* tile = tiles + stored_tile_index;
         mrxs_hier_entry_t hier_entry = tile->hier_entry;
         if (mrxs->dat_files && hier_entry.length > 0 && hier_entry.file < mrxs->dat_count) {
             const source_file_t* file = mrxs->dat_files + hier_entry.file;
@@ -1021,15 +1099,15 @@ static void mrxs_decoded_tile_cache_evict_one(mrxs_t* mrxs) {
     }
 }
 
-static u8* mrxs_acquire_cached_stored_tile(mrxs_t* mrxs, i32 level, i32 stored_tile_index) {
+static u8* mrxs_acquire_cached_stored_tile(mrxs_t* mrxs, i32 plane, i32 level, i32 stored_tile_index) {
     if (!mrxs->decoded_tile_cache_mutex_initialized) {
-        return mrxs_decode_stored_tile_to_bgra(mrxs, level, stored_tile_index);
+        return mrxs_decode_stored_tile_to_bgra(mrxs, plane, level, stored_tile_index);
     }
 
     platform_mutex_lock(&mrxs->decoded_tile_cache_mutex);
     for (i32 i = 0; i < mrxs->decoded_tile_cache_count; ++i) {
         mrxs_decoded_tile_cache_entry_t* entry = mrxs->decoded_tile_cache_entries + i;
-        if (entry->level == level && entry->stored_tile_index == stored_tile_index) {
+        if (entry->plane == plane && entry->level == level && entry->stored_tile_index == stored_tile_index) {
             ++entry->refcount;
             entry->last_used = ++mrxs->decoded_tile_cache_tick;
             u8* pixels = entry->pixels;
@@ -1039,7 +1117,7 @@ static u8* mrxs_acquire_cached_stored_tile(mrxs_t* mrxs, i32 level, i32 stored_t
     }
     platform_mutex_unlock(&mrxs->decoded_tile_cache_mutex);
 
-    u8* pixels = mrxs_decode_stored_tile_to_bgra(mrxs, level, stored_tile_index);
+    u8* pixels = mrxs_decode_stored_tile_to_bgra(mrxs, plane, level, stored_tile_index);
     if (!pixels) {
         return NULL;
     }
@@ -1047,7 +1125,7 @@ static u8* mrxs_acquire_cached_stored_tile(mrxs_t* mrxs, i32 level, i32 stored_t
     platform_mutex_lock(&mrxs->decoded_tile_cache_mutex);
     for (i32 i = 0; i < mrxs->decoded_tile_cache_count; ++i) {
         mrxs_decoded_tile_cache_entry_t* entry = mrxs->decoded_tile_cache_entries + i;
-        if (entry->level == level && entry->stored_tile_index == stored_tile_index) {
+        if (entry->plane == plane && entry->level == level && entry->stored_tile_index == stored_tile_index) {
             ++entry->refcount;
             entry->last_used = ++mrxs->decoded_tile_cache_tick;
             u8* cached_pixels = entry->pixels;
@@ -1078,6 +1156,7 @@ static u8* mrxs_acquire_cached_stored_tile(mrxs_t* mrxs, i32 level, i32 stored_t
 
     if (mrxs->decoded_tile_cache_count < mrxs->decoded_tile_cache_capacity) {
         mrxs_decoded_tile_cache_entry_t* entry = mrxs->decoded_tile_cache_entries + mrxs->decoded_tile_cache_count++;
+        entry->plane = plane;
         entry->level = level;
         entry->stored_tile_index = stored_tile_index;
         entry->pixels = pixels;
@@ -1091,7 +1170,7 @@ static u8* mrxs_acquire_cached_stored_tile(mrxs_t* mrxs, i32 level, i32 stored_t
     return pixels;
 }
 
-static void mrxs_release_cached_stored_tile(mrxs_t* mrxs, i32 level, i32 stored_tile_index, u8* pixels) {
+static void mrxs_release_cached_stored_tile(mrxs_t* mrxs, i32 plane, i32 level, i32 stored_tile_index, u8* pixels) {
     if (!pixels) {
         return;
     }
@@ -1103,7 +1182,7 @@ static void mrxs_release_cached_stored_tile(mrxs_t* mrxs, i32 level, i32 stored_
     platform_mutex_lock(&mrxs->decoded_tile_cache_mutex);
     for (i32 i = 0; i < mrxs->decoded_tile_cache_count; ++i) {
         mrxs_decoded_tile_cache_entry_t* entry = mrxs->decoded_tile_cache_entries + i;
-        if (entry->level == level && entry->stored_tile_index == stored_tile_index && entry->pixels == pixels) {
+        if (entry->plane == plane && entry->level == level && entry->stored_tile_index == stored_tile_index && entry->pixels == pixels) {
             ASSERT(entry->refcount > 0);
             --entry->refcount;
             entry->last_used = ++mrxs->decoded_tile_cache_tick;
@@ -1264,6 +1343,7 @@ static void mrxs_composite_decoded_region(u8* output, i32 output_width, i32 outp
 }
 
 typedef struct mrxs_decode_cache_entry_t {
+	i32 plane;
     i32 level;
     i32 stored_tile_index;
     u8* pixels;
@@ -1275,15 +1355,15 @@ typedef struct mrxs_decode_cache_t {
     i32 capacity;
 } mrxs_decode_cache_t;
 
-static u8* mrxs_decode_cache_get(mrxs_decode_cache_t* cache, mrxs_t* mrxs, i32 level, i32 stored_tile_index) {
+static u8* mrxs_decode_cache_get(mrxs_decode_cache_t* cache, mrxs_t* mrxs, i32 plane, i32 level, i32 stored_tile_index) {
     for (i32 i = 0; i < cache->count; ++i) {
         mrxs_decode_cache_entry_t* entry = cache->entries + i;
-        if (entry->level == level && entry->stored_tile_index == stored_tile_index) {
+        if (entry->plane == plane && entry->level == level && entry->stored_tile_index == stored_tile_index) {
             return entry->pixels;
         }
     }
 
-    u8* pixels = mrxs_acquire_cached_stored_tile(mrxs, level, stored_tile_index);
+    u8* pixels = mrxs_acquire_cached_stored_tile(mrxs, plane, level, stored_tile_index);
     if (!pixels) {
         return NULL;
     }
@@ -1292,7 +1372,7 @@ static u8* mrxs_decode_cache_get(mrxs_decode_cache_t* cache, mrxs_t* mrxs, i32 l
         i32 new_capacity = cache->capacity > 0 ? cache->capacity * 2 : 32;
         mrxs_decode_cache_entry_t* new_entries = realloc(cache->entries, new_capacity * sizeof(*new_entries));
         if (!new_entries) {
-            mrxs_release_cached_stored_tile(mrxs, level, stored_tile_index, pixels);
+            mrxs_release_cached_stored_tile(mrxs, plane, level, stored_tile_index, pixels);
             return NULL;
         }
         cache->entries = new_entries;
@@ -1300,6 +1380,7 @@ static u8* mrxs_decode_cache_get(mrxs_decode_cache_t* cache, mrxs_t* mrxs, i32 l
     }
 
     mrxs_decode_cache_entry_t* entry = cache->entries + cache->count++;
+    entry->plane = plane;
     entry->level = level;
     entry->stored_tile_index = stored_tile_index;
     entry->pixels = pixels;
@@ -1308,7 +1389,7 @@ static u8* mrxs_decode_cache_get(mrxs_decode_cache_t* cache, mrxs_t* mrxs, i32 l
 
 static void mrxs_decode_cache_destroy(mrxs_decode_cache_t* cache, mrxs_t* mrxs) {
     for (i32 i = 0; i < cache->count; ++i) {
-        mrxs_release_cached_stored_tile(mrxs, cache->entries[i].level,
+        mrxs_release_cached_stored_tile(mrxs, cache->entries[i].plane, cache->entries[i].level,
                                         cache->entries[i].stored_tile_index,
                                         cache->entries[i].pixels);
     }
@@ -1316,7 +1397,7 @@ static void mrxs_decode_cache_destroy(mrxs_decode_cache_t* cache, mrxs_t* mrxs) 
     memset(cache, 0, sizeof(*cache));
 }
 
-static u8* mrxs_decode_aligned_overlap_tile_to_bgra(mrxs_t* mrxs, i32 level, i32 logical_tile_index) {
+static u8* mrxs_decode_aligned_overlap_tile_to_bgra(mrxs_t* mrxs, i32 plane, i32 level, i32 logical_tile_index) {
     mrxs_level_t* mrxs_level = mrxs->levels + level;
     i32 logical_width_in_tiles = mrxs_ceil_div_i32(mrxs_ceil_div_i32(mrxs->base_width_in_pixels, 1 << level),
                                                    mrxs_level->tile_width);
@@ -1381,7 +1462,7 @@ static u8* mrxs_decode_aligned_overlap_tile_to_bgra(mrxs_t* mrxs, i32 level, i32
                     }
 
                     i32 stored_tile_index = stored_tile_y * mrxs_level->width_in_tiles + stored_tile_x;
-                    u8* decoded_tile = mrxs_decode_stored_tile_to_bgra(mrxs, level, stored_tile_index);
+                    u8* decoded_tile = mrxs_decode_stored_tile_to_bgra(mrxs, plane, level, stored_tile_index);
                     if (decoded_tile) {
                         mrxs_composite_decoded_tile(result, mrxs_level->tile_width, mrxs_level->tile_height,
                                                     decoded_tile, mrxs_level->tile_width, mrxs_level->tile_height,
@@ -1396,7 +1477,7 @@ static u8* mrxs_decode_aligned_overlap_tile_to_bgra(mrxs_t* mrxs, i32 level, i32
     return result;
 }
 
-static u8* mrxs_decode_fractional_overlap_tile_to_bgra(mrxs_t* mrxs, i32 level, i32 logical_tile_index) {
+static u8* mrxs_decode_fractional_overlap_tile_to_bgra(mrxs_t* mrxs, i32 plane, i32 level, i32 logical_tile_index) {
     mrxs_level_t* mrxs_level = mrxs->levels + level;
     i32 logical_width_in_tiles = mrxs_ceil_div_i32(mrxs_ceil_div_i32(mrxs->base_width_in_pixels, 1 << level),
                                                    mrxs_level->tile_width);
@@ -1477,7 +1558,7 @@ static u8* mrxs_decode_fractional_overlap_tile_to_bgra(mrxs_t* mrxs, i32 level, 
                     }
 
                     i32 stored_tile_index = stored_tile_y * mrxs_level->width_in_tiles + stored_tile_x;
-                    u8* decoded_tile = mrxs_decode_cache_get(&decode_cache, mrxs, level, stored_tile_index);
+                    u8* decoded_tile = mrxs_decode_cache_get(&decode_cache, mrxs, plane, level, stored_tile_index);
                     if (decoded_tile) {
                         float src_box_x = fragment_nominal_left - stored_left;
                         float src_box_y = fragment_nominal_top - stored_top;
@@ -1495,23 +1576,36 @@ static u8* mrxs_decode_fractional_overlap_tile_to_bgra(mrxs_t* mrxs, i32 level, 
     return result;
 }
 
-u8* mrxs_decode_tile_to_bgra(mrxs_t* mrxs, i32 level, i32 tile_index) {
+u8* mrxs_decode_tile_to_bgra(mrxs_t* mrxs, i32 plane, i32 level, i32 tile_index) {
+	if (plane < 0 || plane >= ATLEAST(mrxs->plane_count, 1)) return NULL;
+	if (mrxs->planes && (level < 0 || level >= mrxs->level_count || !mrxs->planes[plane].level_available[level])) return NULL;
 	u8* result = NULL;
 	if (level >= 0 && level < mrxs->level_count) {
         if (!mrxs->has_overlapping_tiles) {
             // No overlapping tiles -> relatively straightforward
-            result = mrxs_decode_stored_tile_to_bgra(mrxs, level, tile_index);
+            result = mrxs_decode_stored_tile_to_bgra(mrxs, plane, level, tile_index);
         } else {
             if (mrxs->cameras && level <= mrxs->max_aligned_overlap_level) {
-                result = mrxs_decode_aligned_overlap_tile_to_bgra(mrxs, level, tile_index);
+                result = mrxs_decode_aligned_overlap_tile_to_bgra(mrxs, plane, level, tile_index);
             } else if (mrxs->cameras) {
-                result = mrxs_decode_fractional_overlap_tile_to_bgra(mrxs, level, tile_index);
+                result = mrxs_decode_fractional_overlap_tile_to_bgra(mrxs, plane, level, tile_index);
             } else {
-                result = mrxs_decode_stored_tile_to_bgra(mrxs, level, tile_index);
+                result = mrxs_decode_stored_tile_to_bgra(mrxs, plane, level, tile_index);
             }
         }
 	}
 	return result;
+}
+
+
+bool mrxs_tile_is_empty(mrxs_t* mrxs, i32 plane, i32 level, i32 tile_index) {
+	if (plane < 0 || plane >= ATLEAST(mrxs->plane_count, 1) || level < 0 || level >= mrxs->level_count) return true;
+	if (mrxs->planes && !mrxs->planes[plane].level_available[level]) return true;
+	if (mrxs->has_overlapping_tiles) return false;
+	mrxs_level_t* l = mrxs->levels + level;
+	if (tile_index < 0 || (u64)tile_index >= (u64)l->width_in_tiles * l->height_in_tiles) return true;
+	mrxs_tile_t* tiles = mrxs->planes ? mrxs->planes[plane].tiles[level] : l->tiles;
+	return !tiles || tiles[tile_index].hier_entry.length == 0;
 }
 
 // Set the thread pool to submit parallel jobs to
@@ -1550,6 +1644,11 @@ void mrxs_destroy(mrxs_t* mrxs) {
 			free(mrxs->nonhier[i].val);
 		}
 		free(mrxs->nonhier);
+	}
+	if (mrxs->planes) {
+		for (i32 p = 1; p < mrxs->plane_count; ++p)
+			for (i32 l = 0; l < COUNT(mrxs->levels); ++l) free(mrxs->planes[p].tiles[l]);
+		free(mrxs->planes);
 	}
 	for (i32 i = 0; i < COUNT(mrxs->levels); ++i) {
 		free(mrxs->levels[i].tiles);

@@ -71,7 +71,7 @@ static void ssi_pending_batch_release(load_tile_task_batch_t* batch, bool cancel
 		tile_indices[i] = task->tile_index;
 	}
 	if (cancel_tiles) {
-		tile_cache_cancel_decode_batch(batch->tile_tasks[0].image,
+		tile_cache_cancel_decode_batch(batch->tile_tasks[0].image, 0,
 		                               levels, tile_indices, batch->task_count);
 	}
 	atomic_subtract(&batch->tile_tasks[0].image->refcount, refcount_decrement);
@@ -107,7 +107,7 @@ void tile_loader_cancel_stale_ssi_pending(image_t* image, i32 viewer_generation)
 				++cancelled_tile_count;
 			}
 		}
-		tile_cache_cancel_decode_batch(image, levels, tile_indices, cancelled_tile_count);
+		tile_cache_cancel_decode_batch(image, 0, levels, tile_indices, cancelled_tile_count);
 		for (i32 batch_index = 0; batch_index < cancelled_batch_count; ++batch_index) {
 			ssi_pending_batch_release(cancelled_batches + batch_index, false);
 		}
@@ -196,14 +196,15 @@ static void tile_loader_get_tile_xy(image_t* image, i32 level, i32 tile_index, i
 }
 
 static void tile_loader_post_stale_result(load_tile_task_t* task) {
-	if (!tile_cache_post_stale_result(task->image, task->resource_id, task->level, task->tile_index)) {
-		tile_cache_cancel_decode(task->image, task->level, task->tile_index);
+	if (!tile_cache_post_stale_result(task->image, task->plane, task->resource_id, task->level, task->tile_index)) {
+		tile_cache_cancel_decode(task->image, task->plane, task->level, task->tile_index);
 	}
 }
 
 static void tile_loader_post_failed_result(load_tile_task_t* task) {
 	level_image_t* level_image = task->image->level_images + task->level;
 	tile_cache_result_t result = {
+		.plane = task->plane,
 		.resource_id = task->resource_id,
 		.level = task->level,
 		.tile_index = task->tile_index,
@@ -214,7 +215,7 @@ static void tile_loader_post_failed_result(load_tile_task_t* task) {
 		.failed = true,
 	};
 	if (!tile_cache_post_load_result(task->image, &result)) {
-		tile_cache_cancel_decode(task->image, task->level, task->tile_index);
+		tile_cache_cancel_decode(task->image, task->plane, task->level, task->tile_index);
 	}
 }
 
@@ -316,7 +317,7 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 						load_tile_task_t* task = wishlist + i;
 						u32 demand_flags = task->need_gpu_residency ? TILE_CACHE_DEMAND_GPU_RESIDENCY : 0;
 						demand_flags |= task->need_cpu_residency ? TILE_CACHE_DEMAND_CPU_RESIDENCY : 0;
-						if (tile_cache_try_begin_decode(image, task->level, task->tile_index, demand_flags, task->priority, task->generation)) {
+						if (tile_cache_try_begin_decode(image, task->plane, task->level, task->tile_index, demand_flags, task->priority, task->generation)) {
 							batch.tile_tasks[batch.task_count++] = *task;
 						} else {
 							console_print_verbose("tile_loader_submit_requests(): tile already requested by another thread (%d)\n", task->tile_index);
@@ -343,7 +344,7 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 					} else {
 						for (i32 i = 0; i < batch.task_count; ++i) {
 							load_tile_task_t* task = batch.tile_tasks + i;
-							tile_cache_cancel_decode(image, task->level, task->tile_index);
+							tile_cache_cancel_decode(image, task->plane, task->level, task->tile_index);
 						}
 					}
 					first_tile += candidate_count;
@@ -355,12 +356,13 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 				u32 demand_flags = task.need_gpu_residency ? TILE_CACHE_DEMAND_GPU_RESIDENCY : 0;
 				demand_flags |= task.need_cpu_residency ? TILE_CACHE_DEMAND_CPU_RESIDENCY : 0;
 
-				if (tile_cache_tile_has_cpu_pixels(image, task.level, task.tile_index) &&
-					    tile_cache_get_gpu_texture(image, task.level, task.tile_index) == 0 && task.need_gpu_residency) {
-					if (tile_cache_try_begin_upload(image, task.level, task.tile_index, demand_flags, task.priority, task.generation)) {
+				if (tile_cache_tile_has_cpu_pixels(image, task.plane, task.level, task.tile_index) &&
+					    tile_cache_get_gpu_texture(image, task.plane, task.level, task.tile_index) == 0 && task.need_gpu_residency) {
+					if (tile_cache_try_begin_upload(image, task.plane, task.level, task.tile_index, demand_flags, task.priority, task.generation)) {
 						task_group_begin(task.task_group);
 						level_image_t* level_image = image->level_images + task.level;
 						tile_cache_result_t upload_request = {0};
+						upload_request.plane = task.plane;
 						upload_request.resource_id = task.resource_id;
 						upload_request.level = task.level;
 						upload_request.tile_index = task.tile_index;
@@ -370,7 +372,7 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 						upload_request.want_cpu_residency = task.need_cpu_residency;
 						upload_request.upload_from_cached_pixels = true;
 						if (!tile_cache_post_load_result(image, &upload_request)) {
-							tile_cache_cancel_upload(image, task.level, task.tile_index);
+							tile_cache_cancel_upload(image, task.plane, task.level, task.tile_index);
 						} else {
 							++tile_loads_submitted;
 						}
@@ -378,13 +380,13 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 					} else {
 						console_print_verbose("tile_loader_submit_requests(): tile already requested by another thread (%d)\n", task.tile_index);
 					}
-				} else if (tile_cache_try_begin_decode(image, task.level, task.tile_index, demand_flags, task.priority, task.generation)) {
+				} else if (tile_cache_try_begin_decode(image, task.plane, task.level, task.tile_index, demand_flags, task.priority, task.generation)) {
 					if (thread_pool_submit_task_to_group(&global_thread_pool, task.task_group, load_tile_func, &task, sizeof(task))) {
 						atomic_add(&image->refcount, task.refcount_to_decrement);
 						++tile_loads_submitted;
 					} else {
 						// TODO: should we even allow this to fail?
-						tile_cache_cancel_decode(image, task.level, task.tile_index);
+						tile_cache_cancel_decode(image, task.plane, task.level, task.tile_index);
 					}
 				} else {
 					console_print_verbose("tile_loader_submit_requests(): tile already requested by another thread (%d)\n", task.tile_index);
@@ -413,7 +415,7 @@ void load_tile_func(i32 logical_thread_index, void* userdata) {
 	i32 tile_y = 0;
 	tile_loader_get_tile_xy(image, level, tile_index, &tile_x, &tile_y);
 
-	if (task->may_discard_if_stale && tile_cache_task_is_stale(image, level, tile_index, task->generation)) {
+	if (task->may_discard_if_stale && tile_cache_task_is_stale(image, task->plane, level, tile_index, task->generation)) {
 		tile_loader_post_stale_result(task);
 		atomic_subtract(&image->refcount, task->refcount_to_decrement);
 		return;
@@ -476,6 +478,11 @@ void load_tile_func(i32 logical_thread_index, void* userdata) {
 		i64 x = (tile_x * level_image->tile_width) << level;
 		i64 y = (tile_y * level_image->tile_height) << level;
 		openslide.read_region(wsi->osr, (u32*)temp_memory, x, y, wsi_file_level, level_image->tile_width, level_image->tile_height);
+		const char* read_error = openslide.get_error(wsi->osr);
+		if (read_error) {
+			console_print_error("OpenSlide tile read failed: %s\n", read_error);
+			failed = true;
+		}
 
 		u32 pixel_count = level_image->tile_width * level_image->tile_height;
 		u32* pixels = (u32*)temp_memory;
@@ -485,10 +492,9 @@ void load_tile_func(i32 logical_thread_index, void* userdata) {
 			nonempty_pixel_count += (p > 0);
 			pixels[i] = p ? p : image_background_color;
 		}
-		if (nonempty_pixel_count == 0) {
+		if (!failed && nonempty_pixel_count == 0) {
 			console_print_verbose("thread %d: tile level %d, tile %d (%d, %d): openslide.read_region() returned zeroes (empty tile)\n",
 			                      logical_thread_index, level, tile_index, tile_x, tile_y);
-			failed = true;
 			is_empty = true;
 		}
 	} else if (image->backend == IMAGE_BACKEND_DICOM) {
@@ -500,7 +506,7 @@ void load_tile_func(i32 logical_thread_index, void* userdata) {
 			failed = true;
 		}
 	} else if (image->backend == IMAGE_BACKEND_MRXS) {
-		u8* pixels = mrxs_decode_tile_to_bgra(&image->mrxs, level, tile_index);
+		u8* pixels = mrxs_decode_tile_to_bgra(&image->mrxs, task->plane, level, tile_index);
 		if (pixels) {
 			tile_buffer_release(temp_memory, pixel_memory_size);
 			temp_memory = pixels;
@@ -524,12 +530,13 @@ void load_tile_func(i32 logical_thread_index, void* userdata) {
 		}
 	}
 
-	if (failed && temp_memory != NULL) {
+	if ((failed || is_empty) && temp_memory != NULL) {
 		tile_buffer_release(temp_memory, pixel_memory_size);
 		temp_memory = NULL;
 	}
 
 	tile_cache_result_t completion_task = {0};
+	completion_task.plane = task->plane;
 	completion_task.resource_id = task->resource_id;
 	completion_task.pixel_memory = temp_memory;
 	completion_task.tile_width = level_image->tile_width;

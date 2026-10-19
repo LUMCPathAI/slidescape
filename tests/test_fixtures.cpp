@@ -1898,7 +1898,7 @@ TEST_CASE("load TIFF fixture as image_t and read a tile region") {
 	u32* region = (u32*)calloc((size_t)tile.read_width * (size_t)tile.read_height, sizeof(u32));
 	REQUIRE(region != NULL);
 
-	REQUIRE(image_read_region(image, 0, x, y, tile.read_width, tile.read_height, region, PIXEL_FORMAT_U8_BGRA));
+	REQUIRE(image_read_region(image, 0, 0, x, y, tile.read_width, tile.read_height, region, PIXEL_FORMAT_U8_BGRA));
 	for (i32 row = 0; row < tile.read_height; ++row) {
 		u32* expected_row = (u32*)tile.pixels + (size_t)row * (size_t)level_image->tile_width;
 		u32* actual_row = region + (size_t)row * (size_t)tile.read_width;
@@ -1939,7 +1939,7 @@ TEST_CASE("image_read_region converts TIFF BGRA pixels to F32 luminance") {
 	float* luminance = (float*)calloc((size_t)read_width * (size_t)read_height, sizeof(float));
 	REQUIRE(luminance != NULL);
 
-	REQUIRE(image_read_region(image, 0, x, y, read_width, read_height, luminance, PIXEL_FORMAT_F32_Y));
+	REQUIRE(image_read_region(image, 0, 0, x, y, read_width, read_height, luminance, PIXEL_FORMAT_F32_Y));
 	for (i32 row = 0; row < read_height; ++row) {
 		for (i32 col = 0; col < read_width; ++col) {
 			u8* bgra = tile.pixels + ((size_t)row * (size_t)level_image->tile_width + (size_t)col) * 4;

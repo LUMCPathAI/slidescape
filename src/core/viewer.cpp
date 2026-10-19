@@ -116,7 +116,7 @@ void renderer_destroy_image_resources(app_state_t* app_state, image_t* image) {
 				renderer_destroy_texture(transfer_state->texture);
 				transfer_state->texture = 0;
 			}
-			tile_cache_cancel_upload(image, transfer_state->level, transfer_state->tile_index);
+			tile_cache_cancel_upload(image, transfer_state->plane, transfer_state->level, transfer_state->tile_index);
 			transfer_state->image = NULL;
 		}
 	}
@@ -132,23 +132,14 @@ void renderer_destroy_image_resources(app_state_t* app_state, image_t* image) {
 		// We shouldn't destroy that texture twice, so here we're just setting it to 0.
 		level_image_t* level_image = image->level_images;
 		if (level_image && level_image[0].tiles) {
-			renderer_texture_handle_t texture = tile_cache_get_gpu_texture(image, 0, 0);
+			renderer_texture_handle_t texture = tile_cache_get_gpu_texture(image, 0, 0, 0);
 			if (texture != 0 && texture == simple_destroyed_texture_handle) {
-				tile_cache_take_gpu_texture(image, 0, 0);
+				tile_cache_take_gpu_texture(image, 0, 0, 0);
 			}
 		}
 	}
 
-	for (i32 i = 0; i < image->level_count; ++i) {
-		level_image_t* level_image = image->level_images + i;
-		if (!level_image->tiles) continue;
-		for (i32 j = 0; j < level_image->tile_count; ++j) {
-			renderer_texture_handle_t texture = tile_cache_take_gpu_texture(image, i, j);
-			if (texture != 0) {
-				renderer_destroy_texture(texture);
-			}
-		}
-	}
+	tile_cache_destroy_gpu_textures(image, renderer_destroy_texture);
 
 	if (image->macro_image.texture != 0) {
 		renderer_destroy_texture(image->macro_image.texture);
@@ -345,14 +336,15 @@ static bool viewer_process_loaded_tile(app_state_t* app_state, image_t* image, t
 				get_seconds_elapsed(image->dicomweb.open_start_clock, get_clock()) * 1000.0);
 		}
 		if (finalize_textures_immediately) {
-			tile_cache_store_gpu_texture(image, task->level, task->tile_index, transfer_state->texture);
+			tile_cache_store_gpu_texture(image, task->plane, task->level, task->tile_index, transfer_state->texture);
 		} else {
 			transfer_state->image = image;
+			transfer_state->plane = task->plane;
 			transfer_state->level = task->level;
 			transfer_state->tile_index = task->tile_index;
 		}
 		if (action.release_upload_cpu_pin) {
-			tile_cache_release_upload_cpu_pin(image, task->level, task->tile_index);
+			tile_cache_release_upload_cpu_pin(image, task->plane, task->level, task->tile_index);
 		}
 		if (action.free_upload_pixels) {
 			tile_buffer_release(action.upload_pixels, pixel_memory_size);
@@ -373,7 +365,7 @@ void viewer_process_completion_queue(app_state_t* app_state) {
 			if (transfer_state->need_finalization) {
 				renderer_finalize_texture_upload(transfer_state);
 				if (transfer_state->image) {
-					tile_cache_store_gpu_texture(transfer_state->image, transfer_state->level, transfer_state->tile_index, transfer_state->texture);
+					tile_cache_store_gpu_texture(transfer_state->image, transfer_state->plane, transfer_state->level, transfer_state->tile_index, transfer_state->texture);
 					transfer_state->image = NULL;
 				}
 			}
@@ -493,7 +485,8 @@ void update_and_render_image(app_state_t* app_state, image_t* image) {
 		i32 lowest_visible_scale = ATLEAST(scene->zoom.level, 0);
 		lowest_visible_scale = ATMOST(highest_visible_scale, lowest_visible_scale);
 		for (; lowest_visible_scale > 0; --lowest_visible_scale) {
-			if (image->level_images[lowest_visible_scale].exists) {
+			if (image->level_images[lowest_visible_scale].exists &&
+			    !(image->level_images[lowest_visible_scale].missing_planes & (UINT64_C(1) << image->selected_plane))) {
 				break; // done, no need to go lower
 			}
 		}
@@ -549,12 +542,13 @@ void update_and_render_image(app_state_t* app_state, image_t* image) {
 				ASSERT(level_image->tiles && level_image->tile_count > 0);
 				tile_t* tile = level_image->tiles + 0;
 				tile_cache_get_or_create(image); // TODO(pvalkema): why? we don't really need a full tile-cache for the STBI backend (which has no tiles), do we?
-				tile_cache_store_gpu_texture(image, 0, 0, image->simple.texture);
+				tile_cache_store_gpu_texture(image, 0, 0, 0, image->simple.texture);
 			}
 
 		} else {
 
 			tile_cache_viewer_request_t request = {0};
+			request.plane = image->selected_plane;
 			request.camera_bounds = scene->restrict_load_bounds ? scene->tile_load_bounds : scene->camera_bounds;
 			request.camera_center = scene->camera;
 			request.crop_bounds = scene->crop_bounds;
@@ -719,7 +713,7 @@ void update_and_render_image(app_state_t* app_state, image_t* image) {
 			i32 highest_level_to_draw = ATMOST(highest_visible_scale, global_highest_scale_to_render);
 			for (i32 level = lowest_level_to_draw; level <= highest_level_to_draw; ++level) {
 				level_image_t *drawn_level = image->level_images + level;
-				if (!drawn_level->exists) {
+				if (!drawn_level->exists || (drawn_level->missing_planes & (UINT64_C(1) << image->selected_plane))) {
 					continue;
 				}
 
@@ -741,7 +735,7 @@ void update_and_render_image(app_state_t* app_state, image_t* image) {
 					for (i32 tile_x = visible_tiles.min.x; tile_x < visible_tiles.max.x; ++tile_x) {
 
 						tile_t *tile = get_tile(drawn_level, tile_x, tile_y);
-						renderer_texture_handle_t texture = tile_cache_get_gpu_texture(image, level, tile->tile_index);
+						renderer_texture_handle_t texture = tile_cache_get_focus_texture(image, level, tile->tile_index);
 						if (texture) {
 							tile->time_last_drawn = app_state->frame_counter;
 

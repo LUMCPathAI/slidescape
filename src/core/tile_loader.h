@@ -39,6 +39,7 @@ typedef enum load_tile_error_code_enum {
 } load_tile_error_code_enum;
 
 typedef struct load_tile_task_t {
+	i32 plane;
 	i32 resource_id;
 	image_t* image;
 	i32 level;

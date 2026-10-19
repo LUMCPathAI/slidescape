@@ -3,6 +3,7 @@
 #include "common.h"
 #include "intrinsics.h"
 #include "tile_cache.h"
+#include "tile_loader.h"
 #include "work_queue.h"
 
 typedef struct tile_cache_test_image_t {
@@ -58,7 +59,7 @@ typedef struct tile_cache_reserve_task_t {
 static void tile_cache_reserve_decode_task(i32 logical_thread_index, void* userdata) {
 	(void)logical_thread_index;
 	tile_cache_reserve_task_t* task = (tile_cache_reserve_task_t*)userdata;
-	if (tile_cache_try_begin_decode(task->image, 0, 0,
+	if (tile_cache_try_begin_decode(task->image, 0, 0, 0,
 	                                TILE_CACHE_DEMAND_GPU_RESIDENCY, 10, 1)) {
 		atomic_increment(task->reservations);
 	}
@@ -107,7 +108,7 @@ typedef struct tile_cache_pin_task_t {
 static void tile_cache_pin_read_task(i32 logical_thread_index, void* userdata) {
 	(void)logical_thread_index;
 	tile_cache_pin_task_t* task = (tile_cache_pin_task_t*)userdata;
-	tile_cache_pin_cpu_tile(task->image, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+	tile_cache_pin_cpu_tile(task->image, 0, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
 }
 
 typedef struct tile_cache_read_region_state_t {
@@ -124,7 +125,7 @@ static void tile_cache_read_region_task(i32 logical_thread_index, void* userdata
 	(void)logical_thread_index;
 	tile_cache_read_region_task_t* task = (tile_cache_read_region_task_t*)userdata;
 	tile_cache_read_region_state_t* state = task->state;
-	state->succeeded = image_read_region(state->image, 0, 0, 0, 1, 1,
+	state->succeeded = image_read_region(state->image, 0, 0, 0, 0, 1, 1,
 	                                    &state->output_pixel, PIXEL_FORMAT_U8_BGRA);
 }
 
@@ -133,13 +134,13 @@ TEST_CASE("tile cache suppresses duplicate decode requests") {
 	tile_cache_test_image_init(&fixture);
 	REQUIRE(fixture.image.tile_cache != nullptr);
 
-	CHECK(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	CHECK(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 	                                  TILE_CACHE_DEMAND_GPU_RESIDENCY, 10, 1));
-	CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 	                                        TILE_CACHE_DEMAND_CPU_RESIDENCY, 20, 1));
 
-	tile_cache_cancel_decode(&fixture.image, 0, 0);
-	CHECK(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	tile_cache_cancel_decode(&fixture.image, 0, 0, 0);
+	CHECK(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 	                                  TILE_CACHE_DEMAND_CPU_RESIDENCY, 20, 1));
 
 	tile_cache_test_image_destroy(&fixture);
@@ -150,12 +151,12 @@ TEST_CASE("GPU-resident tile can be decoded for a later CPU request") {
 	tile_cache_test_image_init(&fixture);
 	REQUIRE(fixture.image.tile_cache != nullptr);
 
-	tile_cache_store_gpu_texture(&fixture.image, 0, 0, 42);
-	CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	tile_cache_store_gpu_texture(&fixture.image, 0, 0, 0, 42);
+	CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 	                                        TILE_CACHE_DEMAND_GPU_RESIDENCY, 10, 1));
-	CHECK(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	CHECK(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 	                                  TILE_CACHE_DEMAND_CPU_RESIDENCY, 10, 1));
-	tile_cache_cancel_decode(&fixture.image, 0, 0);
+	tile_cache_cancel_decode(&fixture.image, 0, 0, 0);
 
 	tile_cache_test_image_destroy(&fixture);
 }
@@ -190,17 +191,17 @@ TEST_CASE("hard demand keeps an older viewer decode alive") {
 	tile_cache_test_image_init(&fixture);
 	REQUIRE(fixture.image.tile_cache != nullptr);
 
-	REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 	                                    TILE_CACHE_DEMAND_VIEWER_VISIBLE, 10, 1));
-	CHECK(tile_cache_task_is_stale(&fixture.image, 0, 0, 1));
+	CHECK(tile_cache_task_is_stale(&fixture.image, 0, 0, 0, 1));
 
-	tile_cache_pin_cpu_tile(&fixture.image, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
-	CHECK_FALSE(tile_cache_task_is_stale(&fixture.image, 0, 0, 1));
-	CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	tile_cache_pin_cpu_tile(&fixture.image, 0, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+	CHECK_FALSE(tile_cache_task_is_stale(&fixture.image, 0, 0, 0, 1));
+	CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 	                                        TILE_CACHE_DEMAND_READ_REGION, 20, 0));
 
-	tile_cache_unpin_cpu_tile(&fixture.image, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
-	CHECK(tile_cache_task_is_stale(&fixture.image, 0, 0, 1));
+	tile_cache_unpin_cpu_tile(&fixture.image, 0, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+	CHECK(tile_cache_task_is_stale(&fixture.image, 0, 0, 0, 1));
 
 	tile_cache_test_image_destroy(&fixture);
 }
@@ -210,7 +211,7 @@ TEST_CASE("retryable tile failure releases its reservation without marking empty
 	tile_cache_test_image_init(&fixture);
 	REQUIRE(fixture.image.tile_cache != nullptr);
 
-	REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 	                                    TILE_CACHE_DEMAND_VIEWER_VISIBLE |
 	                                    TILE_CACHE_DEMAND_GPU_RESIDENCY,
 	                                    10, 0));
@@ -222,8 +223,8 @@ TEST_CASE("retryable tile failure releases its reservation without marking empty
 	tile_cache_result_action_t action = {};
 	REQUIRE(tile_cache_apply_result(&fixture.image, &result, true, &action));
 	CHECK_FALSE(action.mark_empty);
-	CHECK_FALSE(tile_cache_tile_is_busy(&fixture.image, 0, 0));
-	CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	CHECK_FALSE(tile_cache_tile_is_busy(&fixture.image, 0, 0, 0));
+	CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 	                                        TILE_CACHE_DEMAND_VIEWER_VISIBLE |
 	                                        TILE_CACHE_DEMAND_GPU_RESIDENCY,
 	                                        10, 0));
@@ -247,17 +248,17 @@ TEST_CASE("CPU tile pixels live until the final pin is released") {
 	u8* pixels = (u8*)malloc(4);
 	REQUIRE(pixels != nullptr);
 	pixels[0] = 0x5a;
-	tile_cache_store_cpu_pixels(&fixture.image, 0, 0, pixels);
-	tile_cache_pin_cpu_tile(&fixture.image, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
-	tile_cache_pin_cpu_tile(&fixture.image, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+	tile_cache_store_cpu_pixels(&fixture.image, 0, 0, 0, pixels);
+	tile_cache_pin_cpu_tile(&fixture.image, 0, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+	tile_cache_pin_cpu_tile(&fixture.image, 0, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
 
-	tile_cache_unpin_cpu_tile(&fixture.image, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
-	u8* pinned_pixels = tile_cache_get_cpu_pixels(&fixture.image, 0, 0);
+	tile_cache_unpin_cpu_tile(&fixture.image, 0, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+	u8* pinned_pixels = tile_cache_get_cpu_pixels(&fixture.image, 0, 0, 0);
 	REQUIRE(pinned_pixels != nullptr);
 	CHECK(pinned_pixels[0] == 0x5a);
 
-	tile_cache_unpin_cpu_tile(&fixture.image, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
-	CHECK(tile_cache_get_cpu_pixels(&fixture.image, 0, 0) == nullptr);
+	tile_cache_unpin_cpu_tile(&fixture.image, 0, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+	CHECK(tile_cache_get_cpu_pixels(&fixture.image, 0, 0, 0) == nullptr);
 
 	tile_cache_test_image_destroy(&fixture);
 }
@@ -267,15 +268,15 @@ TEST_CASE("hard demand bits follow overlapping pin types") {
 	tile_cache_test_image_init(&fixture);
 	REQUIRE(fixture.image.tile_cache != nullptr);
 
-	REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 	                                    TILE_CACHE_DEMAND_VIEWER_VISIBLE, 10, 1));
-	tile_cache_pin_cpu_tile(&fixture.image, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
-	tile_cache_pin_cpu_tile(&fixture.image, 0, 0, TILE_CACHE_DEMAND_EXPORT);
+	tile_cache_pin_cpu_tile(&fixture.image, 0, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+	tile_cache_pin_cpu_tile(&fixture.image, 0, 0, 0, TILE_CACHE_DEMAND_EXPORT);
 
-	tile_cache_unpin_cpu_tile(&fixture.image, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
-	CHECK_FALSE(tile_cache_task_is_stale(&fixture.image, 0, 0, 1));
-	tile_cache_unpin_cpu_tile(&fixture.image, 0, 0, TILE_CACHE_DEMAND_EXPORT);
-	CHECK(tile_cache_task_is_stale(&fixture.image, 0, 0, 1));
+	tile_cache_unpin_cpu_tile(&fixture.image, 0, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+	CHECK_FALSE(tile_cache_task_is_stale(&fixture.image, 0, 0, 0, 1));
+	tile_cache_unpin_cpu_tile(&fixture.image, 0, 0, 0, TILE_CACHE_DEMAND_EXPORT);
+	CHECK(tile_cache_task_is_stale(&fixture.image, 0, 0, 0, 1));
 
 	tile_cache_test_image_destroy(&fixture);
 }
@@ -288,16 +289,16 @@ TEST_CASE("cached upload reservation pins CPU pixels") {
 	u8* pixels = (u8*)malloc(4);
 	REQUIRE(pixels != nullptr);
 	pixels[0] = 0x7c;
-	tile_cache_store_cpu_pixels(&fixture.image, 0, 0, pixels);
+	tile_cache_store_cpu_pixels(&fixture.image, 0, 0, 0, pixels);
 
-	REQUIRE(tile_cache_try_begin_upload(&fixture.image, 0, 0,
+	REQUIRE(tile_cache_try_begin_upload(&fixture.image, 0, 0, 0,
 	                                    TILE_CACHE_DEMAND_GPU_RESIDENCY, 10, 1));
-	u8* upload_pixels = tile_cache_get_cpu_pixels(&fixture.image, 0, 0);
+	u8* upload_pixels = tile_cache_get_cpu_pixels(&fixture.image, 0, 0, 0);
 	REQUIRE(upload_pixels != nullptr);
 	CHECK(upload_pixels[0] == 0x7c);
 
-	tile_cache_release_upload_cpu_pin(&fixture.image, 0, 0);
-	CHECK(tile_cache_get_cpu_pixels(&fixture.image, 0, 0) == nullptr);
+	tile_cache_release_upload_cpu_pin(&fixture.image, 0, 0, 0);
+	CHECK(tile_cache_get_cpu_pixels(&fixture.image, 0, 0, 0) == nullptr);
 
 	tile_cache_test_image_destroy(&fixture);
 }
@@ -307,8 +308,8 @@ TEST_CASE("decode completion atomically adopts pixels before releasing the reser
 	tile_cache_test_image_init(&fixture);
 	REQUIRE(fixture.image.tile_cache != nullptr);
 
-	tile_cache_pin_cpu_tile(&fixture.image, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
-	REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	tile_cache_pin_cpu_tile(&fixture.image, 0, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+	REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 	                                    TILE_CACHE_DEMAND_CPU_RESIDENCY, 10, 1));
 
 	u8* pixels = (u8*)malloc(4);
@@ -328,14 +329,14 @@ TEST_CASE("decode completion atomically adopts pixels before releasing the reser
 	CHECK(action.upload_pixels == pixels);
 	CHECK_FALSE(action.free_upload_pixels);
 	CHECK(action.release_upload_cpu_pin);
-	CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0, 10, 0));
-	tile_cache_store_gpu_texture(&fixture.image, 0, 0, 42);
-	tile_cache_release_upload_cpu_pin(&fixture.image, 0, 0);
+	CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0, 0, 10, 0));
+	tile_cache_store_gpu_texture(&fixture.image, 0, 0, 0, 42);
+	tile_cache_release_upload_cpu_pin(&fixture.image, 0, 0, 0);
 
-	u8* cached_pixels = tile_cache_get_cpu_pixels(&fixture.image, 0, 0);
+	u8* cached_pixels = tile_cache_get_cpu_pixels(&fixture.image, 0, 0, 0);
 	REQUIRE(cached_pixels != nullptr);
 	CHECK(cached_pixels[0] == 0x39);
-	tile_cache_unpin_cpu_tile(&fixture.image, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+	tile_cache_unpin_cpu_tile(&fixture.image, 0, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
 
 	tile_cache_test_image_destroy(&fixture);
 }
@@ -347,8 +348,8 @@ TEST_CASE("read-region consumption does not wedge a cached upload") {
 
 	u8* pixels = (u8*)malloc(4);
 	REQUIRE(pixels != nullptr);
-	tile_cache_store_cpu_pixels(&fixture.image, 0, 0, pixels);
-	REQUIRE(tile_cache_try_begin_upload(&fixture.image, 0, 0,
+	tile_cache_store_cpu_pixels(&fixture.image, 0, 0, 0, pixels);
+	REQUIRE(tile_cache_try_begin_upload(&fixture.image, 0, 0, 0,
 	                                    TILE_CACHE_DEMAND_GPU_RESIDENCY, 10, 0));
 
 	tile_cache_result_t result = {};
@@ -361,9 +362,9 @@ TEST_CASE("read-region consumption does not wedge a cached upload") {
 	CHECK_FALSE(action.should_upload);
 	CHECK(action.pixels_to_free == nullptr);
 
-	CHECK(tile_cache_try_begin_upload(&fixture.image, 0, 0,
+	CHECK(tile_cache_try_begin_upload(&fixture.image, 0, 0, 0,
 	                                  TILE_CACHE_DEMAND_GPU_RESIDENCY, 10, 0));
-	tile_cache_cancel_upload(&fixture.image, 0, 0);
+	tile_cache_cancel_upload(&fixture.image, 0, 0, 0);
 	tile_cache_test_image_destroy(&fixture);
 }
 
@@ -378,7 +379,7 @@ TEST_CASE("generation completion and read pin race preserves a valid cache state
 		tile_cache_test_image_t fixture = {};
 		tile_cache_test_image_init(&fixture);
 		REQUIRE(fixture.image.tile_cache != nullptr);
-		REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+		REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 		                                    TILE_CACHE_DEMAND_VIEWER_VISIBLE, 10, 1));
 
 		u8* pixels = (u8*)malloc(4);
@@ -399,17 +400,17 @@ TEST_CASE("generation completion and read pin race preserves a valid cache state
 		                                         &pin_task, sizeof(pin_task)));
 		thread_pool_wait_for_group(&pool, &group);
 
-		if (tile_cache_tile_has_cpu_pixels(&fixture.image, 0, 0)) {
-			u8* cached_pixels = tile_cache_get_cpu_pixels(&fixture.image, 0, 0);
+		if (tile_cache_tile_has_cpu_pixels(&fixture.image, 0, 0, 0)) {
+			u8* cached_pixels = tile_cache_get_cpu_pixels(&fixture.image, 0, 0, 0);
 			REQUIRE(cached_pixels != nullptr);
 			CHECK(cached_pixels[0] == (u8)iteration);
-			CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0, 10, 0));
+			CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0, 0, 10, 0));
 		} else {
-			REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+			REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 			                                    TILE_CACHE_DEMAND_CPU_RESIDENCY, 10, 0));
-			tile_cache_cancel_decode(&fixture.image, 0, 0);
+			tile_cache_cancel_decode(&fixture.image, 0, 0, 0);
 		}
-		tile_cache_unpin_cpu_tile(&fixture.image, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+		tile_cache_unpin_cpu_tile(&fixture.image, 0, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
 		tile_cache_test_image_destroy(&fixture);
 	}
 
@@ -426,7 +427,7 @@ TEST_CASE("image_read_region joins a viewer tile already in flight") {
 	fixture.image.lock_initialized = true;
 	platform_mutex_init(&fixture.image.lock);
 
-	REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 	                                    TILE_CACHE_DEMAND_VIEWER_VISIBLE |
 	                                    TILE_CACHE_DEMAND_GPU_RESIDENCY,
 	                                    10, 1));
@@ -444,7 +445,7 @@ TEST_CASE("image_read_region joins a viewer tile already in flight") {
 
 	bool read_pin_acquired = false;
 	for (i32 attempt = 0; attempt < 1000; ++attempt) {
-		if (tile_cache_tile_is_cpu_pinned(&fixture.image, 0, 0)) {
+		if (tile_cache_tile_is_cpu_pinned(&fixture.image, 0, 0, 0)) {
 			read_pin_acquired = true;
 			break;
 		}
@@ -468,7 +469,7 @@ TEST_CASE("image_read_region joins a viewer tile already in flight") {
 	CHECK(read_pin_acquired);
 	CHECK(read_state.succeeded);
 	CHECK(read_state.output_pixel == expected_pixel);
-	CHECK_FALSE(tile_cache_tile_is_busy(&fixture.image, 0, 0));
+	CHECK_FALSE(tile_cache_tile_is_busy(&fixture.image, 0, 0, 0));
 
 	thread_pool_destroy(&read_pool);
 	global_system_info = old_system_info;
@@ -481,7 +482,7 @@ TEST_CASE("tile cache shutdown rejects new work and drains queued pixels") {
 	tile_cache_test_image_t fixture = {};
 	tile_cache_test_image_init(&fixture);
 	REQUIRE(fixture.image.tile_cache != nullptr);
-	REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	REQUIRE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 	                                    TILE_CACHE_DEMAND_VIEWER_VISIBLE, 10, 1));
 
 	u8* queued_pixels = (u8*)malloc(4);
@@ -493,10 +494,10 @@ TEST_CASE("tile cache shutdown rejects new work and drains queued pixels") {
 	REQUIRE(tile_cache_post_load_result(&fixture.image, &queued_result));
 
 	tile_cache_begin_shutdown(&fixture.image);
-	CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0, 10, 0));
+	CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0, 0, 10, 0));
 	CHECK_FALSE(tile_cache_begin_read(&fixture.image));
-	tile_cache_pin_cpu_tile(&fixture.image, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
-	CHECK_FALSE(tile_cache_tile_is_cpu_pinned(&fixture.image, 0, 0));
+	tile_cache_pin_cpu_tile(&fixture.image, 0, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+	CHECK_FALSE(tile_cache_tile_is_cpu_pinned(&fixture.image, 0, 0, 0));
 
 	tile_cache_result_t polled_result = {};
 	REQUIRE(tile_cache_poll_load_result(&fixture.image, &polled_result));
@@ -516,13 +517,13 @@ TEST_CASE("active read can finish after cache shutdown begins") {
 
 	tile_cache_begin_shutdown(&fixture.image);
 	CHECK(tile_cache_get_active_read_count(&fixture.image) == 1);
-	CHECK(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	CHECK(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 	                                  TILE_CACHE_DEMAND_READ_REGION, 10, 0));
-	tile_cache_cancel_decode(&fixture.image, 0, 0);
+	tile_cache_cancel_decode(&fixture.image, 0, 0, 0);
 	tile_cache_end_read(&fixture.image);
 
 	CHECK(tile_cache_get_active_read_count(&fixture.image) == 0);
-	CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0,
+	CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0,
 	                                        TILE_CACHE_DEMAND_READ_REGION, 10, 0));
 	tile_cache_test_image_destroy(&fixture);
 }
@@ -594,4 +595,256 @@ TEST_CASE("tile cache completion polling is exact once across consumers") {
 	thread_pool_destroy(&pool);
 	global_system_info = old_system_info;
 	tile_cache_test_image_destroy(&fixture);
+}
+
+static void tile_cache_test_stack_init(tile_cache_test_image_t* fixture) {
+	tile_cache_test_image_init(fixture);
+	tile_cache_destroy(fixture->image.tile_cache);
+	image_t* image = &fixture->image;
+	image->backend = IMAGE_BACKEND_MRXS;
+	image->plane_count = image->mrxs.plane_count = 4;
+	image->mrxs.level_count = 1;
+	image->mrxs.levels[0].width_in_tiles = image->mrxs.levels[0].height_in_tiles = 1;
+	image->mrxs.planes = (mrxs_plane_t*)calloc(4, sizeof(mrxs_plane_t));
+	for (int p = 0; p < 4; ++p) {
+		mrxs_plane_t* plane = image->mrxs.planes + p;
+		plane->offset_um = p == 0 ? 0 : (p-2)*0.5f;
+		plane->offset_known = true;
+		plane->is_extended_focus = p == 0;
+		plane->level_available[0] = true;
+		plane->tiles[0] = (mrxs_tile_t*)calloc(1, sizeof(mrxs_tile_t));
+		plane->tiles[0]->hier_entry.length = 1;
+	}
+	image->zstack_plane = image->mrxs.zero_plane = 2;
+	image->plane_approach_direction = -1;
+	image->tile_cache = tile_cache_create(image);
+}
+
+static void tile_cache_test_stack_destroy(tile_cache_test_image_t* fixture) {
+	for (int p = 0; p < 4; ++p) free(fixture->image.mrxs.planes[p].tiles[0]);
+	free(fixture->image.mrxs.planes);
+	tile_cache_test_image_destroy(fixture);
+}
+
+TEST_CASE("z-stack fallback uses nearest physical plane and arrival direction on ties") {
+	tile_cache_test_image_t fixture = {};
+	tile_cache_test_stack_init(&fixture);
+	image_t* image = &fixture.image;
+	tile_cache_store_gpu_texture(image, 0, 0, 0, 100);
+	tile_cache_store_gpu_texture(image, 1, 0, 0, 101);
+	tile_cache_store_gpu_texture(image, 3, 0, 0, 103);
+	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 100);
+	image_select_plane(image, 1); image_select_plane(image, 2);
+	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 101);
+	image_select_plane(image, 3); image_select_plane(image, 2);
+	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 103);
+	image->mrxs.planes[1].offset_um = -0.1f; // Distance wins over the arrival side.
+	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 101);
+	tile_cache_store_gpu_texture(image, 2, 0, 0, 102);
+	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 102);
+	CHECK(tile_cache_take_gpu_texture(image, 2, 0, 0) == 102);
+	image->mrxs.planes[2].tiles[0]->hier_entry.length = 0;
+	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 101); // Missing plane data is discovered on load.
+	tile_cache_result_t missing = {}; missing.plane = 2; missing.failed = true;
+	tile_cache_result_action_t action = {};
+	REQUIRE(tile_cache_apply_result(image, &missing, false, &action));
+	CHECK_FALSE(fixture.geometry.is_empty); // The shared coverage must not change.
+	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 0); // A completed failure is not a loading gap.
+	tile_cache_take_gpu_texture(image, 1, 0, 0);
+	tile_cache_take_gpu_texture(image, 3, 0, 0);
+	image_select_plane(image, 1); // An unfailed physical plane with no cached texture.
+	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 0); // Never use the composite as a physical plane.
+	image_select_plane(image, 0);
+	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 100);
+	tile_cache_test_stack_destroy(&fixture);
+}
+
+TEST_CASE("late z-stack results uploads failures and pins stay on their originating plane") {
+	tile_cache_test_image_t fixture = {};
+	tile_cache_test_stack_init(&fixture);
+	image_t* image = &fixture.image;
+	for (int p = 1; p <= 2; ++p) {
+		tile_cache_pin_cpu_tile(image, p, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+		CHECK(tile_cache_try_begin_decode(image, p, 0, 0, TILE_CACHE_DEMAND_CPU_RESIDENCY, 0, 0));
+	}
+	image_select_plane(image, 2);
+	tile_cache_result_t result = {};
+	result.plane = 1; result.tile_width = result.tile_height = 1;
+	result.pixel_memory = (u8*)malloc(4); memset(result.pixel_memory, 11, 4);
+	result.want_cpu_residency = result.want_gpu_residency = true;
+	REQUIRE(tile_cache_post_load_result(image, &result));
+	REQUIRE(tile_cache_poll_load_result(image, &result));
+	CHECK(result.plane == 1);
+	tile_cache_result_action_t action = {};
+	REQUIRE(tile_cache_apply_result(image, &result, true, &action));
+	CHECK(action.should_upload);
+	CHECK(tile_cache_get_cpu_pixels(image, 1, 0, 0)[0] == 11);
+	CHECK(tile_cache_get_cpu_pixels(image, 2, 0, 0) == nullptr);
+	CHECK(tile_cache_tile_is_busy(image, 2, 0, 0));
+	// Mimic a deferred GPU transfer finishing after the selection changed.
+	tile_cache_store_gpu_texture(image, result.plane, 0, 0, 101);
+	tile_cache_release_upload_cpu_pin(image, result.plane, 0, 0);
+	CHECK(tile_cache_get_gpu_texture(image, 2, 0, 0) == 0);
+	CHECK(tile_cache_get_gpu_texture(image, 1, 0, 0) == 101);
+	tile_cache_unpin_cpu_tile(image, 1, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+	CHECK(tile_cache_tile_is_cpu_pinned(image, 2, 0, 0));
+	result = {}; result.plane = 2; result.failed = true;
+	REQUIRE(tile_cache_apply_result(image, &result, false, &action));
+	CHECK((tile_cache_get_tile_status(image, 2, 0, 0) & TILE_CACHE_STATUS_FAILED));
+	CHECK_FALSE((tile_cache_get_tile_status(image, 1, 0, 0) & TILE_CACHE_STATUS_FAILED));
+	tile_cache_unpin_cpu_tile(image, 2, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+	tile_cache_test_stack_destroy(&fixture);
+}
+
+static u32 focus_destroyed_textures;
+static void focus_test_destroy_texture(renderer_texture_handle_t texture) {
+	CHECK(texture >= 100);
+	focus_destroyed_textures |= 1u << (texture - 100);
+}
+
+TEST_CASE("z-stack stale completion cannot cancel a newer plane and teardown releases every plane") {
+	tile_cache_test_ensure_global_thread_pool();
+	tile_cache_test_image_t fixture = {};
+	tile_cache_test_stack_init(&fixture);
+	image_t* image = &fixture.image;
+	image->level_images[0].x_tile_side_in_um = image->level_images[0].y_tile_side_in_um = 1;
+	tile_cache_viewer_request_t request = {};
+	request.plane = 1; request.client_width = request.client_height = 1;
+	request.camera_bounds = BOUNDS2F(10, 10, 11, 11);
+	CHECK(tile_cache_request_viewer_tiles(image, &request) == 0); // Empty viewport; generation one.
+	REQUIRE(tile_cache_try_begin_decode(image, 1, 0, 0, TILE_CACHE_DEMAND_GPU_RESIDENCY, 0, 1));
+	request.plane = 2;
+	CHECK(tile_cache_request_viewer_tiles(image, &request) == 0);
+	REQUIRE(tile_cache_try_begin_decode(image, 2, 0, 0, TILE_CACHE_DEMAND_GPU_RESIDENCY, 0, 2));
+	CHECK(tile_cache_task_is_stale(image, 1, 0, 0, 1));
+	CHECK_FALSE(tile_cache_task_is_stale(image, 2, 0, 0, 2));
+	tile_cache_result_t result = {}; result.plane = 1; result.failed = true;
+	tile_cache_result_action_t action = {};
+	REQUIRE(tile_cache_apply_result(image, &result, false, &action));
+	CHECK_FALSE(action.mark_empty);
+	CHECK_FALSE(tile_cache_tile_is_busy(image, 1, 0, 0));
+	CHECK(tile_cache_tile_is_busy(image, 2, 0, 0));
+	tile_cache_cancel_decode(image, 2, 0, 0);
+	for (int p = 0; p < 4; ++p) tile_cache_store_gpu_texture(image, p, 0, 0, 100+p);
+	focus_destroyed_textures = 0;
+	tile_cache_begin_shutdown(image);
+	tile_cache_destroy_gpu_textures(image, focus_test_destroy_texture);
+	CHECK(focus_destroyed_textures == 15);
+	for (int p = 0; p < 4; ++p) CHECK(tile_cache_get_gpu_texture(image, p, 0, 0) == 0);
+	CHECK_FALSE(tile_cache_try_begin_decode(image, 1, 0, 0, TILE_CACHE_DEMAND_GPU_RESIDENCY, 0, 0));
+	tile_cache_test_stack_destroy(&fixture);
+}
+
+TEST_CASE("cache hash growth preserves keys pins and pending work for single and multiple planes") {
+	for (int planes : {1, 4}) {
+		tile_cache_test_image_t fixture = {};
+		tile_cache_test_image_init(&fixture);
+		image_t* image = &fixture.image;
+		image->plane_count = planes;
+		image->level_count = 2;
+		image->level_images[0].tile_count = 5000;
+		image->level_images[1] = image->level_images[0];
+		tile_cache_pin_cpu_tile(image, 0, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+		u8* pixels = (u8*)malloc(4); memset(pixels, 42, 4);
+		tile_cache_store_cpu_pixels(image, 0, 0, 0, pixels);
+		REQUIRE(tile_cache_try_begin_decode(image, 0, 1, 0, TILE_CACHE_DEMAND_READ_REGION, 0, 0));
+		for (int p = 0; p < planes; ++p) for (int l = 0; l < 2; ++l) {
+			for (int i = 1; i < 5000; ++i)
+				tile_cache_store_gpu_texture(image, p, l, i, 1 + p*10000 + l*5000 + i);
+		}
+		CHECK(tile_cache_get_cpu_pixels(image, 0, 0, 0) == pixels);
+		CHECK(pixels[0] == 42);
+		CHECK(tile_cache_tile_is_cpu_pinned(image, 0, 0, 0));
+		CHECK(tile_cache_tile_is_busy(image, 0, 1, 0));
+		for (int p = 0; p < planes; ++p) for (int l = 0; l < 2; ++l) {
+			for (int i = 1; i < 5000; ++i)
+				CHECK(tile_cache_take_gpu_texture(image, p, l, i) == (u32)(1 + p*10000 + l*5000 + i));
+		}
+		tile_cache_cancel_decode(image, 0, 1, 0);
+		CHECK_FALSE(tile_cache_tile_is_busy(image, 0, 1, 0));
+		tile_cache_unpin_cpu_tile(image, 0, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+		tile_cache_test_image_destroy(&fixture);
+	}
+}
+
+TEST_CASE("explicit empty results and permanent failures have separate cache outcomes") {
+	for (bool empty : {false, true}) {
+		tile_cache_test_image_t fixture = {};
+		tile_cache_test_image_init(&fixture);
+		fixture.image.backend = IMAGE_BACKEND_OPENSLIDE; // Always single-plane.
+		tile_cache_result_t result = {};
+		result.is_empty = empty;
+		result.failed = !empty;
+		result.pixel_memory = (u8*)malloc(4); // Reject even an allocated error/blank buffer.
+		u8* original_pixels = result.pixel_memory;
+		tile_cache_result_action_t action = {};
+		REQUIRE(tile_cache_apply_result(&fixture.image, &result, true, &action));
+		CHECK(action.mark_empty == empty);
+		CHECK_FALSE(action.should_upload);
+		CHECK(action.pixels_to_free == original_pixels);
+		free(action.pixels_to_free);
+		CHECK(tile_cache_get_tile_status(&fixture.image, 0, 0, 0) ==
+		      (u32)(empty ? TILE_CACHE_STATUS_EMPTY : TILE_CACHE_STATUS_FAILED));
+		CHECK_FALSE(tile_cache_try_begin_decode(&fixture.image, 0, 0, 0, TILE_CACHE_DEMAND_READ_REGION, 0, 0));
+		tile_cache_cancel_decode(&fixture.image, 0, 0, 0); // Cancellation must not erase a terminal outcome.
+		CHECK(tile_cache_get_tile_status(&fixture.image, 0, 0, 0) ==
+		      (u32)(empty ? TILE_CACHE_STATUS_EMPTY : TILE_CACHE_STATUS_FAILED));
+		tile_cache_test_image_destroy(&fixture);
+	}
+}
+
+TEST_CASE("empty reports cannot mark shared z-stack coverage and successful results clear failure") {
+	tile_cache_test_image_t fixture = {};
+	tile_cache_test_stack_init(&fixture);
+	for (int plane : {0, 2}) {
+		tile_cache_result_t result = {};
+		result.plane = plane; result.is_empty = true;
+		tile_cache_result_action_t action = {};
+		REQUIRE(tile_cache_apply_result(&fixture.image, &result, false, &action));
+		CHECK_FALSE(action.mark_empty);
+		CHECK(tile_cache_get_tile_status(&fixture.image, plane, 0, 0) == TILE_CACHE_STATUS_FAILED);
+		tile_cache_pin_cpu_tile(&fixture.image, plane, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+		result.is_empty = false;
+		result.pixel_memory = (u8*)malloc(4); memset(result.pixel_memory, 8, 4);
+		REQUIRE(tile_cache_apply_result(&fixture.image, &result, false, &action));
+		CHECK(tile_cache_get_tile_status(&fixture.image, plane, 0, 0) == TILE_CACHE_STATUS_CPU_READY);
+		tile_cache_unpin_cpu_tile(&fixture.image, plane, 0, 0, TILE_CACHE_DEMAND_READ_REGION);
+	}
+	tile_cache_test_stack_destroy(&fixture);
+}
+
+static void WINAPI cache_test_openslide_read(openslide_t*, u32* dest, i64, i64, i32, i64 w, i64 h) {
+	memset(dest, 0, (size_t)w*h*sizeof(u32));
+}
+
+static const char* WINAPI cache_test_openslide_error(openslide_t* osr) {
+	return (const char*)osr;
+}
+
+TEST_CASE("transparent OpenSlide reads are empty only when the decoder reports no error") {
+	tile_cache_test_ensure_thread_memory();
+	for (bool error : {false, true}) {
+		tile_cache_test_image_t fixture = {};
+		tile_cache_test_image_init(&fixture);
+		fixture.image.backend = IMAGE_BACKEND_OPENSLIDE;
+		fixture.image.plane_count = 1;
+		fixture.image.level_images[0].x_tile_side_in_um = 1;
+		fixture.image.level_images[0].y_tile_side_in_um = 1;
+		fixture.image.openslide_wsi.osr = (openslide_t*)(error ? "synthetic read failure" : nullptr);
+		load_tile_task_t task = {}; task.image = &fixture.image;
+		openslide_api saved = openslide;
+		openslide.read_region = cache_test_openslide_read;
+		openslide.get_error = cache_test_openslide_error;
+		load_tile_func(0, &task);
+		openslide = saved;
+		tile_cache_result_t result = {};
+		REQUIRE(tile_cache_poll_load_result(&fixture.image, &result));
+		CHECK(result.failed == error);
+		CHECK(result.is_empty == !error);
+		CHECK(result.pixel_memory == nullptr);
+		tile_cache_result_action_t action = {};
+		REQUIRE(tile_cache_apply_result(&fixture.image, &result, false, &action));
+		CHECK(action.mark_empty == !error);
+		tile_cache_test_image_destroy(&fixture);
+	}
 }

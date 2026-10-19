@@ -263,7 +263,7 @@ static bool registration_create_thumbnail(image_t* image, float target_mpp, regi
         return false;
     }
 
-    bool ok = image_read_region(image, source_level, 0, 0, source_width, source_height, source_pixels, PIXEL_FORMAT_F32_Y);
+    bool ok = image_read_region(image, 0, source_level, 0, 0, source_width, source_height, source_pixels, PIXEL_FORMAT_F32_Y);
     if (!ok) {
         free(source_pixels);
         return false;
@@ -322,8 +322,8 @@ image_transform_t do_local_image_registration(image_t* image1, image_t* image2, 
     float* region2 = calloc(1, w * h * sizeof(float));
 
     // TODO: fix levels > 0 giving incorrect result
-    bool ok = image_read_region(image1, 0, x1, y1, w, h, region1, PIXEL_FORMAT_F32_Y);
-    ok = ok && image_read_region(image2, 0, x2, y2, w, h, region2, PIXEL_FORMAT_F32_Y);
+    bool ok = image_read_region(image1, 0, 0, x1, y1, w, h, region1, PIXEL_FORMAT_F32_Y);
+    ok = ok && image_read_region(image2, 0, 0, x2, y2, w, h, region2, PIXEL_FORMAT_F32_Y);
     if (!ok) {
         console_print("Image registration not possible: image_read_region() failed\n");
         return result;
@@ -333,8 +333,8 @@ image_transform_t do_local_image_registration(image_t* image1, image_t* image2, 
         uint32_t* rgb_region1 = calloc(1, w * h * sizeof(float));
         uint32_t* rgb_region2 = calloc(1, w * h * sizeof(float));
 
-        ok = image_read_region(image1, 0, x1, y1, w, h, rgb_region1, PIXEL_FORMAT_U8_BGRA);
-        ok = ok && image_read_region(image2, 0, x2, y2, w, h, rgb_region2, PIXEL_FORMAT_U8_BGRA);
+        ok = image_read_region(image1, 0, 0, x1, y1, w, h, rgb_region1, PIXEL_FORMAT_U8_BGRA);
+        ok = ok && image_read_region(image2, 0, 0, x2, y2, w, h, rgb_region2, PIXEL_FORMAT_U8_BGRA);
         if (!ok) {
             console_print("Image registration not possible: image_read_region() failed\n");
             return result;

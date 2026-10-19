@@ -252,7 +252,7 @@ void renderer_upload_tile_on_worker_thread(image_t* image, void* tile_pixels, i3
 	glFinish();
 
 	ASSERT(image);
-	tile_cache_store_gpu_texture(image, scale, tile_index, texture);
+	tile_cache_store_gpu_texture(image, 0, scale, tile_index, texture);
 #else
 	tile_cache_result_t completion_task = {};
 	completion_task.pixel_memory = (u8*)tile_pixels;

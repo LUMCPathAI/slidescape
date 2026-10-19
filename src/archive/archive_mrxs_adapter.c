@@ -432,7 +432,7 @@ bool archive_mrxs_adapter_get_rgb_tile(archive_mrxs_adapter_t* adapter,
 	u8* bgra = NULL;
 	if (level->tiles[tile_index].hier_entry.length) {
 		bgra = mrxs_decode_tile_to_bgra(
-			&adapter->slide, (i32)level_index, (i32)tile_index);
+			&adapter->slide, 0, (i32)level_index, (i32)tile_index);
 	} else if (pixel_count <= SIZE_MAX / 4) {
 		bgra = malloc(pixel_count * 4);
 		if (bgra) {

@@ -1532,9 +1532,9 @@ void dicomweb_load_tile_batch_func(i32 logical_thread_index, void* userdata) {
 	for (i32 i = 0; i < batch->task_count; ++i) {
 		load_tile_task_t* task = batch->tile_tasks + i;
 		if (task->may_discard_if_stale &&
-		    tile_cache_task_is_stale(image, task->level, task->tile_index, task->generation)) {
-			if (!tile_cache_post_stale_result(image, task->resource_id, task->level, task->tile_index)) {
-				tile_cache_cancel_decode(image, task->level, task->tile_index);
+		    tile_cache_task_is_stale(image, 0, task->level, task->tile_index, task->generation)) {
+			if (!tile_cache_post_stale_result(image, 0, task->resource_id, task->level, task->tile_index)) {
+				tile_cache_cancel_decode(image, 0, task->level, task->tile_index);
 			}
 			continue;
 		}
@@ -1558,7 +1558,7 @@ void dicomweb_load_tile_batch_func(i32 logical_thread_index, void* userdata) {
 		     ++candidate_index) {
 			load_tile_task_t* candidate = batch->tile_tasks + candidate_index;
 			if (candidate->may_discard_if_stale &&
-			    tile_cache_task_is_stale(image, candidate->level, candidate->tile_index,
+			    tile_cache_task_is_stale(image, 0, candidate->level, candidate->tile_index,
 			                             candidate->generation)) break;
 			level_image_t* candidate_level = image->level_images + candidate->level;
 			if (candidate_level->pyramid_image_index != level->pyramid_image_index) break;

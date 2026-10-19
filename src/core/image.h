@@ -143,6 +143,7 @@ typedef struct {
     v2f origin_offset;
     i32 pyramid_image_index;
     bool exists;
+	u64 missing_planes; // Zero for single-plane backends; bit p means this level is absent in plane p.
     bool needs_indexing; //TODO: implement
     bool indexing_job_submitted;
 } level_image_t;
@@ -185,6 +186,11 @@ typedef struct image_t {
         dicomweb_remote_image_t dicomweb;
 		ssi_remote_image_t ssi;
     };
+    /* Plane zero is the default image (extended focus for MRXS stacks). */
+    i32 plane_count;
+    i32 selected_plane;
+    i32 zstack_plane;
+    i32 plane_approach_direction; // -1: prefer lower offsets on equal-distance fallback.
     i32 level_count;
     u32 tile_width;
     u32 tile_height;
@@ -241,8 +247,9 @@ void init_image_from_openslide(image_t* image, wsi_t* wsi, bool is_overlay);
 void unload_openslide_wsi(wsi_t* wsi);
 bool image_initialize_runtime(image_t* image);
 void image_set_ssi_close_callback(void (*callback)(ssi_remote_image_t* remote));
-bool image_read_region(image_t* image, i32 level, i32 x, i32 y, i32 w, i32 h, void* dest, pixel_format_enum desired_pixel_format);
+bool image_read_region(image_t* image, i32 plane, i32 level, i32 x, i32 y, i32 w, i32 h, void* dest, pixel_format_enum desired_pixel_format);
 void begin_level_image_indexing(image_t* image, level_image_t* level_image, i32 scale);
+void image_select_plane(image_t* image, i32 plane);
 void image_destroy(image_t* image);
 
 #ifdef __cplusplus

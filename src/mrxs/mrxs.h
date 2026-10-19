@@ -125,6 +125,8 @@ typedef struct mrxs_hier_val_t {
 	const char* section;
 	enum mrxs_hier_val_enum type;
 	i32 index;
+	float offset_um;
+	bool offset_known;
 	bool is_ini_section_parsed;
 } mrxs_hier_val_t;
 
@@ -141,6 +143,7 @@ typedef struct mrxs_nonhier_val_t {
 typedef struct mrxs_hier_t {
 	enum mrxs_hier_enum name;
 	i32 val_count;
+	i32 default_value;
 	mrxs_hier_val_t* val;
 	const char* section;
 	bool is_ini_section_parsed;
@@ -178,7 +181,19 @@ typedef struct mrxs_camera_t {
     i32 y;
 } mrxs_camera_t;
 
+typedef struct mrxs_plane_t {
+	const char* name;
+	float offset_um;
+	bool offset_known;
+	bool is_extended_focus;
+	i32 hier_value;
+	/* Plane zero borrows levels[].tiles; other planes own these arrays. */
+	mrxs_tile_t* tiles[16];
+	bool level_available[16];
+} mrxs_plane_t;
+
 typedef struct mrxs_decoded_tile_cache_entry_t {
+	i32 plane;
     i32 level;
     i32 stored_tile_index;
     u8* pixels;
@@ -198,6 +213,13 @@ typedef struct mrxs_t {
     mrxs_hier_t* hier; // NOTE: need free
     mrxs_nonhier_t* nonhier; // NOTE: need free
     i32 slide_zoom_level_hier_index;
+	i32 extended_focus_value;
+	i32 zero_focus_value;
+	i32 plane_count;
+	i32 zero_plane;
+	mrxs_plane_t* planes;
+	volatile i32 extra_tile_warning_count;
+	volatile i32 missing_tile_warning_count;
     i32 base_width_in_tiles;
     i32 base_height_in_tiles;
     i32 base_width_in_pixels;
@@ -250,7 +272,8 @@ bool mrxs_open_from_zip(mrxs_t* mrxs, const char* filename, char* error, size_t 
 bool mrxs_open_from_directory(mrxs_t* mrxs, file_info_t* file, directory_info_t* directory);
 void mrxs_init_runtime_cache(mrxs_t* mrxs);
 u8* mrxs_decode_simple_image_to_rgba(mrxs_t* mrxs, mrxs_simple_image_t* image);
-u8* mrxs_decode_tile_to_bgra(mrxs_t* mrxs, i32 level, i32 tile_index);
+u8* mrxs_decode_tile_to_bgra(mrxs_t* mrxs, i32 plane, i32 level, i32 tile_index);
+bool mrxs_tile_is_empty(mrxs_t* mrxs, i32 plane, i32 level, i32 tile_index);
 void mrxs_set_thread_pool(mrxs_t* mrxs, thread_pool_t* thread_pool);
 void mrxs_destroy(mrxs_t* mrxs);
 

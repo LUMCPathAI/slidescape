@@ -112,9 +112,9 @@ void slide_score_load_tile_batch_func(i32 logical_thread_index, void* userdata) 
 		i32 tile_x = task->tile_index % level_image->width_in_tiles;
 		i32 tile_y = task->tile_index / level_image->width_in_tiles;
 		if (task->may_discard_if_stale &&
-		    tile_cache_task_is_stale(image, task->level, task->tile_index, task->generation)) {
-			if (!tile_cache_post_stale_result(image, task->resource_id, task->level, task->tile_index)) {
-				tile_cache_cancel_decode(image, task->level, task->tile_index);
+		    tile_cache_task_is_stale(image, 0, task->level, task->tile_index, task->generation)) {
+			if (!tile_cache_post_stale_result(image, 0, task->resource_id, task->level, task->tile_index)) {
+				tile_cache_cancel_decode(image, 0, task->level, task->tile_index);
 			}
 			continue;
 		}
@@ -350,10 +350,10 @@ void ssi_load_tile_batch_func(i32 logical_thread_index, void* userdata) {
 	for (i32 i = 0; i < batch->task_count; ++i) {
 		load_tile_task_t* task = batch->tile_tasks + i;
 		if (task->may_discard_if_stale &&
-		    tile_cache_task_is_stale(image, task->level, task->tile_index, task->generation)) {
-			if (!tile_cache_post_stale_result(image, task->resource_id, task->level,
+		    tile_cache_task_is_stale(image, 0, task->level, task->tile_index, task->generation)) {
+			if (!tile_cache_post_stale_result(image, 0, task->resource_id, task->level,
 			                                  task->tile_index)) {
-				tile_cache_cancel_decode(image, task->level, task->tile_index);
+				tile_cache_cancel_decode(image, 0, task->level, task->tile_index);
 			}
 			continue;
 		}
@@ -424,10 +424,10 @@ void ssi_load_tile_batch_func(i32 logical_thread_index, void* userdata) {
 	for (i32 i = 0; i < active_count; ++i) {
 		load_tile_task_t* task = active_tasks[i];
 		if (task->may_discard_if_stale &&
-		    tile_cache_task_is_stale(image, task->level, task->tile_index, task->generation)) {
-			if (!tile_cache_post_stale_result(image, task->resource_id, task->level,
+		    tile_cache_task_is_stale(image, 0, task->level, task->tile_index, task->generation)) {
+			if (!tile_cache_post_stale_result(image, 0, task->resource_id, task->level,
 			                                  task->tile_index)) {
-				tile_cache_cancel_decode(image, task->level, task->tile_index);
+				tile_cache_cancel_decode(image, 0, task->level, task->tile_index);
 			}
 			active_tasks[i] = NULL;
 			++stale_after_request;

@@ -875,6 +875,9 @@ bool init_image_from_mrxs(image_t* image, mrxs_t* mrxs, bool is_overlay) {
 	image->type = IMAGE_TYPE_WSI;
 	image->backend = IMAGE_BACKEND_MRXS;
 	image->mrxs = *mrxs;
+	image->plane_count = mrxs->plane_count;
+	image->zstack_plane = mrxs->zero_plane;
+	image->plane_approach_direction = -1;
 	mrxs = &image->mrxs;
 	mrxs_init_runtime_cache(mrxs);
 	image->is_freshly_loaded = true;
@@ -918,6 +921,9 @@ bool init_image_from_mrxs(image_t* image, mrxs_t* mrxs, bool is_overlay) {
 			mrxs_level_t* mrxs_level = mrxs->levels + level_index;
 
 			level_image->exists = true;
+			for (i32 p = 0; p < mrxs->plane_count; ++p) {
+				if (!mrxs->planes[p].level_available[level_index]) level_image->missing_planes |= UINT64_C(1) << p;
+			}
 			level_image->needs_indexing = false;
 			level_image->pyramid_image_index = level_index; // not used
 			level_image->downsample_factor = exp2f((float)level_index);
@@ -961,6 +967,10 @@ bool init_image_from_mrxs(image_t* image, mrxs_t* mrxs, bool is_overlay) {
 				tile->tile_x = tile_index % level_image->width_in_tiles;
 				tile->tile_y = tile_index / level_image->width_in_tiles;
 
+				/* For WSIs with a Z-stack, use plane zero (normally extended focus) as shared coverage. Extra tiles in
+				 * other planes are deliberately skipped; missing tiles are discovered on load.
+				 * Index/decode warnings report mismatches.
+				 * With overlap, stored and display tiles differ, so coverage stays unknown. */
 				if (!mrxs->has_overlapping_tiles && tile_index < mrxs_level->height_in_tiles * mrxs_level->width_in_tiles) {
 					mrxs_tile_t* mrxs_tile = mrxs_level->tiles + tile_index;
 					if (mrxs_tile->hier_entry.length == 0) {
@@ -1093,6 +1103,8 @@ bool init_image_from_stbi(image_t* image, simple_image_t* simple, bool is_overla
 void init_image_from_openslide(image_t* image, wsi_t* wsi, bool is_overlay) {
     image->type = IMAGE_TYPE_WSI;
     image->backend = IMAGE_BACKEND_OPENSLIDE;
+	image->plane_count = 1;
+	image->selected_plane = image->zstack_plane = 0;
     image->openslide_wsi = *wsi;
     image->is_freshly_loaded = true;
     image->mpp_x = wsi->mpp_x;
@@ -1282,7 +1294,7 @@ void do_invert_colors(u8* pixels, i32 w, i32 h, enum pixel_format_enum pixel_for
 	}
 }
 
-static bool image_read_region_impl(image_t* image, i32 level, i32 x, i32 y, i32 w, i32 h,
+static bool image_read_region_impl(image_t* image, i32 plane, i32 level, i32 x, i32 y, i32 w, i32 h,
                                    void* dest, pixel_format_enum desired_pixel_format) {
     ASSERT(dest != NULL);
 
@@ -1388,7 +1400,7 @@ static bool image_read_region_impl(image_t* image, i32 level, i32 x, i32 y, i32 
 					for (i32 tile_x = tiles_within_level_bounds.min.x; tile_x < tiles_within_level_bounds.max.x; ++tile_x) {
 						tile_t* tile = get_tile(level_image, tile_x, tile_y);
 						if (!tile->is_empty) {
-							tile_cache_pin_cpu_tile(image, level, tile->tile_index, TILE_CACHE_DEMAND_READ_REGION);
+							tile_cache_pin_cpu_tile(image, plane, level, tile->tile_index, TILE_CACHE_DEMAND_READ_REGION);
 						}
 					}
 				}
@@ -1397,16 +1409,14 @@ static bool image_read_region_impl(image_t* image, i32 level, i32 x, i32 y, i32 
 				for (i32 tile_y = tiles_within_level_bounds.min.y; tile_y < tiles_within_level_bounds.max.y; ++tile_y) {
 					for (i32 tile_x = tiles_within_level_bounds.min.x; tile_x < tiles_within_level_bounds.max.x; ++tile_x) {
 						tile_t *tile = get_tile(level_image, tile_x, tile_y);
-						if (tile->is_empty) continue; // no need to load empty tiles
-						if (tile_cache_tile_has_cpu_pixels(image, level, tile->tile_index)) {
-							continue; // already cached
-						}
-						if (tile_cache_tile_is_busy(image, level, tile->tile_index)) {
-							continue; // another read_region() or viewer request is already loading it
-						}
+						if (tile->is_empty) continue;
+						u32 status = tile_cache_get_tile_status(image, plane, level, tile->tile_index);
+						if (status & (TILE_CACHE_STATUS_CPU_READY | TILE_CACHE_STATUS_BUSY |
+						              TILE_CACHE_STATUS_EMPTY | TILE_CACHE_STATUS_FAILED)) continue;
 						wishlist[tiles_to_load++] = (load_tile_task_t) {
 								.resource_id = image->resource_id,
 								.image = image,
+								.plane = plane,
 								.level = level,
 								.tile_index = tile->tile_index,
 								.need_gpu_residency = false,
@@ -1426,7 +1436,7 @@ static bool image_read_region_impl(image_t* image, i32 level, i32 x, i32 y, i32 
 
 				// Retrieve requested tiles. Multiple export workers can read adjacent regions whose source
 				// tile coverage overlaps, so some needed tiles may have been submitted by another caller.
-				// Wait until every required tile is cached/empty, not just until this call's submissions finish.
+				// Wait until every required tile has pixels or a terminal outcome, including another caller's work.
 				for (;;) {
 					tile_cache_result_t cache_result = {0};
 					if (tile_cache_poll_load_result(image, &cache_result)) {
@@ -1448,12 +1458,15 @@ static bool image_read_region_impl(image_t* image, i32 level, i32 x, i32 y, i32 
 						for (i32 tile_y = tiles_within_level_bounds.min.y; tile_y < tiles_within_level_bounds.max.y; ++tile_y) {
 							for (i32 tile_x = tiles_within_level_bounds.min.x; tile_x < tiles_within_level_bounds.max.x; ++tile_x) {
 								tile_t *tile = get_tile(level_image, tile_x, tile_y);
-								if (!tile->is_empty && !tile_cache_tile_has_cpu_pixels(image, level, tile->tile_index)) {
+								if (tile->is_empty) continue;
+								u32 status = tile_cache_get_tile_status(image, plane, level, tile->tile_index);
+								if (!(status & (TILE_CACHE_STATUS_CPU_READY | TILE_CACHE_STATUS_EMPTY | TILE_CACHE_STATUS_FAILED))) {
 									all_tiles_ready = false;
-									if (!tile_cache_tile_is_busy(image, level, tile->tile_index)) {
+									if (!(status & TILE_CACHE_STATUS_BUSY)) {
 										wishlist[retry_tiles_to_load++] = (load_tile_task_t) {
 												.resource_id = image->resource_id,
 												.image = image,
+												.plane = plane,
 												.level = level,
 												.tile_index = tile->tile_index,
 												.need_gpu_residency = false,
@@ -1526,7 +1539,7 @@ static bool image_read_region_impl(image_t* image, i32 level, i32 x, i32 y, i32 
 					if (tile_x >= 0 && tile_y >= 0 && tile_x < level_image->width_in_tiles && tile_y < level_image->height_in_tiles) {
 						// Source tile is within range -> try to read its pixels
 						tile_t* tile = get_tile(level_image, tile_x, tile_y);
-						u8* cached_pixels = tile_cache_get_cpu_pixels(image, level, tile->tile_index);
+						u8* cached_pixels = tile_cache_get_cpu_pixels(image, plane, level, tile->tile_index);
 						if (!tile->is_empty && cached_pixels) {
 							// Copy the relevant portion of the tile to the region
 							u32* pixels = (u32*)cached_pixels;
@@ -1548,7 +1561,7 @@ static bool image_read_region_impl(image_t* image, i32 level, i32 x, i32 y, i32 
 			for (i32 tile_y = tiles_within_level_bounds.min.y; tile_y < tiles_within_level_bounds.max.y; ++tile_y) {
 				for (i32 tile_x = tiles_within_level_bounds.min.x; tile_x < tiles_within_level_bounds.max.x; ++tile_x) {
 					tile_t* tile = get_tile(level_image, tile_x, tile_y);
-					tile_cache_unpin_cpu_tile(image, level, tile->tile_index, TILE_CACHE_DEMAND_READ_REGION);
+					tile_cache_unpin_cpu_tile(image, plane, level, tile->tile_index, TILE_CACHE_DEMAND_READ_REGION);
 				}
 			}
             platform_mutex_unlock(&image->lock);
@@ -1664,15 +1677,16 @@ static bool image_read_region_impl(image_t* image, i32 level, i32 x, i32 y, i32 
     return success;
 }
 
-bool image_read_region(image_t* image, i32 level, i32 x, i32 y, i32 w, i32 h,
+bool image_read_region(image_t* image, i32 plane, i32 level, i32 x, i32 y, i32 w, i32 h,
                        void* dest, pixel_format_enum desired_pixel_format) {
-	if (!tile_cache_begin_read(image)) {
+	if (!image || plane < 0 || plane >= ATLEAST(image->plane_count, 1) || !tile_cache_begin_read(image)) {
 		return false;
 	}
-	bool result = image_read_region_impl(image, level, x, y, w, h, dest, desired_pixel_format);
+	bool result = image_read_region_impl(image, plane, level, x, y, w, h, dest, desired_pixel_format);
 	tile_cache_end_read(image);
 	return result;
 }
+
 
 void do_level_image_indexing(image_t* image, level_image_t* level_image, i32 scale) {
     if (image->backend == IMAGE_BACKEND_DICOM) {
@@ -1733,14 +1747,11 @@ bool image_initialize_runtime(image_t* image) {
 	return true;
 }
 
-static bool check_image_texture_destroyed(renderer_texture_handle_t texture) {
-    if (texture == 0) {
-        return true;
-    } else {
-        console_print_error("image_destroy(): texture %u is still in use (did you call renderer_destroy_image_resources() first?)\n", texture);
-        ASSERT(!"check_image_texture_destroyed");
-        return false;
-    }
+static void check_image_texture_destroyed(renderer_texture_handle_t texture) {
+	if (texture) {
+		console_print_error("image_destroy(): texture %u is still in use (did you call renderer_destroy_image_resources() first?)\n", texture);
+		ASSERT(!"check_image_texture_destroyed");
+	}
 }
 
 void image_destroy(image_t* image) {
@@ -1796,13 +1807,10 @@ void image_destroy(image_t* image) {
 			fatal_error("invalid image type");
 		}
 
+		/* Validate cached textures in every plane without probing the entire spatial grid. */
+		tile_cache_destroy_gpu_textures(image, check_image_texture_destroyed);
 		for (i32 i = 0; i < image->level_count; ++i) {
 			level_image_t* level_image = image->level_images + i;
-			if (level_image->tiles) {
-				for (i32 j = 0; j < level_image->tile_count; ++j) {
-                    check_image_texture_destroyed(tile_cache_get_gpu_texture(image, i, j));
-				}
-			}
 			free(level_image->tiles);
 			level_image->tiles = NULL;
 		}
@@ -1827,4 +1835,14 @@ void image_destroy(image_t* image) {
 		}
 
 	}
+}
+
+void image_select_plane(image_t* image, i32 plane) {
+	if (!image || plane < 0 || plane >= ATLEAST(image->plane_count, 1)) return;
+	if (plane > 0) {
+		if (image->zstack_plane != plane)
+			image->plane_approach_direction = plane > image->zstack_plane ? -1 : 1;
+		image->zstack_plane = plane;
+	}
+	image->selected_plane = plane;
 }

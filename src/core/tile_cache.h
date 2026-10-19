@@ -32,6 +32,7 @@ typedef enum tile_cache_request_state_enum {
 	TILE_CACHE_IN_FLIGHT,
 	TILE_CACHE_READY,
 	TILE_CACHE_FAILED,
+	TILE_CACHE_EMPTY,
 } tile_cache_request_state_enum;
 
 typedef enum tile_cache_demand_flags_enum {
@@ -55,6 +56,7 @@ typedef struct tile_cache_policy_t {
 } tile_cache_policy_t;
 
 typedef struct tile_cache_viewer_request_t {
+	i32 plane;
 	bounds2f camera_bounds;
 	bounds2f crop_bounds;
 	v2f camera_center;
@@ -65,6 +67,7 @@ typedef struct tile_cache_viewer_request_t {
 } tile_cache_viewer_request_t;
 
 typedef struct tile_cache_result_t {
+	i32 plane;
 	u8* pixel_memory;
 	i32 level;
 	i32 tile_index;
@@ -100,31 +103,44 @@ void tile_cache_destroy(tile_cache_t* cache);
 tile_cache_policy_t tile_cache_get_policy(image_t* image);
 float tile_cache_retry_delay_seconds(i32 consecutive_failure_count);
 bool tile_cache_post_load_result(image_t* image, tile_cache_result_t* task);
-bool tile_cache_post_stale_result(image_t* image, i32 resource_id, i32 level, i32 tile_index);
+bool tile_cache_post_stale_result(image_t* image, i32 plane, i32 resource_id, i32 level, i32 tile_index);
 bool tile_cache_poll_load_result(image_t* image, tile_cache_result_t* out_task);
 bool tile_cache_apply_result(image_t* image, tile_cache_result_t* result,
                              bool renderer_available, tile_cache_result_action_t* out_action);
-void tile_cache_pin_cpu_tile(image_t* image, i32 level, i32 tile_index, u32 demand_flags);
-void tile_cache_unpin_cpu_tile(image_t* image, i32 level, i32 tile_index, u32 demand_flags);
-bool tile_cache_tile_has_cpu_pixels(image_t* image, i32 level, i32 tile_index);
-bool tile_cache_tile_is_cpu_pinned(image_t* image, i32 level, i32 tile_index);
-bool tile_cache_tile_is_busy(image_t* image, i32 level, i32 tile_index);
-bool tile_cache_try_begin_decode(image_t* image, i32 level, i32 tile_index, u32 demand_flags, i32 priority, i32 generation);
-bool tile_cache_try_begin_upload(image_t* image, i32 level, i32 tile_index, u32 demand_flags, i32 priority, i32 generation);
-void tile_cache_cancel_decode(image_t* image, i32 level, i32 tile_index);
-void tile_cache_cancel_decode_batch(image_t* image, const i32* levels,
+void tile_cache_pin_cpu_tile(image_t* image, i32 plane, i32 level, i32 tile_index, u32 demand_flags);
+void tile_cache_unpin_cpu_tile(image_t* image, i32 plane, i32 level, i32 tile_index, u32 demand_flags);
+bool tile_cache_tile_has_cpu_pixels(image_t* image, i32 plane, i32 level, i32 tile_index);
+bool tile_cache_tile_is_cpu_pinned(image_t* image, i32 plane, i32 level, i32 tile_index);
+bool tile_cache_tile_is_busy(image_t* image, i32 plane, i32 level, i32 tile_index);
+bool tile_cache_try_begin_decode(image_t* image, i32 plane, i32 level, i32 tile_index, u32 demand_flags, i32 priority, i32 generation);
+bool tile_cache_try_begin_upload(image_t* image, i32 plane, i32 level, i32 tile_index, u32 demand_flags, i32 priority, i32 generation);
+void tile_cache_cancel_decode(image_t* image, i32 plane, i32 level, i32 tile_index);
+void tile_cache_cancel_decode_batch(image_t* image, i32 plane, const i32* levels,
 		const i32* tile_indices, i32 tile_count);
-void tile_cache_cancel_upload(image_t* image, i32 level, i32 tile_index);
-void tile_cache_release_upload_cpu_pin(image_t* image, i32 level, i32 tile_index);
-renderer_texture_handle_t tile_cache_get_gpu_texture(image_t* image, i32 level, i32 tile_index);
-void tile_cache_store_gpu_texture(image_t* image, i32 level, i32 tile_index, renderer_texture_handle_t texture);
-renderer_texture_handle_t tile_cache_take_gpu_texture(image_t* image, i32 level, i32 tile_index);
+void tile_cache_cancel_upload(image_t* image, i32 plane, i32 level, i32 tile_index);
+void tile_cache_release_upload_cpu_pin(image_t* image, i32 plane, i32 level, i32 tile_index);
+renderer_texture_handle_t tile_cache_get_gpu_texture(image_t* image, i32 plane, i32 level, i32 tile_index);
+void tile_cache_store_gpu_texture(image_t* image, i32 plane, i32 level, i32 tile_index, renderer_texture_handle_t texture);
+renderer_texture_handle_t tile_cache_take_gpu_texture(image_t* image, i32 plane, i32 level, i32 tile_index);
 /* The returned pointer is valid only while the caller's CPU pin remains held. */
-u8* tile_cache_get_cpu_pixels(image_t* image, i32 level, i32 tile_index);
-void tile_cache_store_cpu_pixels(image_t* image, i32 level, i32 tile_index, u8* pixels);
-void tile_cache_release_cpu_pixels_if_unpinned(image_t* image, i32 level, i32 tile_index);
+u8* tile_cache_get_cpu_pixels(image_t* image, i32 plane, i32 level, i32 tile_index);
+void tile_cache_store_cpu_pixels(image_t* image, i32 plane, i32 level, i32 tile_index, u8* pixels);
+void tile_cache_release_cpu_pixels_if_unpinned(image_t* image, i32 plane, i32 level, i32 tile_index);
 i32 tile_cache_request_viewer_tiles(image_t* image, tile_cache_viewer_request_t* request);
-bool tile_cache_task_is_stale(image_t* image, i32 level, i32 tile_index, i32 generation);
+bool tile_cache_task_is_stale(image_t* image, i32 plane, i32 level, i32 tile_index, i32 generation);
+
+/* One read-only snapshot for region readers; querying never creates an entry. */
+typedef enum tile_cache_status_flags_enum {
+	TILE_CACHE_STATUS_CPU_READY = 1 << 0,
+	TILE_CACHE_STATUS_BUSY = 1 << 1,
+	TILE_CACHE_STATUS_EMPTY = 1 << 2,
+	TILE_CACHE_STATUS_FAILED = 1 << 3,
+} tile_cache_status_flags_enum;
+u32 tile_cache_get_tile_status(image_t* image, i32 plane, i32 level, i32 tile_index);
+
+/* Returns only physical-plane textures in z-stack mode, nearest offset first. */
+renderer_texture_handle_t tile_cache_get_focus_texture(image_t* image, i32 level, i32 tile_index);
+void tile_cache_destroy_gpu_textures(image_t* image, void (*destroy_texture)(renderer_texture_handle_t));
 
 #ifdef __cplusplus
 }

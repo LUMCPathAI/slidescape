@@ -31,6 +31,7 @@
 #include "stb_image_write.h" //for debugging only
 
 typedef struct export_region_task_t {
+	i32 plane;
     app_state_t* app_state;
     image_t* image;
     bounds2f world_bounds;
@@ -117,6 +118,7 @@ typedef struct image_draft_t {
     image_draft_level_t levels[10];
     image_t* source_image;
     bounds2i source_level0_bounds;
+    i32 source_plane;
     i32 source_base_level;
     float base_downsample_factor_x;
     float base_downsample_factor_y;
@@ -249,7 +251,7 @@ static void construct_base_tile_with_resampling(image_draft_t* draft, image_draf
         i32 supertile_read_x = (i32)floorf(supertile_x) - 4;
         float supertile_offset_x = supertile_x - (float)supertile_read_x;
 
-        if (image_read_region(draft->source_image, draft->source_base_level, supertile_read_x, supertile_read_y,
+        if (image_read_region(draft->source_image, draft->source_plane, draft->source_base_level, supertile_read_x, supertile_read_y,
                               draft->supertile_width_read, draft->supertile_height_read, supertile.pixels,
                               supertile.pixel_format)) {
             rect2f box = {supertile_offset_x, supertile_offset_y, draft->supertile_width, draft->supertile_height};
@@ -283,7 +285,7 @@ static void construct_base_tile_with_resampling(image_draft_t* draft, image_draf
 
         i32 x = draft->source_level0_bounds.left + draft->tile_width * tile->tile_x;
         i32 y = draft->source_level0_bounds.top + draft->tile_height * tile->tile_y;
-        if (image_read_region(draft->source_image, draft->source_base_level, x, y,
+        if (image_read_region(draft->source_image, draft->source_plane, draft->source_base_level, x, y,
                           draft->tile_width, draft->tile_height, tile_buffer.pixels,
                           tile_buffer.pixel_format)) {
             tile->buffer = tile_buffer;
@@ -661,7 +663,7 @@ void image_draft_destroy(image_draft_t* draft) {
 }
 
 
-bool export_cropped_bigtiff_with_resample(app_state_t* app_state, image_t* image, bounds2f world_bounds, bounds2i level0_bounds, const char* filename,
+bool export_cropped_bigtiff_with_resample(app_state_t* app_state, image_t* image, i32 plane, bounds2f world_bounds, bounds2i level0_bounds, const char* filename,
                             u32 export_tile_width, u16 desired_photometric_interpretation, i32 quality, u32 export_flags, bool need_resize, v2f target_mpp) {
 
     switch(desired_photometric_interpretation) {
@@ -731,6 +733,7 @@ bool export_cropped_bigtiff_with_resample(app_state_t* app_state, image_t* image
 
     draft.source_image = image;
     draft.source_level0_bounds = level0_bounds;
+    draft.source_plane = plane;
     draft.source_base_level = source_base_level;
     draft.base_downsample_factor_x = downsample_factor_x;
     draft.base_downsample_factor_y = downsample_factor_y;
@@ -866,9 +869,10 @@ bool export_cropped_bigtiff_with_resample(app_state_t* app_state, image_t* image
     return success;
 }
 
+
 void export_cropped_bigtiff_with_resample_func(i32 logical_thread_index, void* userdata) {
     export_region_task_t* task = (export_region_task_t*) userdata;
-    bool success = export_cropped_bigtiff_with_resample(task->app_state, task->image, task->world_bounds, task->level0_bounds,
+    bool success = export_cropped_bigtiff_with_resample(task->app_state, task->image, task->plane, task->world_bounds, task->level0_bounds,
                                           task->filename, task->export_tile_width,
                                           task->desired_photometric_interpretation, task->quality, task->export_flags,
                                           task->need_resize, task->target_mpp);
@@ -884,6 +888,7 @@ void begin_export_cropped_bigtiff_with_resample(app_state_t* app_state, image_t*
     export_region_task_t task = {0};
     task.app_state = app_state;
     task.image = image;
+	task.plane = image->selected_plane;
     task.world_bounds = world_bounds;
     task.level0_bounds = level0_bounds;
     task.filename = filename;

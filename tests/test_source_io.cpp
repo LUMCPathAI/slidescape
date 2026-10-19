@@ -365,7 +365,7 @@ TEST_CASE("native MRXS opens and decodes a nested stored ZIP without an mrxs thu
 	CHECK(slide.mpp_x == doctest::Approx(0.25));
 	CHECK(slide.dat_files[0].size == 73);
 	CHECK(slide.dat_files[0].offset > 0);
-	u8* pixels = mrxs_decode_tile_to_bgra(&slide, 0, 0);
+	u8* pixels = mrxs_decode_tile_to_bgra(&slide, 0, 0, 0);
 	REQUIRE(pixels);
 	for (int i = 0; i < 4; ++i) {
 		CHECK(pixels[i*4] == 30);
@@ -931,4 +931,146 @@ TEST_CASE("Part 10 shell translates 64-bit member offsets only after member-boun
 	input.member_offset = UINT64_MAX;
 	CHECK_FALSE(archive_shell_build_part10(&input, &output, error, sizeof(error)));
 	archive_shell_buffer_destroy(&output); dicom_destroy(&dicom);
+}
+
+// Four focus values, two zooms and nontrivial mask/filter dimensions. Stored focus
+// values are deliberately out of Z order, and the declared default is physical zero.
+static std::vector<u8> tiny_mrxs_focus_zip(int damage = 0, bool extra_coverage = false) {
+	std::string ini = "[GENERAL]\nIMAGENUMBER_X=2\nIMAGENUMBER_Y=2\nCameraImageDivisionsPerSide=1\n"
+		"[HIERARCHICAL]\nINDEXFILE=Index.dat\nHIER_COUNT=4\nNONHIER_COUNT=0\n"
+		"HIER_0_NAME=Slide zoom level\nHIER_0_COUNT=2\n"
+		"HIER_0_VAL_0=ZoomLevel_0\nHIER_0_VAL_0_SECTION=ZOOM0\n"
+		"HIER_0_VAL_1=ZoomLevel_1\nHIER_0_VAL_1_SECTION=ZOOM1\n"
+		"HIER_1_NAME=Slide zoom mask level2\nHIER_1_COUNT=2\n"
+		"HIER_2_NAME=Slide filter level\nHIER_2_COUNT=3\n"
+		"HIER_3_NAME=Microscope focus level\nHIER_3_COUNT=4\nHIER_3_DEFAULT=2\nHIER_3_SECTION=FOCUS\n"
+		"HIER_3_VAL_0=ExtFocusLevel\nHIER_3_VAL_0_SECTION=F0\n"
+		"HIER_3_VAL_1=ZStackLevel_(+1)\nHIER_3_VAL_1_SECTION=F1\n"
+		"HIER_3_VAL_2=ZStackLevel_(0)\nHIER_3_VAL_2_SECTION=F2\n"
+		"HIER_3_VAL_3=ZStackLevel_(-1)\nHIER_3_VAL_3_SECTION=F3\n"
+		"[DATAFILE]\nFILE_COUNT=1\nFILE_0=Data0000.dat\n";
+	for (int l = 0; l < 2; ++l) ini += "[ZOOM" + std::to_string(l) + "]\nDIGITIZER_WIDTH=2\nDIGITIZER_HEIGHT=2\nIMAGE_FORMAT=BMP24\n"
+		"MICROMETER_PER_PIXEL_X=0.25\nMICROMETER_PER_PIXEL_Y=0.25\n";
+	ini += "[FOCUS]\nEXTENDED_FOCUS_LEVEL=0\nZERO_FOCUS_LEVEL=2\n"
+		"[F0]\nOFFSET_IN_MICROMETERS=0\n[F1]\nOFFSET_IN_MICROMETERS=0.5\n"
+		"[F2]\nOFFSET_IN_MICROMETERS=0\n[F3]\nOFFSET_IN_MICROMETERS=-0.5\n";
+	std::vector<u8> data;
+	for (int focus = 0; focus < 4; ++focus) {
+		std::vector<u8> bmp(70);
+		put(bmp, 0, 0x4d42, 2); put(bmp, 2, 70, 4); put(bmp, 10, 54, 4); put(bmp, 14, 40, 4);
+		put(bmp, 18, 2, 4); put(bmp, 22, 2, 4); put(bmp, 26, 1, 2); put(bmp, 28, 24, 2);
+		for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
+			bmp[54+y*8+x*3] = 30 + focus; bmp[55+y*8+x*3] = 20; bmp[56+y*8+x*3] = 10;
+		}
+		data.insert(data.end(), bmp.begin(), bmp.end());
+	}
+	std::vector<u8> index(45 + 48 * 4);
+	memcpy(index.data(), "01.02", 5); put(index, 37, 45, 4); put(index, 41, 45, 4);
+	for (int f = 0; f < 4; ++f) for (int l = 0; l < 2; ++l) {
+		if (f == 3 && l == 1) continue; // Missing coarse plane, not shared extended-focus data.
+		size_t page = index.size();
+		put(index, 45 + (12*f+l)*4, page, 4);
+		int n = l == 0 ? (extra_coverage && f == 0 ? 1 : f == 3 ? 3 : 4) : 1;
+		put(index, page, n, 4); put(index, page+4, damage == 1 ? page : 0, 4);
+		for (int i = 0; i < n; ++i) {
+			size_t at = page + 8 + i*16;
+			put(index, at, damage == 2 ? 99 : i, 4); put(index, at+4, f*70, 4);
+			put(index, at+8, 70, 4); put(index, at+12, 0, 4);
+		}
+	}
+	if (damage == 3) put(index, 45, index.size()-2, 4);
+	std::vector<u8> text(ini.begin(), ini.end());
+	auto ini_blob = memory_blob(text), index_blob = memory_blob(index), data_blob = memory_blob(data);
+	source_zip_input_t members[] = {{"slide/Slidedat.ini", entire(ini_blob), false},
+		{"slide/Index.dat", entire(index_blob), false}, {"slide/Data0000.dat", entire(data_blob), false}};
+	std::vector<u8> output;
+	REQUIRE(source_zip_write(members, 3, memory_write, &output, nullptr, 0));
+	return output;
+}
+
+TEST_CASE("MRXS focus pyramids use mixed radix addressing and retain extended focus as default") {
+	init_global_system_info(false);
+	if (!threadlocal_thread_memory) init_thread_memory(&global_system_info);
+	source_test_file temp(tiny_mrxs_focus_zip());
+	mrxs_t slide = {};
+	char error[256] = {};
+	REQUIRE_MESSAGE(mrxs_open_from_zip(&slide, temp.path, error, sizeof(error)), error);
+	CHECK(slide.plane_count == 4);
+	CHECK(slide.zero_plane == 2);
+	CHECK(slide.planes[0].is_extended_focus);
+	CHECK(slide.planes[1].offset_um == doctest::Approx(-0.5));
+	CHECK(slide.planes[2].offset_um == 0);
+	CHECK(slide.planes[3].offset_um == doctest::Approx(0.5));
+	const int expected[] = {30,33,32,31};
+	for (int p = 0; p < 4; ++p) {
+		u8* pixels = mrxs_decode_tile_to_bgra(&slide, p, 0, 0);
+		REQUIRE(pixels); CHECK(pixels[0] == expected[p]); free(pixels);
+	}
+	CHECK(slide.extra_tile_warning_count == 0);
+	for (int i = 0; i < 10; ++i) CHECK(mrxs_decode_tile_to_bgra(&slide, 1, 0, 3) == nullptr);
+	CHECK(slide.missing_tile_warning_count == 5); // Warning budget saturates, even on repeated reads.
+	CHECK(mrxs_tile_is_empty(&slide, 1, 0, 3));
+	CHECK_FALSE(mrxs_tile_is_empty(&slide, 2, 0, 3));
+	CHECK_FALSE(slide.planes[1].level_available[1]);
+	CHECK(mrxs_decode_tile_to_bgra(&slide, 1, 1, 0) == nullptr);
+	CHECK(mrxs_decode_tile_to_bgra(&slide, 4, 0, 0) == nullptr);
+	mrxs_destroy(&slide);
+	file_info_t info = viewer_get_file_info(temp.path); info.type = VIEWER_FILE_TYPE_ZIP;
+	image_load_options_t options = {};
+	image_t* image = image_load_from_file(&info, nullptr, &options);
+	REQUIRE(image);
+	CHECK(image->selected_plane == 0);
+	CHECK(image->zstack_plane == 2);
+	CHECK(image->level_images[0].missing_planes == 0);
+	CHECK(image->level_images[1].missing_planes == (UINT64_C(1) << 1));
+	image_select_plane(image, image->zstack_plane);
+	CHECK(image->selected_plane == 2);
+	image_select_plane(image, 3); CHECK(image->plane_approach_direction == -1);
+	image_select_plane(image, 2); CHECK(image->plane_approach_direction == 1);
+	image_select_plane(image, 0); CHECK(image->zstack_plane == 2);
+	REQUIRE(archive_instance_provider_initialize());
+	for (int p = 0; p < 4; ++p) {
+		image_select_plane(image, (p+1)%4);
+		u8 pixels[16] = {};
+		REQUIRE(image_read_region(image, p, 0, 0, 0, 2, 2, pixels, PIXEL_FORMAT_U8_BGRA));
+		CHECK(pixels[0] == expected[p]);
+	}
+	u8 empty[16] = {};
+	REQUIRE(image_read_region(image, 1, 0, 2, 2, 2, 2, empty, PIXEL_FORMAT_U8_BGRA));
+	CHECK(empty[0] == 255);
+	CHECK(image->mrxs.missing_tile_warning_count == 1);
+	CHECK_FALSE(image->level_images[0].tiles[3].is_empty);
+	REQUIRE(image_read_region(image, 2, 0, 2, 2, 2, 2, empty, PIXEL_FORMAT_U8_BGRA));
+	CHECK(empty[0] == 32); // Missing data in one plane does not suppress another plane.
+
+	image_destroy(image); free(image);
+}
+
+TEST_CASE("MRXS shared coverage ignores extra physical-plane tiles and caps warnings") {
+	init_global_system_info(false);
+	if (!threadlocal_thread_memory) init_thread_memory(&global_system_info);
+	source_test_file temp(tiny_mrxs_focus_zip(0, true));
+	file_info_t info = viewer_get_file_info(temp.path); info.type = VIEWER_FILE_TYPE_ZIP;
+	image_load_options_t options = {};
+	image_t* image = image_load_from_file(&info, nullptr, &options);
+	REQUIRE(image);
+	CHECK(image->mrxs.extra_tile_warning_count == 5); // Eight extra entries, only five warnings.
+	CHECK(image->level_images[0].tiles[1].is_empty);
+	u8* decoded = mrxs_decode_tile_to_bgra(&image->mrxs, 2, 0, 1);
+	REQUIRE(decoded); CHECK(decoded[0] == 32); free(decoded);
+	REQUIRE(archive_instance_provider_initialize());
+	u8 pixels[16] = {};
+	REQUIRE(image_read_region(image, 2, 0, 2, 0, 2, 2, pixels, PIXEL_FORMAT_U8_BGRA));
+	CHECK(pixels[0] == 255); // Deliberately skip data outside plane-zero coverage.
+	CHECK(image->level_images[0].tiles[1].is_empty);
+	image_destroy(image); free(image);
+}
+
+TEST_CASE("MRXS focus indexes reject cycles out of range tiles and truncated pages") {
+	for (int damage = 1; damage <= 3; ++damage) {
+		source_test_file temp(tiny_mrxs_focus_zip(damage));
+		mrxs_t slide = {}; char error[256] = {};
+		CHECK_FALSE(mrxs_open_from_zip(&slide, temp.path, error, sizeof(error)));
+		mrxs_destroy(&slide);
+	}
 }

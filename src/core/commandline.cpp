@@ -267,7 +267,7 @@ int app_command_execute(app_state_t* app_state) {
 
 								char filename_hint[512];
 								export_region_get_name_hint(app_state, filename_hint, sizeof(filename_hint));
-								export_cropped_bigtiff_with_resample(app_state, image, world_bounds, pixel_bounds,
+								export_cropped_bigtiff_with_resample(app_state, image, 0, world_bounds, pixel_bounds,
 								                                     filename_hint, tiff_export_tile_width,
 								                                     tiff_export_desired_color_space,
 								                                     tiff_export_jpeg_quality, export_flags, !tiff_export_match_input_resolution,
@@ -290,7 +290,7 @@ int app_command_execute(app_state_t* app_state) {
 
 							char filename_hint[512];
 							export_region_get_name_hint(app_state, filename_hint, sizeof(filename_hint));
-							export_cropped_bigtiff_with_resample(app_state, image, world_bounds, pixel_bounds,
+							export_cropped_bigtiff_with_resample(app_state, image, 0, world_bounds, pixel_bounds,
 							                                     filename_hint, tiff_export_tile_width,
 							                                     tiff_export_desired_color_space,
 							                                     tiff_export_jpeg_quality, export_flags, !tiff_export_match_input_resolution,
