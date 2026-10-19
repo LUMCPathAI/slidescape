@@ -22,10 +22,13 @@ Important source areas:
 - Use C for new implementation code unless an existing boundary requires C++.
 - C++ is mostly used where needed for Dear ImGui integration or existing C++ translation units. When writing C++, keep it C-like: plain structs, functions, explicit ownership, minimal templates, minimal RAII, and no modern C++ abstractions unless there is a strong local precedent.
 - Follow the surrounding file's style. The repository mostly uses tabs for indentation (`.editorconfig`: tab width 4).
+- Always use braces for `if`, `else`, `for`, `while`, and similar control flow, even for a single statement. Put the body on separate lines, with the opening brace on the same line as the condition.
+- Prefer one statement per line and descriptive local names over compressed expressions or multiple statements on one line.
+- Preserve readability and debugger visibility when refactoring code (some code might be intentionally verbose to aid readability and debugging.)
 - Keep code straightforward and explicit. Avoid clever abstractions, hidden allocations, exceptions, RTTI-dependent designs, and heavy standard-library usage in hot paths.
 - Prefer existing project types, macros, and helpers from `common.h`, `platform.h`, `arena.h`, and nearby modules.
 - Be careful with integer sizes and file offsets. Whole-slide images can be very large, so preserve 64-bit sizes/offsets where relevant.
-- Add short comments where appropriate, especially where intent might not be immediately obvious for future readers.
+- Add comments where appropriate, especially where intent might not be immediately obvious for future readers.
 
 ## Dependencies
 

@@ -28,8 +28,4 @@ void console_print_error(const char* fmt, ...) {
 	va_end(args);
 }
 
-u8* download_remote_chunk(const char*, i32, const char*, i64, i64, i32*, i32) {
-	return NULL;
-}
-
 }

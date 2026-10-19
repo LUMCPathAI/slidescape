@@ -207,7 +207,6 @@ void init_app_state(app_state_t* app_state, app_command_t command) {
 	ASSERT(app_state->temp_storage_memory == NULL);
 //	memset(app_state, 0, sizeof(app_state_t));
 
-	tile_loader_set_remote_tiff_batch_callback(tiff_load_tile_batch_func);
 	tile_loader_set_slide_score_batch_callback(slide_score_load_tile_batch_func);
 	tile_loader_set_dicomweb_batch_callback(dicomweb_load_tile_batch_func);
 	tile_loader_set_ssi_batch_callback(ssi_load_tile_batch_func);

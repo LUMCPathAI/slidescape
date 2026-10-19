@@ -185,10 +185,6 @@ static tile_cache_policy_t tile_cache_make_policy(image_t* image) {
 		result.latency_bound = true;
 	} else if (image->backend == IMAGE_BACKEND_OPENSLIDE) {
 		result.max_inflight_tiles = 8;
-	} else if (image->backend == IMAGE_BACKEND_TIFF && image->tiff.is_remote) {
-		result.max_inflight_tiles = 8;
-		result.max_submit_per_tick = 3;
-		result.latency_bound = true;
 	}
 
 	return result;

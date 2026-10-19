@@ -31,7 +31,7 @@ target_include_directories(slidescape_tests PRIVATE
 )
 
 target_compile_definitions(slidescape_tests PRIVATE
-        IS_SERVER=0
+        USE_CONSOLE_LOGGING=1
         SLIDESCAPE_TEST_FIXTURE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/manifest.txt"
         SLIDESCAPE_TEST_LOCAL_FIXTURE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/local_manifest.txt"
         SLIDESCAPE_TEST_DICOMWEB_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/dicomweb"
@@ -106,6 +106,6 @@ if(BUILD_SLIDESCAPE_BENCHMARKS AND (WIN32 OR APPLE OR CMAKE_SYSTEM_NAME STREQUAL
                 ../src/platform
                 ../src/utils
                 ../src/third_party)
-        target_compile_definitions(slidescape_allocator_benchmark PRIVATE IS_SERVER=0)
+        target_compile_definitions(slidescape_allocator_benchmark PRIVATE USE_CONSOLE_LOGGING=1)
         slidescape_enable_process_allocator(slidescape_allocator_benchmark)
 endif()

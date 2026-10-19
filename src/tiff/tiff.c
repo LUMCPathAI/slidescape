@@ -19,12 +19,9 @@
 #include "common.h"
 #include "mathutils.h"
 
-#include "lz4.h"
-
 #include "tiff.h"
 #include "tile_buffer_pool.h"
 #include "tif_lzw.h"
-#include "remote.h"
 #include "jpeg_decoder.h"
 
 u32 get_tiff_field_size(u16 data_type) {
@@ -642,7 +639,7 @@ bool tiff_read_ifd(tiff_t* tiff, tiff_ifd_t* ifd, u64* next_ifd_offset) {
 			} break;
 			case TIFF_TAG_REFERENCEBLACKWHITE: {
 				ifd->reference_black_white_rational_count = tag->data_count;
-				ifd->reference_black_white = tiff_read_field_rationals(tiff, tag); //TODO: add to serialized format
+				ifd->reference_black_white = tiff_read_field_rationals(tiff, tag);
 				if (ifd->reference_black_white == NULL) {
 					free(tags);
 					return false; // failed
@@ -989,377 +986,6 @@ bool32 open_tiff_from_source(tiff_t* tiff, source_fs_t* source, const char* memb
 }
 
 
-void memrw_push_tiff_block(memrw_t* buffer, u32 block_type, u32 index, u64 block_length) {
-	serial_block_t block = { .block_type = block_type, .index = index, .length = block_length };
-	memrw_push_back(buffer, (u8*) &block, sizeof(block));
-}
-
-#define INCLUDE_IMAGE_DESCRIPTION 1
-
-memrw_t* tiff_serialize(tiff_t* tiff, memrw_t* buffer) {
-
-	u64 uncompressed_size = 0;
-
-	// TODO: is_mpp_known
-	// block: general TIFF header / meta
-	uncompressed_size += sizeof(serial_block_t);
-	tiff_serial_header_t serial_header = (tiff_serial_header_t){
-			.filesize = tiff->filesize,
-			.ifd_count = tiff->ifd_count,
-			.main_image_index = tiff->main_image_ifd_index,
-			.macro_image_index = tiff->macro_image_index,
-			.label_image_index = tiff->label_image_index,
-			.level_image_ifd_count = tiff->level_image_ifd_count,
-			.level_image_index = tiff->level_images_ifd_index,
-			.bytesize_of_offsets = tiff->bytesize_of_offsets,
-			.is_bigtiff = tiff->is_bigtiff,
-			.is_big_endian = tiff->is_big_endian,
-			.mpp_x = tiff->mpp_x,
-			.mpp_y = tiff->mpp_y,
-	};
-	uncompressed_size += sizeof(serial_header);
-
-	// block: IFD's
-	uncompressed_size += sizeof(serial_block_t);
-	u64 serial_ifds_block_size = tiff->ifd_count * sizeof(tiff_serial_ifd_t);
-	tiff_serial_ifd_t* serial_ifds = (tiff_serial_ifd_t*) alloca(serial_ifds_block_size);
-	for (i32 i = 0; i < tiff->ifd_count; ++i) {
-		tiff_ifd_t* ifd = tiff->ifds + i;
-		tiff_serial_ifd_t* serial_ifd = serial_ifds + i;
-		*serial_ifd = (tiff_serial_ifd_t) {
-			.image_width = ifd->image_width,
-			.image_height = ifd->image_height,
-			.tile_width = ifd->tile_width,
-			.tile_height = ifd->tile_height,
-			.tile_count = ifd->tile_count,
-			.image_description_length = ifd->image_description_length,
-			.jpeg_tables_length = ifd->jpeg_tables_length,
-			.compression = ifd->compression,
-			.color_space = ifd->color_space,
-			.level_magnification = ifd->level_magnification,
-			.width_in_tiles = ifd->width_in_tiles,
-			.height_in_tiles = ifd->height_in_tiles,
-			.um_per_pixel_x = ifd->um_per_pixel_x,
-			.um_per_pixel_y = ifd->um_per_pixel_y,
-			.x_tile_side_in_um = ifd->x_tile_side_in_um,
-			.y_tile_side_in_um = ifd->y_tile_side_in_um,
-			.chroma_subsampling_horizontal = ifd->chroma_subsampling_horizontal,
-			.chroma_subsampling_vertical = ifd->chroma_subsampling_vertical,
-			.subimage_type = ifd->subimage_type,
-		};
-#if INCLUDE_IMAGE_DESCRIPTION
-		uncompressed_size += ifd->image_description_length;
-#endif
-		uncompressed_size += ifd->jpeg_tables_length;
-		uncompressed_size += ifd->tile_count * sizeof(ifd->tile_offsets[0]);
-		uncompressed_size += ifd->tile_count * sizeof(ifd->tile_byte_counts[0]);
-	}
-	uncompressed_size += tiff->ifd_count * sizeof(tiff_serial_ifd_t);
-
-	// blocks: need separate blocks for each IFD's image descriptions, tile offsets, tile byte counts, jpeg tables
-#if INCLUDE_IMAGE_DESCRIPTION
-	uncompressed_size += tiff->ifd_count * sizeof(serial_block_t);
-#endif
-	uncompressed_size += tiff->ifd_count * sizeof(serial_block_t);
-	uncompressed_size += tiff->ifd_count * sizeof(serial_block_t);
-	uncompressed_size += tiff->ifd_count * sizeof(serial_block_t);
-
-	// block: terminator (end of stream marker)
-	uncompressed_size += sizeof(serial_block_t);
-
-	// Allocate space, and start pushing the data onto the buffer
-	memrw_maybe_grow(buffer, uncompressed_size);
-
-	memrw_push_tiff_block(buffer, SERIAL_BLOCK_TIFF_HEADER_AND_META, 0, sizeof(serial_block_t));
-	memrw_push_back(buffer, &serial_header, sizeof(serial_header));
-
-	memrw_push_tiff_block(buffer, SERIAL_BLOCK_TIFF_IFDS, 0, serial_ifds_block_size);
-	memrw_push_back(buffer, serial_ifds, serial_ifds_block_size);
-
-	for (i32 i = 0; i < tiff->ifd_count; ++i) {
-		tiff_ifd_t* ifd = tiff->ifds + i;
-#if INCLUDE_IMAGE_DESCRIPTION
-		memrw_push_tiff_block(buffer, SERIAL_BLOCK_TIFF_IMAGE_DESCRIPTION, i, ifd->image_description_length);
-		memrw_push_back(buffer, ifd->image_description, ifd->image_description_length);
-#endif
-		u64 tile_offsets_size = ifd->tile_count * sizeof(ifd->tile_offsets[0]);
-		memrw_push_tiff_block(buffer, SERIAL_BLOCK_TIFF_TILE_OFFSETS, i, tile_offsets_size);
-		memrw_push_back(buffer, ifd->tile_offsets, tile_offsets_size);
-
-		u64 tile_byte_counts_size = ifd->tile_count * sizeof(ifd->tile_byte_counts[0]);
-		memrw_push_tiff_block(buffer, SERIAL_BLOCK_TIFF_TILE_BYTE_COUNTS, i, tile_byte_counts_size);
-		memrw_push_back(buffer, ifd->tile_byte_counts, tile_byte_counts_size);
-
-		memrw_push_tiff_block(buffer, SERIAL_BLOCK_TIFF_JPEG_TABLES, i, ifd->jpeg_tables_length);
-		memrw_push_back(buffer, ifd->jpeg_tables, ifd->jpeg_tables_length);
-
-	}
-
-	memrw_push_tiff_block(buffer, SERIAL_BLOCK_TERMINATOR, 0, 0);
-
-//	console_print("buffer has %llu used bytes, out of %llu capacity\n", buffer->used_size, buffer->capacity);
-
-	// Additional compression step
-#if 1
-	ASSERT(buffer->used_size == uncompressed_size);
-	i32 compression_size_bound = LZ4_COMPRESSBOUND(buffer->used_size);
-	u8* compression_buffer = (u8*) malloc(compression_size_bound);
-	i32 compressed_size = LZ4_compress_default((char*)buffer->data, (char*)compression_buffer,
-	                                           buffer->used_size, compression_size_bound);
-	if (compressed_size > 0) {
-		// success! We can replace the buffer contents with the compressed data
-		memrw_rewind(buffer);
-		memrw_push_tiff_block(buffer, SERIAL_BLOCK_LZ4_COMPRESSED_DATA, uncompressed_size, compressed_size);
-		memrw_push_back(buffer, compression_buffer, compressed_size);
-	} else {
-		console_print_error("Warning: tiff_serialize(): payload LZ4 compression failed\n");
-	}
-
-	free(compression_buffer);
-#endif
-
-	return buffer;
-
-}
-
-u8* pop_from_buffer(u8** pos, i64 size, i64* bytes_left) {
-	if (size > *bytes_left) {
-		console_print_error("pop_from_buffer(): buffer empty\n");
-		return NULL;
-	}
-	u8* old_pos = *pos;
-	*pos += size;
-	*bytes_left -= size;
-	return old_pos;
-}
-
-serial_block_t* pop_block_from_buffer(u8** pos, i64* bytes_left) {
-	return (serial_block_t*) pop_from_buffer(pos, sizeof(serial_block_t), bytes_left);
-}
-
-i64 find_end_of_http_headers(u8* str, u64 len) {
-	static const char crlfcrlf[] = "\r\n\r\n";
-	u32 search_key = *(u32*)crlfcrlf;
-	i64 result = 0;
-	for (i64 offset = 0; offset < len - 4; ++offset) {
-		u8* pos = str + offset;
-		u32 check = *(u32*)pos;
-		if (check == search_key) {
-			result = offset + 4;
-			break;
-		}
-	}
-	return result;
-}
-
-
-
-bool32 tiff_deserialize(tiff_t* tiff, u8* buffer, u64 buffer_size) {
-	i64 bytes_left = (i64)buffer_size;
-	u8* pos = buffer;
-	u8* data = NULL;
-	serial_block_t* block = NULL;
-	bool32 success = false;
-	u8* decompressed_buffer = NULL;
-
-	if (0) {
-		failed:
-		if (decompressed_buffer) free(decompressed_buffer);
-		return false;
-	}
-
-
-#define POP_DATA(size) do {if (!(data = pop_from_buffer(&pos, (size), &bytes_left))) goto failed; } while(0)
-#define POP_BLOCK() do{if (!(block = pop_block_from_buffer(&pos, &bytes_left))) goto failed; } while(0)
-
-
-	i64 content_offset = find_end_of_http_headers(buffer, buffer_size);
-	i64 content_length = buffer_size - content_offset;
-	POP_DATA(content_offset);
-
-	// block: general TIFF header / meta
-	POP_BLOCK();
-
-	if (block->block_type == SERIAL_BLOCK_LZ4_COMPRESSED_DATA) {
-		// compressed LZ4 stream
-		i32 compressed_size = (i32)block->length;
-		i32 decompressed_size = (i32)block->index; // used as general purpose field here..
-		ASSERT(block->length < INT32_MAX);
-		ASSERT(block->index < INT32_MAX);
-		POP_DATA(compressed_size);
-		decompressed_buffer = (u8*) malloc(decompressed_size);
-		i32 bytes_decompressed = LZ4_decompress_safe((char*)data, (char*)decompressed_buffer, compressed_size, decompressed_size);
-		if (bytes_decompressed > 0) {
-			if (bytes_decompressed != decompressed_size) {
-				console_print_error("LZ4_decompress_safe() decompressed %d bytes, however the expected size was %d\n", bytes_decompressed, decompressed_size);
-			} else {
-				// success, switch over to the uncompressed buffer!
-				pos = decompressed_buffer;
-				bytes_left = bytes_decompressed;
-				POP_BLOCK(); // now pointing to the uncompressed data stream
-			}
-
-		} else {
-			console_print_error("LZ4_decompress_safe() failed (return value %d)\n", bytes_decompressed);
-		}
-	}
-
-	if (block->block_type != SERIAL_BLOCK_TIFF_HEADER_AND_META) goto failed;
-
-	POP_DATA(sizeof(tiff_serial_header_t));
-	tiff_serial_header_t* serial_header = (tiff_serial_header_t*) data;
-	*tiff = (tiff_t) {0};
-	tiff->is_remote = 1; // Deserialized IFDs use calloc, including on partial failure.
-	tiff->location = (network_location_t){0}; // set later
-	tiff->filesize = serial_header->filesize;
-	tiff->bytesize_of_offsets = serial_header->bytesize_of_offsets;
-	tiff->ifd_count = serial_header->ifd_count;
-	tiff->ifds = NULL; // set later
-	tiff->main_image_ifd = NULL; // set later
-	tiff->main_image_ifd_index = serial_header->main_image_index;
-	tiff->macro_image = NULL; // set later
-	tiff->macro_image_index = serial_header->macro_image_index;
-	tiff->label_image = NULL; // set later
-	tiff->label_image_index = serial_header->label_image_index;
-	tiff->level_image_ifd_count = serial_header->level_image_ifd_count;
-	tiff->level_images_ifd = NULL; // set later
-	tiff->level_images_ifd_index = 0; // set later
-	tiff->is_bigtiff = serial_header->is_bigtiff;
-	tiff->is_big_endian = serial_header->is_big_endian;
-	tiff->mpp_x = serial_header->mpp_x;
-	tiff->mpp_y = serial_header->mpp_y;
-
-	// block: IFD's
-	POP_BLOCK();
-	if (block->block_type != SERIAL_BLOCK_TIFF_IFDS) goto failed;
-	u64 serial_ifds_block_size = tiff->ifd_count * sizeof(tiff_serial_ifd_t);
-	if (block->length != serial_ifds_block_size) goto failed;
-
-	POP_DATA(serial_ifds_block_size);
-	tiff_serial_ifd_t* serial_ifds = (tiff_serial_ifd_t*) data;
-
-	// TODO: maybe not use a stretchy_buffer here?
-	tiff->ifds = (tiff_ifd_t*) calloc(1, sizeof(tiff_ifd_t) * tiff->ifd_count); // allocate space for the IFD's
-	memset(tiff->ifds, 0, tiff->ifd_count * sizeof(tiff_ifd_t));
-
-	for (i32 i = 0; i < tiff->ifd_count; ++i) {
-		tiff_ifd_t* ifd = tiff->ifds + i;
-		tiff_serial_ifd_t* serial_ifd = serial_ifds + i;
-		*ifd = (tiff_ifd_t) {0};
-		ifd->ifd_index = i;
-		ifd->image_width = serial_ifd->image_width;
-		ifd->image_height = serial_ifd->image_height;
-		ifd->tile_width = serial_ifd->tile_width;
-		ifd->tile_height = serial_ifd->tile_height;
-		ifd->tile_count = serial_ifd->tile_count;
-		ifd->tile_offsets = NULL; // set later
-		ifd->tile_byte_counts = NULL; // set later
-		ifd->image_description = NULL; // set later
-		ifd->image_description_length = serial_ifd->image_description_length;
-		ifd->jpeg_tables = NULL; // set later
-		ifd->jpeg_tables_length = serial_ifd->jpeg_tables_length;
-		ifd->compression = serial_ifd->compression;
-		ifd->color_space = serial_ifd->color_space;
-		ifd->subimage_type = serial_ifd->subimage_type;
-		ifd->level_magnification = serial_ifd->level_magnification; // TODO: delete this?
-		ifd->width_in_tiles = serial_ifd->width_in_tiles;
-		ifd->height_in_tiles = serial_ifd->height_in_tiles;
-		ifd->um_per_pixel_x = serial_ifd->um_per_pixel_x;
-		ifd->um_per_pixel_y = serial_ifd->um_per_pixel_y;
-		ifd->x_tile_side_in_um = serial_ifd->x_tile_side_in_um;
-		ifd->y_tile_side_in_um = serial_ifd->y_tile_side_in_um;
-		ifd->chroma_subsampling_horizontal = serial_ifd->chroma_subsampling_horizontal;
-		ifd->chroma_subsampling_vertical = serial_ifd->chroma_subsampling_vertical;
-		ifd->reference_black_white_rational_count = 0; // unused for now
-		ifd->reference_black_white = NULL; // unused for now
-	}
-
-	DUMMY_STATEMENT; // for placing a debug breakpoint
-
-	// The number of remaining blocks is unspecified.
-	// We are expecting at least byte offsets, tile offsets and JPEG tables for each IFD
-	bool32 reached_end = false;
-	while (!reached_end) {
-
-		POP_BLOCK();
-		if (block->length > 0) {
-			POP_DATA(block->length);
-		}
-		u8* block_content = data;
-		// TODO: Need to think about this: are block index's (if present) always referring an IFD index, though? Or are there other use cases?
-		if (block->index >= tiff->ifd_count) {
-			console_print_error("tiff_deserialize(): found block referencing a non-existent IFD\n");
-			goto failed;
-		}
-		tiff_ifd_t* referenced_ifd = tiff->ifds + block->index;
-
-
-		switch (block->block_type) {
-			case SERIAL_BLOCK_TIFF_IMAGE_DESCRIPTION: {
-				if (referenced_ifd->image_description) {
-					console_print_error("tiff_deserialize(): IFD %u already has an image description\n", block->index);
-					goto failed;
-				}
-				referenced_ifd->image_description = (char*) malloc(block->length + 1);
-				memcpy(referenced_ifd->image_description, block_content, block->length);
-				referenced_ifd->image_description[block->length] = '\0';
-				referenced_ifd->image_description_length = block->length;
-			} break;
-			case SERIAL_BLOCK_TIFF_TILE_OFFSETS: {
-				if (referenced_ifd->tile_offsets) {
-					console_print_error("tiff_deserialize(): IFD %u already has tile offsets\n", block->index);
-					goto failed;
-				}
-				referenced_ifd->tile_offsets = (u64*) malloc(block->length);
-				memcpy(referenced_ifd->tile_offsets, block_content, block->length);
-			} break;
-			case SERIAL_BLOCK_TIFF_TILE_BYTE_COUNTS: {
-				if (referenced_ifd->tile_byte_counts) {
-					console_print_error("tiff_deserialize(): IFD %u already has tile byte counts\n", block->index);
-					goto failed;
-				}
-				referenced_ifd->tile_byte_counts = (u64*) malloc(block->length);
-				memcpy(referenced_ifd->tile_byte_counts, block_content, block->length);
-			} break;
-			case SERIAL_BLOCK_TIFF_JPEG_TABLES: {
-				if (referenced_ifd->jpeg_tables) {
-					console_print_error("tiff_deserialize(): IFD %u already has JPEG tables\n", block->index);
-					goto failed;
-				}
-				referenced_ifd->jpeg_tables = (u8*) malloc(block->length);
-				if (!referenced_ifd->jpeg_tables) goto failed;
-				memcpy(referenced_ifd->jpeg_tables, block_content, block->length);
-				referenced_ifd->jpeg_tables_length = block->length;
-			} break;
-			case SERIAL_BLOCK_TERMINATOR: {
-				// Reached the end
-#if REMOTE_CLIENT_VERBOSE
-				console_print("tiff_deserialize(): found a terminator block\n");
-#endif
-				reached_end = true;
-				break;
-			} break;
-		}
-	}
-	if (reached_end) {
-		success = true;
-#if REMOTE_CLIENT_VERBOSE
-		console_print("tiff_deserialize(): bytes_left = %lld, content length = %lld, buffer size = %llu\n", bytes_left, content_length, buffer_size);
-#endif
-	}
-
-	if (decompressed_buffer != NULL) free(decompressed_buffer);
-
-	tiff_post_init(tiff);
-
-	return success;
-
-
-#undef POP_DATA
-#undef POP_BLOCK
-
-}
-
 void tiff_destroy(tiff_t* tiff) {
 	if (tiff->owned_blob) {
 		source_blob_close(tiff->owned_blob);
@@ -1379,12 +1005,7 @@ void tiff_destroy(tiff_t* tiff) {
 		if (ifd->reference_black_white) free(ifd->reference_black_white);
         if (ifd->ndpi_optimization_markers) free(ifd->ndpi_optimization_markers);
 	}
-	// TODO: fix this, choose either stretchy_buffer or regular malloc, not both...
-	if (tiff->is_remote) {
-		free(tiff->ifds);
-	} else {
-		arrfree(tiff->ifds);
-	}
+	arrfree(tiff->ifds);
 	memset(tiff, 0, sizeof(*tiff));
 }
 
@@ -1487,6 +1108,7 @@ static int horAcc8(u32 stride, uint8* cp0, u32 cc) {
 
 
 u8* tiff_decode_tile(i32 logical_thread_index, tiff_t* tiff, tiff_ifd_t* level_ifd, i32 tile_index, i32 level, i32 tile_x, i32 tile_y) {
+	const size_t bytes_per_pixel = 4; // Decoded output is BGRA.
 
 	u16 compression = level_ifd->compression;
 	u8* jpeg_tables = level_ifd->jpeg_tables;
@@ -1514,78 +1136,43 @@ u8* tiff_decode_tile(i32 logical_thread_index, tiff_t* tiff, tiff_ifd_t* level_i
 		// TODO: optimize allocation
 		compressed_tile_data = (u8*)malloc(compressed_tile_size_in_bytes);
 
-		if (!tiff->is_remote) {
-			if (source_file_read(&tiff->file, tile_offset, compressed_tile_data, compressed_tile_size_in_bytes) != SOURCE_READ_OK) {
-				free(compressed_tile_data);
-				return NULL;
-			}
-		} else {
-			console_print_verbose("[thread %d] remote tile requested: level %d, tile %d (%d, %d)\n", logical_thread_index, level, tile_index, tile_x, tile_y);
-
-			i32 bytes_read = 0;
-			u8* read_buffer = download_remote_chunk(tiff->location.hostname, tiff->location.portno, tiff->location.filename,
-			                                        tile_offset, compressed_tile_size_in_bytes, &bytes_read, logical_thread_index);
-			if (read_buffer && bytes_read > 0) {
-				i64 content_offset = find_end_of_http_headers(read_buffer, bytes_read);
-				i64 content_length = bytes_read - content_offset;
-				u8* content = read_buffer + content_offset;
-
-				if (content_length >= compressed_tile_size_in_bytes) {
-					memcpy(compressed_tile_data, content, compressed_tile_size_in_bytes);
-				} else {
-					failed = true;
-				}
-
-			} else {
-				failed = true;
-			}
-			if (read_buffer) {
-				free(read_buffer);
-			}
-			if (failed) {
-				console_print_error("[thread %d] failed to read from remote level %d, tile %d (%d, %d)\n", logical_thread_index, level, tile_index, tile_x, tile_y);
-                free(compressed_tile_data);
-				return NULL;
-			}
+		if (source_file_read(&tiff->file, tile_offset, compressed_tile_data, compressed_tile_size_in_bytes) != SOURCE_READ_OK) {
+			free(compressed_tile_data);
+			return NULL;
 		}
 
 	} else {
 		// image is not tiled
 
 
-		if (!tiff->is_remote) {
-
-			if (level_ifd->strip_count > 0) {
-				ASSERT(level_ifd->strip_offsets);
-				ASSERT(level_ifd->strip_byte_counts);
-				if (level_ifd->strip_count == 1) {
-					compressed_tile_size_in_bytes = level_ifd->strip_byte_counts[0];
-					compressed_tile_data = (u8*)malloc(compressed_tile_size_in_bytes);
-					size_t bytes_read = source_file_read_at_offset(compressed_tile_data, &tiff->file, level_ifd->strip_offsets[0], compressed_tile_size_in_bytes);
-					if (bytes_read != compressed_tile_size_in_bytes) {
+		if (level_ifd->strip_count > 0) {
+			ASSERT(level_ifd->strip_offsets);
+			ASSERT(level_ifd->strip_byte_counts);
+			if (level_ifd->strip_count == 1) {
+				compressed_tile_size_in_bytes = level_ifd->strip_byte_counts[0];
+				compressed_tile_data = (u8*)malloc(compressed_tile_size_in_bytes);
+				size_t bytes_read = source_file_read_at_offset(compressed_tile_data, &tiff->file, level_ifd->strip_offsets[0], compressed_tile_size_in_bytes);
+				if (bytes_read != compressed_tile_size_in_bytes) {
+					failed = true;
+				}
+			} else {
+				compressed_strip_data = (u8**)alloca(level_ifd->strip_count * sizeof(u8**));
+				memset(compressed_strip_data, 0, level_ifd->strip_count * sizeof(u8**));
+				for (i32 i = 0; i < level_ifd->strip_count; ++i) {
+					u64 strip_offset = level_ifd->strip_offsets[i];
+					u64 strip_byte_count = level_ifd->strip_byte_counts[i];
+					compressed_strip_data[i] = (u8*)malloc(strip_byte_count);
+					size_t bytes_read = source_file_read_at_offset(compressed_strip_data[i], &tiff->file, strip_offset, strip_byte_count);
+					if (bytes_read != strip_byte_count) {
 						failed = true;
 					}
-				} else {
-					compressed_strip_data = (u8**)alloca(level_ifd->strip_count * sizeof(u8**));
-					memset(compressed_strip_data, 0, level_ifd->strip_count * sizeof(u8**));
-					for (i32 i = 0; i < level_ifd->strip_count; ++i) {
-						u64 strip_offset = level_ifd->strip_offsets[i];
-						u64 strip_byte_count = level_ifd->strip_byte_counts[i];
-						compressed_strip_data[i] = (u8*)malloc(strip_byte_count);
-						size_t bytes_read = source_file_read_at_offset(compressed_strip_data[i], &tiff->file, strip_offset, strip_byte_count);
-						if (bytes_read != strip_byte_count) {
-							failed = true;
-						}
-					}
 				}
-
-			} else {
-				failed = true; // no tiles and no strips?
 			}
 
 		} else {
-			failed = true;
+			failed = true; // no tiles and no strips?
 		}
+
 
 		if (failed) {
 			if (compressed_tile_data) {
@@ -1608,7 +1195,7 @@ u8* tiff_decode_tile(i32 logical_thread_index, tiff_t* tiff, tiff_ifd_t* level_i
 	if (compressed_tile_data || compressed_strip_data)  {
 //		console_print_verbose("[thread %d] loading tile: level %d, tile %d (%d, %d)\n", logical_thread_index, level, tile_index, tile_x, tile_y);
 
-		size_t pixel_memory_size = level_ifd->tile_width * level_ifd->tile_height * BYTES_PER_PIXEL;
+		size_t pixel_memory_size = level_ifd->tile_width * level_ifd->tile_height * bytes_per_pixel;
 		u8* pixel_memory = tile_buffer_acquire(pixel_memory_size);
 		u8* decompressed = NULL; // allocated later if needed
 
@@ -1640,7 +1227,7 @@ u8* tiff_decode_tile(i32 logical_thread_index, tiff_t* tiff, tiff_ifd_t* level_i
 				if (row_offset >= level_ifd->tile_height) {
 					goto decompression_failed; // out of bounds
 				}
-				pixel_memory_dest += row_offset * level_ifd->tile_width * BYTES_PER_PIXEL;
+				pixel_memory_dest += row_offset * level_ifd->tile_width * bytes_per_pixel;
 			}
 
 			u32 decompressed_height;

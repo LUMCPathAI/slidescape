@@ -1194,7 +1194,6 @@ static void gui_draw_main_menu_bar(app_state_t* app_state) {
 			bool open_file;
 			bool close;
 			bool save;
-			bool open_remote;
 			bool open_uri;
 			bool exit_program;
 			bool new_dataset_asap_xml;
@@ -1309,8 +1308,6 @@ static void gui_draw_main_menu_bar(app_state_t* app_state) {
 				if (ImGui::MenuItem("Show demo window", "F1", &show_demo_window)) {}
 				if (ImGui::MenuItem("Show debugging window", "Ctrl+F1", &show_debugging_window)) {}
 				ImGui::Separator();
-                if (ImGui::MenuItem("Open remote WSI...", NULL, &menu_items_clicked.open_remote)) {}
-				ImGui::Separator();
 				if (ImGui::MenuItem("Show menu bar", "Alt+F12", &show_menu_bar)) {}
 				if (ImGui::MenuItem("Load next as overlay", "F6", &load_next_image_as_overlay)) {}
 				if (ImGui::MenuItem("Show mouse position", NULL, &show_mouse_pos_overlay)) {}
@@ -1341,8 +1338,6 @@ static void gui_draw_main_menu_bar(app_state_t* app_state) {
 			menu_close_file(app_state);
 		} else if (menu_items_clicked.save) {
 			save_annotations(app_state, &app_state->scene.annotation_set, true, false);
-		} else if (menu_items_clicked.open_remote) {
-			show_open_remote_window = true;
 		} else if (prev_fullscreen != is_fullscreen) {
 			bool currently_fullscreen = check_fullscreen(app_state->main_window);
 			if (currently_fullscreen != is_fullscreen) {
@@ -2576,43 +2571,6 @@ void gui_draw(app_state_t* app_state, input_t* input, i32 client_width, i32 clie
 	if (show_open_uri_window) gui_draw_open_uri_window(app_state);
 	gui_draw_open_uri_credential_modals(app_state);
     if (show_dicomweb_archive_window) gui_draw_dicomweb_archive_window(app_state);
-
-	if (show_open_remote_window) {
-		ImGui::SetNextWindowPos(ImVec2(120, 100), ImGuiCond_FirstUseEver);
-		ImGui::SetNextWindowSize(ImVec2(256, 156), ImGuiCond_FirstUseEver);
-
-		ImGui::Begin("Open remote", &show_open_remote_window);
-
-		ImGuiInputTextFlags input_flags = ImGuiInputTextFlags_EnterReturnsTrue;
-		bool entered = false;
-		entered = entered || ImGui::InputText("Hostname", remote_hostname, sizeof(remote_hostname), input_flags);
-		entered = entered || ImGui::InputText("Port", remote_port, sizeof(remote_port), input_flags);
-		entered = entered || ImGui::InputText("Filename", remote_filename, sizeof(remote_filename), input_flags);
-		if (entered || ImGui::Button("Connect")) {
-			const char* ext = get_file_extension(remote_filename);
-#if DO_DEBUG
-			if (strcmp(remote_filename, "test_google.html") == 0) {
-				i32 bytes_read = 0;
-				u8* read_buffer = do_http_request(remote_hostname, atoi(remote_port), "/test", &bytes_read, 0);
-				if (read_buffer) {
-					FILE* test_out = fopen("test_google2.html", "wb");
-					fwrite(read_buffer, bytes_read, 1, test_out);
-					fclose(test_out);
-					free(read_buffer);
-				}
-			}
-			else
-#endif
-			// Open as 'slide'
-			if (open_remote_slide(app_state, remote_hostname, atoi(remote_port), remote_filename)) {
-				show_open_remote_window = false; // success!
-			}
-
-
-		}
-		ImGui::End();
-	}
-
 
 	// 1. Show the big demo window (Most of the sample code is in ImGui::ShowDemoWindow()! You can browse its code to learn more about Dear ImGui!).
 	if (show_demo_window) {

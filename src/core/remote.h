@@ -42,12 +42,6 @@ extern "C" {
 
 // prototypes
 void init_networking();
-u8 *do_http_request(const char *hostname, i32 portno, const char *uri, i32 *bytes_read, i32 thread_id);
-u8 *download_remote_chunk(const char *hostname, i32 portno, const char *filename, i64 chunk_offset, i64 chunk_size,
-                          i32 *bytes_read, i32 thread_id);
-u8 *download_remote_batch(const char *hostname, i32 portno, const char *filename, i64 *chunk_offsets, i64 *chunk_sizes,
-                          i32 batch_size, i32 *bytes_read, i32 thread_id);
-bool open_remote_slide(app_state_t *app_state, const char *hostname, i32 portno, const char *filename);
 http_response_t* open_remote_uri(app_state_t *app_state, const char *uri, const char* api_token);
 http_response_t* open_remote_uri_with_extra_headers(const char *uri, const char* api_token, const char* cookie_header);
 http_response_t* open_remote_uri_with_extra_headers_and_options(
@@ -75,21 +69,6 @@ void http_response_destroy(http_response_t* response);
 #if DO_DEBUG
 void do_remote_connection_test();
 #endif
-
-// globals
-#if defined(TLSCLIENT_IMPL)
-#define INIT(...) __VA_ARGS__
-#define extern
-#else
-#define INIT(...)
-#undef extern
-#endif
-
-
-
-#undef INIT
-#undef extern
-
 
 #ifdef __cplusplus
 }

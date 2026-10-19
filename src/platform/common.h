@@ -227,23 +227,24 @@ FORCE_INLINE void libc_free(void* memory) {
 #define vsprintf  stbsp_vsprintf
 #define vsnprintf stbsp_vsnprintf
 
-// Catch prints to the console so that we can also log them, display them in a GUI, etc.
-#ifndef USE_CONSOLE_GUI
-#define USE_CONSOLE_GUI 0
+// Route output through application-provided logging functions when enabled.
+// Otherwise, write directly to stdio. This does not require a GUI.
+#ifndef USE_CONSOLE_LOGGING
+#define USE_CONSOLE_LOGGING 0
 #endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-#if !USE_CONSOLE_GUI
+#if !USE_CONSOLE_LOGGING
 #define console_print printf
 #define console_print_error(...) fprintf(stderr, __VA_ARGS__)
 extern bool is_verbose_mode; // NOTE: necessary to define this variable somewhere
 #define console_print_verbose(...) do { if (is_verbose_mode) fprintf(stdout, __VA_ARGS__); } while(0)
 #else
-void console_print(const char *fmt, ...); // defined in console.cpp
-void console_print_verbose(const char *fmt, ...); // defined in console.cpp
-void console_print_error(const char *fmt, ...); // // defined in console.cpp
+void console_print(const char *fmt, ...);
+void console_print_verbose(const char *fmt, ...);
+void console_print_error(const char *fmt, ...);
 #endif
 #ifdef __cplusplus
 }

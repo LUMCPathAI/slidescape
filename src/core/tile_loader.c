@@ -24,7 +24,6 @@
 #include "tile_cache.h"
 #include "tiff.h"
 
-static work_queue_callback_t* remote_tiff_load_tile_batch_func;
 static work_queue_callback_t* slide_score_load_tile_batch_func;
 static work_queue_callback_t* dicomweb_load_tile_batch_func;
 static work_queue_callback_t* ssi_load_tile_batch_callback;
@@ -43,9 +42,6 @@ static ssi_pending_batch_queue_t ssi_pending_queue = {
 	.mutex = PLATFORM_MUTEX_INITIALIZER,
 };
 
-void tile_loader_set_remote_tiff_batch_callback(work_queue_callback_t* callback) {
-	remote_tiff_load_tile_batch_func = callback;
-}
 
 void tile_loader_set_slide_score_batch_callback(work_queue_callback_t* callback) {
 	slide_score_load_tile_batch_func = callback;
@@ -269,17 +265,12 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 	i32 tile_loads_submitted = 0;
 
 	if (tiles_to_load > 0) {
-		bool use_remote_batch = (image->backend == IMAGE_BACKEND_TIFF && image->tiff.is_remote) ||
-		                        image->backend == IMAGE_BACKEND_SLIDE_SCORE ||
+		bool use_remote_batch = image->backend == IMAGE_BACKEND_SLIDE_SCORE ||
 		                        image->backend == IMAGE_BACKEND_DICOMWEB ||
 		                        image->backend == IMAGE_BACKEND_SSI;
 		if (use_remote_batch) {
 			work_queue_callback_t* load_func = NULL;
-			u32 intermittent_interval = 1;
-			if (image->backend == IMAGE_BACKEND_TIFF) {
-				load_func = remote_tiff_load_tile_batch_func;
-				intermittent_interval = 5; // reduce load on remote server; can be tweaked
-			} else if (image->backend == IMAGE_BACKEND_SLIDE_SCORE) {
+			if (image->backend == IMAGE_BACKEND_SLIDE_SCORE) {
 				load_func = slide_score_load_tile_batch_func;
 			} else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
 				load_func = dicomweb_load_tile_batch_func;
@@ -292,63 +283,57 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 				return 0;
 			}
 
-			// For remote slides, only send out a batch request every so often, instead of single tile requests every frame.
-			// (to reduce load on the server)
-			static u32 intermittent = 0;
-			++intermittent;
-			if (intermittent % intermittent_interval == 0) {
-				i32 work_items_submitted = 0;
-				i32 policy_batch_size = TILE_LOAD_BATCH_MAX;
-				tile_cache_policy_t policy = tile_cache_get_policy(image);
-				if (policy.batch_size > 0) {
-					policy_batch_size = policy.batch_size;
+			i32 work_items_submitted = 0;
+			i32 policy_batch_size = TILE_LOAD_BATCH_MAX;
+			tile_cache_policy_t policy = tile_cache_get_policy(image);
+			if (policy.batch_size > 0) {
+				policy_batch_size = policy.batch_size;
+			}
+			policy_batch_size = CLAMP(policy_batch_size, 1, TILE_LOAD_BATCH_MAX);
+			for (i32 first_tile = 0;
+			     first_tile < tiles_to_load && work_items_submitted < usable_slots;) {
+				i32 candidate_count = ATMOST(policy_batch_size, tiles_to_load - first_tile);
+				if (image->backend == IMAGE_BACKEND_SSI) {
+					candidate_count = ssi_group_rectangle_tasks(image, wishlist, first_tile,
+					                                            tiles_to_load, policy_batch_size);
 				}
-				policy_batch_size = CLAMP(policy_batch_size, 1, TILE_LOAD_BATCH_MAX);
-				for (i32 first_tile = 0;
-				     first_tile < tiles_to_load && work_items_submitted < usable_slots;) {
-					i32 candidate_count = ATMOST(policy_batch_size, tiles_to_load - first_tile);
-					if (image->backend == IMAGE_BACKEND_SSI) {
-						candidate_count = ssi_group_rectangle_tasks(image, wishlist, first_tile,
-						                                            tiles_to_load, policy_batch_size);
-					}
-					ASSERT(candidate_count > 0);
-					load_tile_task_batch_t batch = {0};
-					for (i32 i = first_tile; i < first_tile + candidate_count; ++i) {
-						load_tile_task_t* task = wishlist + i;
-						u32 demand_flags = task->need_gpu_residency ? TILE_CACHE_DEMAND_GPU_RESIDENCY : 0;
-						demand_flags |= task->need_cpu_residency ? TILE_CACHE_DEMAND_CPU_RESIDENCY : 0;
-						if (tile_cache_try_begin_decode(image, task->plane, task->level, task->tile_index, demand_flags, task->priority, task->generation)) {
-							batch.tile_tasks[batch.task_count++] = *task;
-						} else {
-							console_print_verbose("tile_loader_submit_requests(): tile already requested by another thread (%d)\n", task->tile_index);
-						}
-					}
-					if (batch.task_count == 0) {
-						first_tile += candidate_count;
-						continue;
-					}
-					bool submitted = image->backend == IMAGE_BACKEND_SSI
-						? ssi_pending_enqueue(&batch)
-						: thread_pool_submit_task_to_group(&global_thread_pool,
-						                                   batch.tile_tasks[0].task_group,
-						                                   load_func, &batch, sizeof(batch));
-					if (submitted) {
-						++work_items_submitted;
-						for (i32 i = 0; i < batch.task_count; ++i) {
-							load_tile_task_t* task = batch.tile_tasks + i;
-							if (image->backend != IMAGE_BACKEND_SSI) {
-								atomic_add(&image->refcount, task->refcount_to_decrement);
-							}
-							++tile_loads_submitted;
-						}
+				ASSERT(candidate_count > 0);
+				load_tile_task_batch_t batch = {0};
+				for (i32 i = first_tile; i < first_tile + candidate_count; ++i) {
+					load_tile_task_t* task = wishlist + i;
+					u32 demand_flags = task->need_gpu_residency ? TILE_CACHE_DEMAND_GPU_RESIDENCY : 0;
+					demand_flags |= task->need_cpu_residency ? TILE_CACHE_DEMAND_CPU_RESIDENCY : 0;
+					if (tile_cache_try_begin_decode(image, task->plane, task->level, task->tile_index, demand_flags, task->priority, task->generation)) {
+						batch.tile_tasks[batch.task_count++] = *task;
 					} else {
-						for (i32 i = 0; i < batch.task_count; ++i) {
-							load_tile_task_t* task = batch.tile_tasks + i;
-							tile_cache_cancel_decode(image, task->plane, task->level, task->tile_index);
-						}
+						console_print_verbose("tile_loader_submit_requests(): tile already requested by another thread (%d)\n", task->tile_index);
 					}
-					first_tile += candidate_count;
 				}
+				if (batch.task_count == 0) {
+					first_tile += candidate_count;
+					continue;
+				}
+				bool submitted = image->backend == IMAGE_BACKEND_SSI
+					? ssi_pending_enqueue(&batch)
+					: thread_pool_submit_task_to_group(&global_thread_pool,
+					                                   batch.tile_tasks[0].task_group,
+					                                   load_func, &batch, sizeof(batch));
+				if (submitted) {
+					++work_items_submitted;
+					for (i32 i = 0; i < batch.task_count; ++i) {
+						load_tile_task_t* task = batch.tile_tasks + i;
+						if (image->backend != IMAGE_BACKEND_SSI) {
+							atomic_add(&image->refcount, task->refcount_to_decrement);
+						}
+						++tile_loads_submitted;
+					}
+				} else {
+					for (i32 i = 0; i < batch.task_count; ++i) {
+						load_tile_task_t* task = batch.tile_tasks + i;
+						tile_cache_cancel_decode(image, task->plane, task->level, task->tile_index);
+					}
+				}
+				first_tile += candidate_count;
 			}
 		} else {
 			for (i32 i = 0; i < tiles_to_load; ++i) {

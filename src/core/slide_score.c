@@ -657,12 +657,6 @@ static void slide_score_read_api_key(char* buffer, size_t buffer_size) {
     slide_score_read_api_key_file(leaf_filename, buffer, buffer_size);
 }
 
-void slide_score_remote_image_destroy(slide_score_remote_image_t* remote) {
-	if (!remote) return;
-	free(remote->case_slides);
-	remote->case_slides = NULL;
-	remote->case_slide_count = 0;
-}
 
 static bool slide_score_require_api_key(slide_score_remote_image_t* remote) {
 	if (!remote || !remote->client.api_key[0]) {
@@ -1115,16 +1109,3 @@ bool slide_score_try_open_uri(app_state_t* app_state, const char* uri, const cha
     return true;
 }
 
-void slide_score_get_image_metadata(slide_score_client_t* ss, i32 image_id) {
-    char image_id_str[16];
-    snprintf(image_id_str, sizeof(image_id_str), "%d", image_id);
-    const char* names[] = {"imageId"};
-    const char* values[] = {image_id_str};
-    web_api_call_t call = slide_score_build_api_call(ss, SLIDE_SCORE_API_GET_IMAGE_METADATA, names, values, 1);
-    if (call.is_valid) {
-//        do_http_request()
-    }
-
-    char url[512];
-//    snprintf("https://")
-}

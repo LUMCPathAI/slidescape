@@ -262,7 +262,6 @@ LPSTR* WINAPI CommandLineToArgvA(LPSTR lpCmdline, int* numargs)
 	return argv;
 }
 
-#if !IS_SERVER
 u8* platform_alloc(size_t size) {
 	u8* result = (u8*) VirtualAlloc(0, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 	if (!result) {
@@ -271,7 +270,6 @@ u8* platform_alloc(size_t size) {
 	}
 	return result;
 }
-#endif
 
 void message_box(window_handle_t window, const char* message) {
 	MessageBoxA(window, message, APP_TITLE, MB_ICONERROR);

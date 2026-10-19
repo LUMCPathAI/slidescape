@@ -542,8 +542,9 @@ else()
     list(APPEND SLIDESCAPE_NONGUI_BASE_FILES src/platform/linux_utils.c)
 endif()
 add_library(slidescape_nongui STATIC ${SLIDESCAPE_NONGUI_BASE_FILES})
+# Shared code calls logging functions supplied by the linking application or tests.
 target_compile_definitions(slidescape_nongui PRIVATE
-        IS_SERVER=0
+        USE_CONSOLE_LOGGING=1
         ISYNTAX_JPEG_DECODER_USE_LIBJPEG=1
 )
 target_link_libraries(slidescape_nongui PUBLIC slidescape_openjpeg)
@@ -557,7 +558,6 @@ set(VIEWER_SOURCE_FILES
         platform/presenter_imgui_opengl_cached.cpp
         core/viewer.cpp
         core/viewer_io_file.cpp
-        core/viewer_io_remote.c
         core/viewer_options.c
         core/renderer_opengl.c
         core/renderer_opengl_shader.c
@@ -731,7 +731,11 @@ target_link_libraries(slidescape PRIVATE slidescape_nongui slidescape_jpeg slide
 if (WIN32)
     target_link_libraries(slidescape_console PRIVATE slidescape_nongui slidescape_jpeg slidescape_tls)
 endif()
-target_compile_definitions(slidescape PRIVATE IS_SERVER=0)
+# Route viewer logs through console.cpp; tools use stdio by default.
+target_compile_definitions(slidescape PRIVATE USE_CONSOLE_LOGGING=1)
+if (WIN32)
+    target_compile_definitions(slidescape_console PRIVATE USE_CONSOLE_LOGGING=1)
+endif()
 
 
 
@@ -784,7 +788,6 @@ if (NOT(APPLE AND SLIDESCAPE_ARCHIVE_USE_COMMONCRYPTO))
 endif()
 add_library(slidescape_archive_core STATIC ${SLIDESCAPE_ARCHIVE_CORE_FILES})
 target_include_directories(slidescape_archive_core PUBLIC src/archive)
-target_compile_definitions(slidescape_archive_core PRIVATE IS_SERVER=1)
 target_link_libraries(slidescape_archive_core PRIVATE slidescape_sqlite)
 if (APPLE AND SLIDESCAPE_ARCHIVE_USE_COMMONCRYPTO)
     find_library(SECURITY_FRAMEWORK Security)
@@ -805,7 +808,6 @@ if (BUILD_SLIDESCAPE_ARCHIVE)
             src/archive/archive_http.c
             src/archive/archive_support.c
             )
-    target_compile_definitions(slidescape_archive PRIVATE IS_SERVER=1)
     target_link_libraries(slidescape_archive PRIVATE slidescape_archive_core slidescape_nongui slidescape_jpeg)
     slidescape_enable_process_allocator(slidescape_archive)
     if (WIN32)
@@ -821,7 +823,6 @@ add_executable(dicom_dict_gen
         src/third_party/yxml.c
         src/third_party/lz4.c
         )
-target_compile_definitions(dicom_dict_gen PRIVATE IS_SERVER=1)
 slidescape_enable_process_allocator(dicom_dict_gen)
 
 include(CTest)

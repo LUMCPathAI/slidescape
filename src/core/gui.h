@@ -97,7 +97,6 @@ extern bool show_demo_window;
 extern bool show_debugging_window;
 extern bool show_image_options_window;
 extern bool show_focus_window INIT(= true);
-extern bool show_open_remote_window;
 extern bool show_open_uri_window;
 extern bool show_dicomweb_archive_window;
 extern bool show_layers_window;
@@ -118,9 +117,6 @@ extern bool load_next_image_as_overlay;
 extern i32 layers_window_selected_image_index; // TODO: make this a property of scene_t?
 extern gui_modal_popup_t* gui_modal_stack;
 extern float global_progress_bar_test_progress;
-extern char remote_hostname[64] INIT(= "localhost");
-extern char remote_port[64] INIT(= "2000");
-extern char remote_filename[128] INIT(= "sample.tiff");
 extern char remote_uri[1024];
 #ifdef __cplusplus
 extern ImFont* global_main_font;

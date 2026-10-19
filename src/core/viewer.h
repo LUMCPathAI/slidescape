@@ -310,8 +310,6 @@ void set_annotation_directory(app_state_t* app_state, const char* path);
 void slide_score_load_tile_batch_func(i32 logical_thread_index, void* userdata);
 void ssi_load_tile_batch_func(i32 logical_thread_index, void* userdata);
 
-// viewer_io_remote.cpp
-void tiff_load_tile_batch_func(i32 logical_thread_index, void* userdata);
 
 // viewer_options.cpp
 void viewer_init_options(app_state_t* app_state);

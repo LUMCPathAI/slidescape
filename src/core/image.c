@@ -30,6 +30,16 @@
 #include "tile_cache.h"
 #include "tile_buffer_pool.h"
 
+// Image-owned metadata cleanup is shared with nongui consumers.
+void slide_score_remote_image_destroy(slide_score_remote_image_t* remote) {
+	if (!remote) {
+		return;
+	}
+	free(remote->case_slides);
+	remote->case_slides = NULL;
+	remote->case_slide_count = 0;
+}
+
 static void (*ssi_close_callback)(ssi_remote_image_t* remote);
 
 void image_set_ssi_close_callback(void (*callback)(ssi_remote_image_t* remote)) {
@@ -171,7 +181,6 @@ bool init_image_from_tiff(image_t* image, bool is_overlay, image_t* parent_image
     image->clip_rects[0] = RECT2F(0.0f, 0.0f, image->width_in_um, image->height_in_um);
     image->clip_rect_count = 1;
 
-    // TODO: fix code duplication with tiff_deserialize()
     if (tiff->level_image_ifd_count > 0 && tiff->main_image_ifd->tile_width) {
 
         if (tiff->main_image_ifd->is_tiled) {
@@ -513,7 +522,6 @@ bool init_image_from_isyntax(image_t* image, bool is_overlay) {
         }
     }
 
-    // TODO: fix code duplication with tiff_deserialize()
     if (wsi_image->level_count > 0 && isyntax->tile_width) {
 
         memset(image->level_images, 0, sizeof(image->level_images));
@@ -647,7 +655,6 @@ bool init_image_from_dicom(image_t* image, bool is_overlay) {
 	image->clip_rects[0] = RECT2F(0.0f, 0.0f, image->width_in_um, image->height_in_um);
 	image->clip_rect_count = 1;
 
-    // TODO: fix code duplication with tiff_deserialize()
     if (dicom->wsi.instance_count > 0 && image->tile_width) {
 
         memset(image->level_images, 0, sizeof(image->level_images));
@@ -900,7 +907,6 @@ bool init_image_from_mrxs(image_t* image, bool is_overlay) {
 	image->clip_rects[0] = RECT2F(0.0f, 0.0f, image->width_in_um, image->height_in_um);
 	image->clip_rect_count = 1;
 
-	// TODO: fix code duplication with tiff_deserialize()
 	if (mrxs->level_count > 0 && image->tile_width) {
 
 		memset(image->level_images, 0, sizeof(image->level_images));

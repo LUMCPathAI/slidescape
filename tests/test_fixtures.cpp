@@ -1016,13 +1016,6 @@ TEST_CASE("open TIFF fixtures through Slidescape TIFF reader") {
 	}
 }
 
-TEST_CASE("TODO: TIFF fixture metadata serializes and deserializes" * doctest::skip()) {
-	// This currently does not round-trip the cropped TIFF fixture metadata correctly:
-	// deserialized.level_image_ifd_count differs from the original and cleanup trips ltalloc
-	// guard checks. Keep this as a regression target once tiff_serialize/tiff_deserialize
-	// semantics are clarified or fixed.
-}
-
 TEST_CASE("open DICOM WSI fixtures through Slidescape DICOM reader") {
 	fixture_manifest_t* manifest = fixture_manifest();
 	bool checked_any = false;
