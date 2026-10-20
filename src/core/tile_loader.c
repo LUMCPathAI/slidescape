@@ -22,6 +22,7 @@
 #include "dicom_wsi.h"
 #include "mrxs.h"
 #include "tile_cache.h"
+#include "profiler.h"
 #include "tiff.h"
 
 static work_queue_callback_t* slide_score_load_tile_batch_func;
@@ -114,6 +115,29 @@ void tile_loader_cancel_stale_ssi_pending(image_t* image, i32 viewer_generation)
 	}
 }
 
+static void tile_loader_profiled_batch(i32 logical_thread_index, void* userdata) {
+	load_tile_task_batch_t* batch = (load_tile_task_batch_t*)userdata;
+	load_tile_task_t* task = &batch->tile_tasks[0];
+	work_queue_callback_t* callback = NULL;
+	switch (task->image->backend) {
+		case IMAGE_BACKEND_SLIDE_SCORE: {
+			callback = slide_score_load_tile_batch_func;
+		} break;
+		case IMAGE_BACKEND_DICOMWEB: {
+			callback = dicomweb_load_tile_batch_func;
+		} break;
+		case IMAGE_BACKEND_SSI: {
+			callback = ssi_load_tile_batch_callback;
+		} break;
+		default: {
+			ASSERT(!"unexpected tile batch backend");
+		} break;
+	}
+	profiler_worker_begin(task->profile_capture_id, task->profile_queued_clock);
+	callback(logical_thread_index, userdata);
+	profiler_worker_end();
+}
+
 static void ssi_pending_pump(i32 logical_thread_index, void* userdata) {
 	for (;;) {
 		load_tile_task_batch_t batch = {0};
@@ -135,7 +159,7 @@ static void ssi_pending_pump(i32 logical_thread_index, void* userdata) {
 			ssi_pending_queue.batches[--ssi_pending_queue.batch_count];
 		platform_mutex_unlock(&ssi_pending_queue.mutex);
 
-		ssi_load_tile_batch_callback(logical_thread_index, &batch);
+		tile_loader_profiled_batch(logical_thread_index, &batch);
 		task_group_end(batch.tile_tasks[0].task_group);
 	}
 }
@@ -304,7 +328,10 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 					u32 demand_flags = task->need_gpu_residency ? TILE_CACHE_DEMAND_GPU_RESIDENCY : 0;
 					demand_flags |= task->need_cpu_residency ? TILE_CACHE_DEMAND_CPU_RESIDENCY : 0;
 					if (tile_cache_try_begin_decode(image, task->plane, task->level, task->tile_index, demand_flags, task->priority, task->generation)) {
-						batch.tile_tasks[batch.task_count++] = *task;
+						load_tile_task_t* submitted_task = &batch.tile_tasks[batch.task_count++];
+						*submitted_task = *task;
+						submitted_task->profile_capture_id = profiler_capture_id();
+						submitted_task->profile_queued_clock = submitted_task->profile_capture_id ? get_clock() : 0;
 					} else {
 						console_print_verbose("tile_loader_submit_requests(): tile already requested by another thread (%d)\n", task->tile_index);
 					}
@@ -317,7 +344,7 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 					? ssi_pending_enqueue(&batch)
 					: thread_pool_submit_task_to_group(&global_thread_pool,
 					                                   batch.tile_tasks[0].task_group,
-					                                   load_func, &batch, sizeof(batch));
+					                                   tile_loader_profiled_batch, &batch, sizeof(batch));
 				if (submitted) {
 					++work_items_submitted;
 					for (i32 i = 0; i < batch.task_count; ++i) {
@@ -338,6 +365,8 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 		} else {
 			for (i32 i = 0; i < tiles_to_load; ++i) {
 				load_tile_task_t task = wishlist[i];
+				task.profile_capture_id = profiler_capture_id();
+				task.profile_queued_clock = task.profile_capture_id ? get_clock() : 0;
 				u32 demand_flags = task.need_gpu_residency ? TILE_CACHE_DEMAND_GPU_RESIDENCY : 0;
 				demand_flags |= task.need_cpu_residency ? TILE_CACHE_DEMAND_CPU_RESIDENCY : 0;
 
@@ -382,7 +411,7 @@ i32 tile_loader_submit_requests(image_t* image, load_tile_task_t* wishlist, i32 
 	return tile_loads_submitted;
 }
 
-void load_tile_func(i32 logical_thread_index, void* userdata) {
+static void load_tile_impl(i32 logical_thread_index, void* userdata) {
 	load_tile_task_t* task = (load_tile_task_t*) userdata;
 	image_t* image = task->image;
 
@@ -542,4 +571,11 @@ void load_tile_func(i32 logical_thread_index, void* userdata) {
 	// NOTE: we guarantee existence of image_t until the jobs submitted from the main thread are done.
 	// However, we will NOT wait for the completion queues to also be finished (usually the responsibility of the main thread).
 	atomic_subtract(&image->refcount, task->refcount_to_decrement);
+}
+
+void load_tile_func(i32 logical_thread_index, void* userdata) {
+	load_tile_task_t* task = (load_tile_task_t*)userdata;
+	profiler_worker_begin(task->profile_capture_id, task->profile_queued_clock);
+	load_tile_impl(logical_thread_index, userdata);
+	profiler_worker_end();
 }

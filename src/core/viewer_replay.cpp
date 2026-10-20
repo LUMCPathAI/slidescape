@@ -247,7 +247,7 @@ void viewer_replay_apply_camera(app_state_t* app) {
 }
 
 void viewer_replay_after_navigation(app_state_t* app) {
-	if (!recording && !profiler_is_capturing()) {
+	if (!recording && !profiler_is_collecting()) {
 		return;
 	}
 	scene_t* scene = &app->scene;
@@ -278,7 +278,7 @@ void viewer_replay_after_navigation(app_state_t* app) {
 		memcpy(recorded_camera, camera, sizeof(camera));
 		have_recorded_camera = true;
 	}
-	if (!profiler_is_capturing()) {
+	if (!profiler_is_collecting()) {
 		return;
 	}
 	if (profiler_memory_sample_due() || metrics.image_count != (u32)arrlen(app->loaded_images)) {

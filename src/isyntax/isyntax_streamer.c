@@ -32,6 +32,7 @@
 
 #define ISYNTAX_STREAMER_IMPL
 #include "isyntax_streamer.h"
+#include "profiler.h"
 
 static bool allow_load_tile_on_worker_threads = true; // disable to load tiles only on the main thread (e.g. for debugging)
 
@@ -340,7 +341,7 @@ typedef struct isyntax_load_tile_task_t {
 	i32 tile_index;
 } isyntax_load_tile_task_t;
 
-void isyntax_load_tile_task_func(i32 logical_thread_index, void* userdata) {
+static void isyntax_load_tile_task_impl(i32 logical_thread_index, void* userdata) {
 	isyntax_load_tile_task_t* task = (isyntax_load_tile_task_t*) userdata;
     isyntax_t* isyntax = task->streamer.isyntax;
 	size_t tile_size = (size_t)isyntax->tile_width * isyntax->tile_height * sizeof(u32);
@@ -358,6 +359,14 @@ void isyntax_load_tile_task_func(i32 logical_thread_index, void* userdata) {
 							  task->streamer.isyntax->tile_width, task->streamer.isyntax->tile_height);
 	}
 	atomic_decrement(&task->streamer.isyntax->refcount); // release
+}
+
+void isyntax_load_tile_task_func(i32 logical_thread_index, void* userdata) {
+	profiler_worker_begin(profiler_capture_id(), 0);
+	i64 profile_start = profiler_worker_decode_begin();
+	isyntax_load_tile_task_impl(logical_thread_index, userdata);
+	profiler_worker_decode_end(profile_start);
+	profiler_worker_end();
 }
 
 void isyntax_begin_load_tile(isyntax_streamer_t* streamer, i32 scale, i32 tile_x, i32 tile_y) {
@@ -466,7 +475,11 @@ typedef struct isyntax_decompress_h_coeff_for_tile_task_t {
 
 void isyntax_decompress_h_coeff_for_tile_task_func(i32 logical_thread_index, void* userdata) {
 	isyntax_decompress_h_coeff_for_tile_task_t* task = (isyntax_decompress_h_coeff_for_tile_task_t*) userdata;
+	profiler_worker_begin(profiler_capture_id(), 0);
+	i64 profile_start = profiler_worker_decode_begin();
 	isyntax_decompress_h_coeff_for_tile(task->isyntax, task->wsi, task->scale, task->tile_x, task->tile_y);
+	profiler_worker_decode_end(profile_start);
+	profiler_worker_end();
 	atomic_decrement(&task->isyntax->refcount); // release
 }
 
@@ -1124,6 +1137,7 @@ void isyntax_stream_image_tiles(isyntax_streamer_t* streamer, isyntax_t* isyntax
 }
 
 void isyntax_stream_image_tiles_func(i32 logical_thread_index, void* userdata) {
+	profiler_worker_begin(profiler_capture_id(), 0);
 
 	isyntax_streamer_t* tile_streamer;
 	bool need_repeat = false;
@@ -1138,6 +1152,7 @@ void isyntax_stream_image_tiles_func(i32 logical_thread_index, void* userdata) {
 			is_tile_streamer_frame_boundary_passed = false;
 		}
 	} while (need_repeat);
+	profiler_worker_end();
 	is_tile_stream_task_in_progress = false;
 	atomic_decrement(&tile_streamer->isyntax->refcount); // release
 }

@@ -23,6 +23,7 @@
 #include "mathutils.h"
 #include "tile_buffer_pool.h"
 #include "tile_loader.h"
+#include "profiler.h"
 
 typedef enum tile_cache_completion_event_kind_t {
 	TILE_CACHE_COMPLETION_EVENT_RESULT = 1,
@@ -53,6 +54,8 @@ typedef struct tile_cache_tile_t {
 	i64 last_cpu_access_time;
 	i64 last_gpu_access_time;
 	i64 last_retryable_failure_time;
+	u64 profile_capture_id;
+	i64 profile_request_clock;
 } tile_cache_tile_t;
 
 typedef struct tile_cache_entry_t {
@@ -741,6 +744,8 @@ bool tile_cache_try_begin_decode(image_t* image, i32 plane, i32 level, i32 tile_
 		platform_mutex_unlock(&cache->lock);
 		return false;
 	}
+	tile->profile_capture_id = profiler_capture_id();
+	tile->profile_request_clock = tile->profile_capture_id ? get_clock() : 0;
 	tile->decode_in_flight = true;
 	tile->request_state = TILE_CACHE_IN_FLIGHT;
 	tile->demand_mask |= demand_flags;
@@ -764,6 +769,8 @@ bool tile_cache_try_begin_upload(image_t* image, i32 plane, i32 level, i32 tile_
 		platform_mutex_unlock(&cache->lock);
 		return false;
 	}
+	tile->profile_capture_id = profiler_capture_id();
+	tile->profile_request_clock = tile->profile_capture_id ? get_clock() : 0;
 	tile->upload_pending = true;
 	tile->upload_cpu_pinned = true;
 	++tile->cpu_pin_count;
@@ -857,6 +864,9 @@ void tile_cache_store_gpu_texture(image_t* image, i32 plane, i32 level, i32 tile
 	if (!tile) {
 		platform_mutex_unlock(&cache->lock);
 		return;
+	}
+	if (!tile->gpu_resident) {
+		profiler_record_tile_ready(tile->profile_capture_id, tile->profile_request_clock);
 	}
 	tile->texture = texture;
 	tile->gpu_resident = true;
@@ -1148,17 +1158,26 @@ wishlist_full:
 	return tile_loader_submit_requests(image, wishlist, tiles_to_load);
 }
 
-renderer_texture_handle_t tile_cache_get_focus_texture(image_t* image, i32 level, i32 tile_index) {
+renderer_texture_handle_t tile_cache_get_focus_texture(image_t* image, i32 level, i32 tile_index, bool profile_target_level) {
 	tile_cache_t* cache = image->tile_cache;
-	if (!cache || !image_level_index_ready(image, 0, level) ||
-	    get_tile_from_tile_index(image, level, tile_index)->is_empty) {
+	if (!cache || !image_level_index_ready(image, 0, level)) {
+		return 0;
+	}
+	if (get_tile_from_tile_index(image, level, tile_index)->is_empty) {
+		if (profile_target_level) {
+			profiler_record_visible_tile(PROFILER_TILE_EMPTY);
+		}
 		return 0;
 	}
 	platform_mutex_lock(&cache->lock);
 	i32 selected = image->selected_plane;
 	tile_cache_tile_t* tile = tile_cache_find_tile_locked(cache, selected, level, tile_index);
 	renderer_texture_handle_t texture = tile && tile->gpu_resident ? tile->texture : 0;
-	if (texture) tile->last_gpu_access_time = get_clock();
+	tile_cache_tile_t* drawn_tile = texture ? tile : NULL;
+	bool selected_ready = texture != 0;
+	if (texture) {
+		tile->last_gpu_access_time = get_clock();
+	}
 	/* Adjacent planes only fill loading gaps, never terminal failures or known holes. */
 	if (!texture && selected > 0 && image->backend == IMAGE_BACKEND_MRXS &&
 	    (!tile || (tile->request_state != TILE_CACHE_FAILED && tile->request_state != TILE_CACHE_EMPTY))) {
@@ -1174,10 +1193,32 @@ renderer_texture_handle_t tile_cache_get_focus_texture(image_t* image, i32 level
 			bool preferred_side = (p - selected) * image->plane_approach_direction > 0;
 			if (distance < best_distance || (distance == best_distance && preferred_side &&
 			    (best_plane - selected) * image->plane_approach_direction <= 0)) {
-				texture = candidate->texture; best_distance = distance; best_plane = p;
+				texture = candidate->texture;
+				best_distance = distance;
+				best_plane = p;
+				drawn_tile = candidate;
 				candidate->last_gpu_access_time = get_clock();
 			}
 		}
+	}
+	if (profile_target_level) {
+		profiler_visible_tile_state_t state = PROFILER_TILE_MISSING;
+		if (selected_ready) {
+			state = PROFILER_TILE_READY;
+		} else if (texture) {
+			state = PROFILER_TILE_ADJACENT_PLANE;
+		} else if (tile && tile->request_state == TILE_CACHE_FAILED) {
+			state = PROFILER_TILE_FAILED;
+		} else if (tile && tile->request_state == TILE_CACHE_EMPTY) {
+			state = PROFILER_TILE_EMPTY;
+		}
+		profiler_record_visible_tile(state);
+	}
+	if (drawn_tile && drawn_tile->profile_request_clock) {
+		// This lookup is used by the draw loop. Count once, including coarser or
+		// adjacent-plane draws; stencil occlusion and scanout are not measured.
+		profiler_record_tile_draw(drawn_tile->profile_capture_id, drawn_tile->profile_request_clock);
+		drawn_tile->profile_request_clock = 0;
 	}
 	platform_mutex_unlock(&cache->lock);
 	return texture;

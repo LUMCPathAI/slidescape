@@ -1004,8 +1004,10 @@ bool win32_process_pending_messages(input_t* input, HWND window, bool allow_idli
 			 * Wake occasionally even without input so background maintenance such as
 			 * remote-session keepalives is not suspended while the window is idle.
 			 */
+			profiler_begin(PROFILER_SECTION_INPUT_WAIT);
 			DWORD wait_result = MsgWaitForMultipleObjectsEx(
 				0, NULL, 10000, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+			profiler_end(PROFILER_SECTION_INPUT_WAIT);
 			if (wait_result == WAIT_FAILED) {
 				win32_diagnostic("MsgWaitForMultipleObjectsEx");
 				fatal_error();
@@ -1403,7 +1405,11 @@ static void win32_render_frame(app_state_t* app_state, input_t* input, float del
 
 	app_state->last_frame_start = get_clock();
 
-	profiler_begin(PROFILER_SECTION_FRAME);
+	profiler_frame_t* profile_frame = &global_profiler.frames[global_profiler.current_frame];
+	if (!profile_frame->sections[PROFILER_SECTION_FRAME].active_start) {
+		profiler_new_frame();
+		profiler_begin(PROFILER_SECTION_FRAME);
+	}
 
 	profiler_begin(PROFILER_SECTION_GUI_NEW_FRAME);
 	win32_gui_new_frame(app_state);
@@ -1982,6 +1988,7 @@ int main() {
 		delta_t = ATMOST(2.0f / 60.0f, delta_t); // prevent physics overshoot at lag spikes
 
 		profiler_new_frame();
+		profiler_begin(PROFILER_SECTION_FRAME);
 
 		profiler_begin(PROFILER_SECTION_INPUT);
 		bool did_idle = win32_process_input(app_state);

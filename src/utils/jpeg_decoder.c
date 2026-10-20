@@ -1,4 +1,5 @@
 #include "common.h"
+#include "profiler.h"
 #include "tile_buffer_pool.h"
 
 #ifdef TARGET_EMSCRIPTEN
@@ -255,18 +256,27 @@ u8* jpeg_decode_image_bounded(u8* input, u32 input_size,
 		i32 expected_width, i32 expected_height, size_t maximum_output_size,
 		i32* width, i32* height, i32* channels) {
 	if (expected_width <= 0 || expected_height <= 0) return NULL;
-	return jpeg_decode_image_internal(input, input_size, width, height, channels,
+	i64 profile_start = profiler_worker_decode_begin();
+	u8* result = jpeg_decode_image_internal(input, input_size, width, height, channels,
 		JCS_UNKNOWN, expected_width, expected_height, maximum_output_size);
+	profiler_worker_decode_end(profile_start);
+	return result;
 }
 
 u8* jpeg_decode_image(u8* input, u32 input_size, i32* width, i32* height, i32* channels) {
-	return jpeg_decode_image_internal(input, input_size, width, height, channels,
+	i64 profile_start = profiler_worker_decode_begin();
+	u8* result = jpeg_decode_image_internal(input, input_size, width, height, channels,
 		JCS_UNKNOWN, 0, 0, SIZE_MAX);
+	profiler_worker_decode_end(profile_start);
+	return result;
 }
 
 u8* jpeg_decode_rgb_image(u8* input, u32 input_size, i32* width, i32* height, i32* channels) {
-	return jpeg_decode_image_internal(input, input_size, width, height, channels,
+	i64 profile_start = profiler_worker_decode_begin();
+	u8* result = jpeg_decode_image_internal(input, input_size, width, height, channels,
 		JCS_RGB, 0, 0, SIZE_MAX);
+	profiler_worker_decode_end(profile_start);
+	return result;
 }
 
 u8* jpeg_decode_ndpi_image(u8* input_ptr, u32 input_length, i32 width, i32 height, i32 *channels_in_file) {

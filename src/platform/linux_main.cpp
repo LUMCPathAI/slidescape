@@ -997,6 +997,7 @@ int main(int argc, const char** argv)
         // - When io.WantCaptureKeyboard is true, do not dispatch keyboard input data to your main application.
         // Generally you may always pass all inputs to dear imgui, and hide them from your application based on those two flags.
 	    profiler_begin(PROFILER_SECTION_INPUT);
+        profiler_begin(PROFILER_SECTION_PLATFORM_EVENTS);
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL2_ProcessEvent(&event);
@@ -1039,7 +1040,10 @@ int main(int argc, const char** argv)
 	    }
 #endif
 
+		profiler_end(PROFILER_SECTION_PLATFORM_EVENTS);
+		profiler_begin(PROFILER_SECTION_INPUT_STATE);
         linux_process_input();
+		profiler_end(PROFILER_SECTION_INPUT_STATE);
 	    profiler_end(PROFILER_SECTION_INPUT);
 
 	    if (was_key_pressed(curr_input, KEY_F4) && curr_input->keyboard.key_alt.down) {

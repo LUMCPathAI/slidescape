@@ -16,6 +16,7 @@
   along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "profiler.h"
 #include "common.h"
 #include "dicom.h"
 #include "dicom_wsi.h"
@@ -845,6 +846,7 @@ u8* dicom_wsi_decode_tile_to_bgra(dicom_series_t* dicom_series, i32 instance_ind
 		return NULL;
 	}
 
+	i64 profile_decode_start = profiler_worker_decode_begin();
     u8* result = NULL;
 	if (!instance->is_pixel_data_encapsulated) {
 		result = dicom_wsi_decode_native_tile_to_bgra(instance, tile_data, bytes_read);
@@ -901,6 +903,7 @@ u8* dicom_wsi_decode_tile_to_bgra(dicom_series_t* dicom_series, i32 instance_ind
 			                    instance->transfer_syntax_uid.value);
 		}
 	}
+	profiler_worker_decode_end(profile_decode_start);
     release_temp_memory(&temp);
 	return result;
 }

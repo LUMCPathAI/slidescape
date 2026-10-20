@@ -1196,7 +1196,7 @@ TEST_CASE("MRXS indexing is one high priority job and region reads wait for it")
 		CHECK_FALSE(atomic_load_acquire(&image->indexing_finished));
 		CHECK(image->level_images[0].tiles == nullptr);
 		CHECK_FALSE(tile_cache_try_begin_decode(image, 0, 0, 0, 0, 0, 0));
-		CHECK(tile_cache_get_focus_texture(image, 0, 0) == 0);
+		CHECK(tile_cache_get_focus_texture(image, 0, 0, false) == 0);
 		u8 pixels[16] = {};
 		CHECK(image_read_region(image, 0, 0, 0, 0, 2, 2, pixels, PIXEL_FORMAT_U8_BGRA));
 		CHECK(atomic_load_acquire(&image->indexing_finished));

@@ -25,6 +25,7 @@
   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+#include "profiler.h"
 #include "common.h"
 #include "win32_utils.h"
 
@@ -177,7 +178,9 @@ size_t file_handle_read_at_offset(void* dest, file_handle_t file_handle, u64 off
 		init_thread_memory(&global_system_info);
 	}
 	ASSERT(threadlocal_thread_memory != NULL);
+	i64 profile_start = profiler_worker_io_begin();
 	size_t bytes_read = win32_overlapped_read(threadlocal_thread_memory, file_handle, dest, bytes_to_read, offset);
+	profiler_worker_io_end(profile_start, bytes_read);
 	return bytes_read;
 }
 

@@ -319,6 +319,7 @@ static bool viewer_process_loaded_tile(app_state_t* app_state, image_t* image, t
 	}
 
 	if (action.should_upload && action.upload_pixels) {
+		profiler_begin(PROFILER_SECTION_TEXTURE_UPLOAD);
 		if (image->backend == IMAGE_BACKEND_SSI &&
 		    atomic_compare_exchange(&image->ssi.first_tile_displayed_reported, 1, 0)) {
 			console_print_verbose(
@@ -344,6 +345,7 @@ static bool viewer_process_loaded_tile(app_state_t* app_state, image_t* image, t
 			transfer_state->level = task->level;
 			transfer_state->tile_index = task->tile_index;
 		}
+		profiler_end(PROFILER_SECTION_TEXTURE_UPLOAD);
 		if (action.release_upload_cpu_pin) {
 			tile_cache_release_upload_cpu_pin(image, task->plane, task->level, task->tile_index);
 		}
@@ -364,7 +366,9 @@ void viewer_process_completion_queue(app_state_t* app_state) {
 		for (i32 transfer_index = 0; transfer_index < COUNT(app_state->pixel_transfer_states); ++transfer_index) {
 			pixel_transfer_state_t* transfer_state = app_state->pixel_transfer_states + transfer_index;
 			if (transfer_state->need_finalization) {
+				profiler_begin(PROFILER_SECTION_TEXTURE_FINALIZE);
 				renderer_finalize_texture_upload(transfer_state);
+				profiler_end(PROFILER_SECTION_TEXTURE_FINALIZE);
 				if (transfer_state->image) {
 					tile_cache_store_gpu_texture(transfer_state->image, transfer_state->plane, transfer_state->level, transfer_state->tile_index, transfer_state->texture);
 					transfer_state->image = NULL;
@@ -714,6 +718,10 @@ void update_and_render_image(app_state_t* app_state, image_t* image) {
 			i32 highest_level_to_draw = ATMOST(highest_visible_scale, global_highest_scale_to_render);
 			for (i32 level = lowest_level_to_draw; level <= highest_level_to_draw; ++level) {
 				level_image_t *drawn_level = image->level_images + level;
+				if (level == lowest_level_to_draw &&
+				    !image_level_index_ready(image, image->selected_plane, level)) {
+					profiler_record_unready_level();
+				}
 				if (!drawn_level->exists || (drawn_level->missing_planes & (UINT64_C(1) << image->selected_plane)) ||
 				    !image_level_index_ready(image, 0, level)) {
 					continue;
@@ -737,7 +745,7 @@ void update_and_render_image(app_state_t* app_state, image_t* image) {
 					for (i32 tile_x = visible_tiles.min.x; tile_x < visible_tiles.max.x; ++tile_x) {
 
 						tile_t *tile = get_tile(drawn_level, tile_x, tile_y);
-						renderer_texture_handle_t texture = tile_cache_get_focus_texture(image, level, tile->tile_index);
+						renderer_texture_handle_t texture = tile_cache_get_focus_texture(image, level, tile->tile_index, level == lowest_level_to_draw);
 						if (texture) {
 							tile->time_last_drawn = app_state->frame_counter;
 
@@ -1031,6 +1039,7 @@ void recount_enabled_images(app_state_t* app_state) {
 }
 
 void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client_width, i32 client_height, float delta_time) {
+	profiler_set_live_enabled(show_profiler_window && !global_profiler.paused);
 
 	// Release the temporary memory that was allocated the previous frame.
 	app_state->temp_arena.used = 0;
@@ -1815,7 +1824,9 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 		// Render everything at once
 		renderer_clear_render_target(app_state->clear_color, client_width, client_height);
 		image_t* image = app_state->loaded_images[app_state->enabled_image_indices[0]];
+		profiler_begin(PROFILER_SECTION_RENDER_IMAGE);
 		update_and_render_image(app_state, image);
+		profiler_end(PROFILER_SECTION_RENDER_IMAGE);
 	} else {
 		// We are rendering the scene in two passes.
 		// 1: render to framebuffer

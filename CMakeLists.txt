@@ -503,6 +503,7 @@ set(SLIDESCAPE_NONGUI_BASE_FILES
         src/utils/crc32.c
         src/utils/block_allocator.c
         src/utils/timerutils.c
+        src/utils/profiler.c
         src/platform/platform_mutex.c
         src/core/image.c
         src/core/image_resize.c
@@ -545,10 +546,14 @@ endif()
 add_library(slidescape_nongui STATIC ${SLIDESCAPE_NONGUI_BASE_FILES})
 # Shared code calls logging functions supplied by the linking application or tests.
 target_compile_definitions(slidescape_nongui PRIVATE
+        SLIDESCAPE_BUILD_CONFIGURATION="$<CONFIG>"
         USE_CONSOLE_LOGGING=1
         ISYNTAX_JPEG_DECODER_USE_LIBJPEG=1
 )
 target_link_libraries(slidescape_nongui PUBLIC slidescape_openjpeg)
+if (WIN32)
+    target_link_libraries(slidescape_nongui PUBLIC psapi)
+endif()
 
 
 
@@ -586,7 +591,6 @@ set(VIEWER_SOURCE_FILES
         imgui/misc/freetype/imgui_freetype.cpp
         imgui/imgui_widget_flamegraph.cpp
         utils/triangulate.c
-        utils/profiler.c
         )
 if (WIN32)
     set(VIEWER_SOURCE_FILES ${VIEWER_SOURCE_FILES}

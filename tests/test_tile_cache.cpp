@@ -634,29 +634,29 @@ TEST_CASE("z-stack fallback uses nearest physical plane and arrival direction on
 	tile_cache_store_gpu_texture(image, 0, 0, 0, 100);
 	tile_cache_store_gpu_texture(image, 1, 0, 0, 101);
 	tile_cache_store_gpu_texture(image, 3, 0, 0, 103);
-	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 100);
+	CHECK(tile_cache_get_focus_texture(image, 0, 0, false) == 100);
 	image_select_plane(image, 1); image_select_plane(image, 2);
-	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 101);
+	CHECK(tile_cache_get_focus_texture(image, 0, 0, false) == 101);
 	image_select_plane(image, 3); image_select_plane(image, 2);
-	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 103);
+	CHECK(tile_cache_get_focus_texture(image, 0, 0, false) == 103);
 	image->mrxs.planes[1].offset_um = -0.1f; // Distance wins over the arrival side.
-	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 101);
+	CHECK(tile_cache_get_focus_texture(image, 0, 0, false) == 101);
 	tile_cache_store_gpu_texture(image, 2, 0, 0, 102);
-	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 102);
+	CHECK(tile_cache_get_focus_texture(image, 0, 0, false) == 102);
 	CHECK(tile_cache_take_gpu_texture(image, 2, 0, 0) == 102);
 	image->mrxs.planes[2].tiles[0]->hier_entry.length = 0;
-	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 101); // Missing plane data is discovered on load.
+	CHECK(tile_cache_get_focus_texture(image, 0, 0, false) == 101); // Missing plane data is discovered on load.
 	tile_cache_result_t missing = {}; missing.plane = 2; missing.failed = true;
 	tile_cache_result_action_t action = {};
 	REQUIRE(tile_cache_apply_result(image, &missing, false, &action));
 	CHECK_FALSE(fixture.geometry.is_empty); // The shared coverage must not change.
-	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 0); // A completed failure is not a loading gap.
+	CHECK(tile_cache_get_focus_texture(image, 0, 0, false) == 0); // A completed failure is not a loading gap.
 	tile_cache_take_gpu_texture(image, 1, 0, 0);
 	tile_cache_take_gpu_texture(image, 3, 0, 0);
 	image_select_plane(image, 1); // An unfailed physical plane with no cached texture.
-	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 0); // Never use the composite as a physical plane.
+	CHECK(tile_cache_get_focus_texture(image, 0, 0, false) == 0); // Never use the composite as a physical plane.
 	image_select_plane(image, 0);
-	CHECK(tile_cache_get_focus_texture(image, 0, 0) == 100);
+	CHECK(tile_cache_get_focus_texture(image, 0, 0, false) == 100);
 	tile_cache_test_stack_destroy(&fixture);
 }
 

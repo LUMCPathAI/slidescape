@@ -16,6 +16,7 @@
   along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "profiler.h"
 #include "common.h"
 #include "platform.h"
 #include "mrxs.h"
@@ -1152,8 +1153,10 @@ static u8* mrxs_decode_stored_tile_to_bgra(mrxs_t* mrxs, i32 plane, i32 level, i
                 u8* compressed_tile_data = (u8*)arena_push_size(temp.arena, hier_entry.length);
                 source_read_result_t read = source_file_read(file, hier_entry.offset, compressed_tile_data, hier_entry.length);
                 if (read == SOURCE_READ_OK) {
+					i64 profile_decode_start = profiler_worker_decode_begin();
                     result = mrxs_decode_image_to_bgra(compressed_tile_data, hier_entry.length, mrxs_level->image_format,
                                                        mrxs_level->tile_width, mrxs_level->tile_height);
+					profiler_worker_decode_end(profile_decode_start);
                 }
                 release_temp_memory(&temp);
             }

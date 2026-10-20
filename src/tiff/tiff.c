@@ -16,6 +16,7 @@
   along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "profiler.h"
 #include "common.h"
 #include "mathutils.h"
 
@@ -1191,6 +1192,7 @@ u8* tiff_decode_tile(i32 logical_thread_index, tiff_t* tiff, tiff_ifd_t* level_i
 	// We should have either a compressed tile, or one or more compressed strips
 	ASSERT(compressed_tile_data != NULL || compressed_strip_data[0] != NULL);
 
+	i64 profile_decode_start = profiler_worker_decode_begin();
 	// Now decompress
 	if (compressed_tile_data || compressed_strip_data)  {
 //		console_print_verbose("[thread %d] loading tile: level %d, tile %d (%d, %d)\n", logical_thread_index, level, tile_index, tile_x, tile_y);
@@ -1507,6 +1509,7 @@ u8* tiff_decode_tile(i32 logical_thread_index, tiff_t* tiff, tiff_ifd_t* level_i
 			free(decompressed);
 		}
 
+		profiler_worker_decode_end(profile_decode_start);
 		return pixel_memory;
 
 	}

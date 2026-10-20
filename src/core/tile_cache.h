@@ -130,6 +130,7 @@ void tile_cache_cancel_decode_batch(image_t* image, i32 plane, const i32* levels
 void tile_cache_cancel_upload(image_t* image, i32 plane, i32 level, i32 tile_index);
 void tile_cache_release_upload_cpu_pin(image_t* image, i32 plane, i32 level, i32 tile_index);
 renderer_texture_handle_t tile_cache_get_gpu_texture(image_t* image, i32 plane, i32 level, i32 tile_index);
+// Renderer-thread only; also publishes profiling readiness.
 void tile_cache_store_gpu_texture(image_t* image, i32 plane, i32 level, i32 tile_index, renderer_texture_handle_t texture);
 renderer_texture_handle_t tile_cache_take_gpu_texture(image_t* image, i32 plane, i32 level, i32 tile_index);
 /* The returned pointer is valid only while the caller's CPU pin remains held. */
@@ -149,7 +150,7 @@ typedef enum tile_cache_status_flags_enum {
 u32 tile_cache_get_tile_status(image_t* image, i32 plane, i32 level, i32 tile_index);
 
 /* Returns only physical-plane textures in z-stack mode, nearest offset first. */
-renderer_texture_handle_t tile_cache_get_focus_texture(image_t* image, i32 level, i32 tile_index);
+renderer_texture_handle_t tile_cache_get_focus_texture(image_t* image, i32 level, i32 tile_index, bool profile_target_level);
 void tile_cache_destroy_gpu_textures(image_t* image, void (*destroy_texture)(renderer_texture_handle_t));
 
 #ifdef __cplusplus

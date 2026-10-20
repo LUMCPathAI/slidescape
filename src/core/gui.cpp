@@ -34,6 +34,7 @@
 #include "slide_score.h"
 #include "ssi.h"
 #include "profiler.h"
+#include "presenter.h"
 
 #if WINDOWS
 #include "win32_gui.h"
@@ -2402,148 +2403,352 @@ void gui_draw_open_uri_window(app_state_t* app_state) {
 	ImGui::End();
 }
 
+typedef struct profiler_flamegraph_data_t {
+	const profiler_frame_t* frame;
+	i64 cutoff;
+	i32 sections[PROFILER_SECTION_COUNT];
+	i32 count;
+} profiler_flamegraph_data_t;
+
+static float profiler_frame_ms(const profiler_frame_t* frame, bool hide_present) {
+	i64 end = frame->frame_end;
+	const profiler_section_t* present = &frame->sections[PROFILER_SECTION_PRESENT];
+	if (hide_present && present->start >= frame->frame_start && present->end > 0) {
+		end = present->start;
+	}
+	return frame->frame_start > 0 && end > frame->frame_start
+		? get_seconds_elapsed(frame->frame_start, end) * 1000.0f : 0.0f;
+}
+
 static void profiler_flamegraph_getter(float* start, float* end, ImU8* level, const char** caption, const void* data, int idx) {
-	const profiler_frame_t* frame = (const profiler_frame_t*)data;
-	if (idx < 0 || idx >= PROFILER_SECTION_COUNT) return;
-	const profiler_section_t* s = &frame->sections[idx];
-	if (start) *start = (s->start > 0 && frame->frame_start > 0) ? get_seconds_elapsed(frame->frame_start, s->start) * 1000.0f : 0.0f;
-	if (end)   *end   = (s->end   > 0 && frame->frame_start > 0) ? get_seconds_elapsed(frame->frame_start, s->end)   * 1000.0f : 0.0f;
-	if (level)   *level   = s->level;
-	if (caption) *caption = profiler_section_names[idx];
+	const profiler_flamegraph_data_t* graph = (const profiler_flamegraph_data_t*)data;
+	ASSERT(idx >= 0 && idx < graph->count);
+	const profiler_section_t* section = &graph->frame->sections[graph->sections[idx]];
+	if (start) {
+		*start = get_seconds_elapsed(graph->frame->frame_start, section->start) * 1000.0f;
+	}
+	if (end) {
+		*end = get_seconds_elapsed(graph->frame->frame_start, MIN(section->end, graph->cutoff)) * 1000.0f;
+	}
+	if (level) {
+		*level = section->level;
+	}
+	if (caption) {
+		*caption = profiler_section_names[graph->sections[idx]];
+	}
+}
+
+static void profiler_timing_row(const char* label, double total_ms, u64 samples) {
+	ImGui::TableNextRow();
+	ImGui::TableNextColumn();
+	ImGui::TextUnformatted(label);
+	ImGui::TableNextColumn();
+	ImGui::Text("%.3f", total_ms);
+	ImGui::TableNextColumn();
+	if (samples) {
+		ImGui::Text("%.3f", total_ms / samples);
+	} else {
+		ImGui::TextDisabled("--");
+	}
+}
+
+static void profiler_latency_row(const char* label, u64 samples, double total_ms, float max_ms) {
+	ImGui::TableNextRow();
+	ImGui::TableNextColumn();
+	ImGui::TextUnformatted(label);
+	ImGui::TableNextColumn();
+	ImGui::Text("%llu", (unsigned long long)samples);
+	ImGui::TableNextColumn();
+	if (samples) {
+		ImGui::Text("%.3f", total_ms / samples);
+	} else {
+		ImGui::TextDisabled("--");
+	}
+	ImGui::TableNextColumn();
+	if (samples) {
+		ImGui::Text("%.3f", max_ms);
+	} else {
+		ImGui::TextDisabled("--");
+	}
+}
+
+static void profiler_memory_row(const char* label, u64 bytes) {
+	ImGui::TableNextRow();
+	ImGui::TableNextColumn();
+	ImGui::TextUnformatted(label);
+	ImGui::TableNextColumn();
+	ImGui::Text("%.2f MiB", bytes / (1024.0 * 1024.0));
+}
+
+static void draw_profiler_statistics(const profiler_frame_t* frames, i32 selected) {
+	static bool selected_frame_only;
+	const profiler_frame_t* frame = &frames[selected];
+	if (!frame->metrics_valid) {
+		ImGui::TextDisabled("Collecting worker and tile statistics...");
+		return;
+	}
+	ImGui::Checkbox("Selected frame only", &selected_frame_only);
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip("Worker and latency totals normally cover the last second ending at the selected frame.");
+	}
+	profiler_worker_metrics_t workers = {};
+	profiler_tile_metrics_t latency = {};
+	i32 sample_frames = 0;
+	i64 first_start = frame->frame_start;
+	for (i32 age = 0; age < (selected_frame_only ? 1 : PROFILER_FRAME_BUFFER_SIZE); ++age) {
+		i32 index = (selected + PROFILER_FRAME_BUFFER_SIZE - age) % PROFILER_FRAME_BUFFER_SIZE;
+		const profiler_frame_t* sample = &frames[index];
+		if (!sample->frame_end || sample->frame_end > frame->frame_end ||
+		    get_seconds_elapsed(sample->frame_end, frame->frame_end) > 1.0f) {
+			break;
+		}
+		if (!sample->metrics_valid) {
+			continue;
+		}
+		++sample_frames;
+		first_start = sample->frame_start;
+		workers.jobs += sample->workers.jobs;
+		workers.queued_jobs += sample->workers.queued_jobs;
+		workers.io_bytes += sample->workers.io_bytes;
+		workers.load_ms += sample->workers.load_ms;
+		workers.queue_ms += sample->workers.queue_ms;
+		workers.io_ms += sample->workers.io_ms;
+		workers.decode_ms += sample->workers.decode_ms;
+		latency.ready_tiles += sample->tiles.ready_tiles;
+		latency.request_to_ready_ms += sample->tiles.request_to_ready_ms;
+		latency.request_to_ready_max_ms = MAX(latency.request_to_ready_max_ms, sample->tiles.request_to_ready_max_ms);
+		latency.first_draws += sample->tiles.first_draws;
+		latency.request_to_draw_ms += sample->tiles.request_to_draw_ms;
+		latency.request_to_draw_max_ms = MAX(latency.request_to_draw_max_ms, sample->tiles.request_to_draw_max_ms);
+	}
+	ImGui::TextDisabled("Worker / latency window: %.2f s, %d frames",
+	                    get_seconds_elapsed(first_start, frame->frame_end), sample_frames);
+
+	if (ImGui::CollapsingHeader("Workers")) {
+		ImGui::Text("%llu completed jobs / batches  |  %.2f MiB read",
+		            (unsigned long long)workers.jobs, workers.io_bytes / (1024.0 * 1024.0));
+		if (workers.load_ms > 0.0) {
+			const double portions[] = {workers.decode_ms, workers.io_ms,
+			                          MAX(0.0, workers.load_ms - workers.decode_ms - workers.io_ms)};
+			const ImU32 colors[] = {IM_COL32(79, 156, 220, 255), IM_COL32(219, 168, 68, 255), IM_COL32(130, 135, 145, 255)};
+			const char* names[] = {"Decode", "I/O", "Other / opaque"};
+			ImVec2 pos = ImGui::GetCursorScreenPos();
+			float width = ImGui::GetContentRegionAvail().x;
+			float height = ImGui::GetFrameHeight();
+			float offset = 0.0f;
+			for (i32 i = 0; i < COUNT(portions); ++i) {
+				float part_width = (float)(portions[i] / workers.load_ms) * width;
+				ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(pos.x + offset, pos.y),
+					ImVec2(pos.x + offset + part_width, pos.y + height), colors[i]);
+				offset += part_width;
+			}
+			ImGui::InvisibleButton("##worker_breakdown", ImVec2(width, height));
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip("Decode %.1f%% | I/O %.1f%% | Other %.1f%%",
+				                 portions[0] / workers.load_ms * 100.0, portions[1] / workers.load_ms * 100.0,
+				                 portions[2] / workers.load_ms * 100.0);
+			}
+			for (i32 i = 0; i < COUNT(names); ++i) {
+				if (i) {
+					ImGui::SameLine();
+				}
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(colors[i]), "%s", names[i]);
+			}
+		}
+		if (ImGui::BeginTable("worker_timings", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+			ImGui::TableSetupColumn("Stage");
+			ImGui::TableSetupColumn("Total ms");
+			ImGui::TableSetupColumn("Mean ms / job");
+			ImGui::TableHeadersRow();
+			profiler_timing_row("Execution", workers.load_ms, workers.jobs);
+			profiler_timing_row("  Decode", workers.decode_ms, workers.jobs);
+			profiler_timing_row("  I/O", workers.io_ms, workers.jobs);
+			profiler_timing_row("  Other / opaque", MAX(0.0, workers.load_ms - workers.decode_ms - workers.io_ms), workers.jobs);
+			profiler_timing_row("Queue wait (separate)", workers.queue_ms, workers.queued_jobs);
+			ImGui::EndTable();
+		}
+		ImGui::TextDisabled("Queue samples: %llu", (unsigned long long)workers.queued_jobs);
+		// ImGui::TextWrapped("Completed jobs only. Threads overlap; totals may exceed wall time. Decode and I/O are parts of execution. Opaque backend calls remain in Other.");
+	}
+
+	if (ImGui::CollapsingHeader("Tile latency")) {
+		if (ImGui::BeginTable("tile_latency", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+			ImGui::TableSetupColumn("From request to");
+			ImGui::TableSetupColumn("Samples");
+			ImGui::TableSetupColumn("Mean ms");
+			ImGui::TableSetupColumn("Max ms");
+			ImGui::TableHeadersRow();
+			profiler_latency_row("Texture ready", latency.ready_tiles, latency.request_to_ready_ms, latency.request_to_ready_max_ms);
+			profiler_latency_row("First draw", latency.first_draws, latency.request_to_draw_ms, latency.request_to_draw_max_ms);
+			ImGui::EndTable();
+		}
+		// ImGui::TextWrapped("First draw includes prefetched tiles waiting to be needed; it does not measure scanout. Legacy iSyntax requests have no latency samples.");
+	}
+
+	if (ImGui::CollapsingHeader("Visible tiles - selected frame")) {
+		const profiler_tile_metrics_t* tiles = &frame->tiles;
+		u64 required = tiles->visible[PROFILER_TILE_READY] + tiles->visible[PROFILER_TILE_ADJACENT_PLANE] +
+		               tiles->visible[PROFILER_TILE_MISSING] + tiles->visible[PROFILER_TILE_FAILED];
+		if (tiles->unready_levels) {
+			ImGui::Text("Waiting for indexing: %llu requested levels", (unsigned long long)tiles->unready_levels);
+		} else if (required) {
+			char overlay[96];
+			snprintf(overlay, sizeof(overlay), "%llu / %llu ready at requested level and plane",
+			         (unsigned long long)tiles->visible[PROFILER_TILE_READY], (unsigned long long)required);
+			ImGui::ProgressBar((float)tiles->visible[PROFILER_TILE_READY] / required, ImVec2(-1, 0), overlay);
+		} else {
+			ImGui::TextDisabled("No nonempty requested tiles in this frame.");
+		}
+		ImGui::TextWrapped("Ready %llu  |  Adjacent plane %llu  |  Missing %llu  |  Failed %llu  |  Empty %llu",
+		            (unsigned long long)tiles->visible[PROFILER_TILE_READY],
+		            (unsigned long long)tiles->visible[PROFILER_TILE_ADJACENT_PLANE],
+		            (unsigned long long)tiles->visible[PROFILER_TILE_MISSING],
+		            (unsigned long long)tiles->visible[PROFILER_TILE_FAILED],
+		            (unsigned long long)tiles->visible[PROFILER_TILE_EMPTY]);
+		// ImGui::TextWrapped("Counts use viewport tile bounds, not pixel coverage. Missing requested tiles may still have coarser imagery underneath.");
+	}
+	if (ImGui::CollapsingHeader("Memory - sampled")) {
+		if (!frame->memory_sample_clock) {
+			ImGui::TextDisabled("No memory sample yet.");
+		} else {
+			// ImGui::TextDisabled("Sample age at selected frame: %.2f s", get_seconds_elapsed(frame->memory_sample_clock, frame->frame_end));
+			if (ImGui::BeginTable("profile_memory", 2, ImGuiTableFlags_RowBg)) {
+				profiler_memory_row("Process resident", frame->metrics.resident_bytes);
+				profiler_memory_row("Textures (estimated)", frame->metrics.texture_bytes);
+				profiler_memory_row("CPU tiles", frame->metrics.cpu_tile_bytes);
+				profiler_memory_row("Cache table", frame->metrics.cache_table_bytes);
+				profiler_memory_row("Shared tile metadata", frame->metrics.tile_metadata_bytes);
+				if (frame->metrics.mrxs_index_bytes > 0) {
+					profiler_memory_row("MRXS indices", frame->metrics.mrxs_index_bytes);
+				}
+				profiler_memory_row("Idle tile buffers", frame->metrics.pooled_bytes);
+				ImGui::EndTable();
+			}
+			ImGui::Text("Cache entries: %llu", (unsigned long long)frame->metrics.cache_entries);
+			// ImGui::TextWrapped("Sampled about once per second. These categories must not be added to process resident memory.");
+		}
+	}
 }
 
 void draw_profiler_window(app_state_t* app_state) {
 	static i32 pinned_frame = -1;
-
+	static bool hide_present;
+	static bool was_paused;
+	// CSV capture keeps advancing the live ring while the GUI is paused.
+	static profiler_frame_t frozen_frames[PROFILER_FRAME_BUFFER_SIZE];
+	ImGui::SetNextWindowSize(ImVec2(760, 850), ImGuiCond_FirstUseEver);
 	if (!ImGui::Begin("Profiler", &show_profiler_window)) {
 		ImGui::End();
 		return;
 	}
-
 	if (ImGui::Button(global_profiler.paused ? "Resume" : "Pause")) {
 		global_profiler.paused = !global_profiler.paused;
-		if (!global_profiler.paused) pinned_frame = -1;
 	}
+	if (global_profiler.paused && !was_paused) {
+		memcpy(frozen_frames, global_profiler.frames, sizeof(frozen_frames));
+		pinned_frame = global_profiler.displayed_frame;
+	}
+	if (!global_profiler.paused) {
+		pinned_frame = -1;
+	}
+	was_paused = global_profiler.paused;
 	ImGui::SameLine();
+	ImGui::Checkbox("Hide Present", &hide_present);
+	ImGui::SameLine();
+	ImGui::TextDisabled("%s%s", profiler_build_configuration(), profiler_is_capturing() ? " | CSV recording" : "");
 
-	i32 display_idx = (pinned_frame >= 0) ? pinned_frame : global_profiler.displayed_frame;
-	const profiler_frame_t* frame = &global_profiler.frames[display_idx];
-
-	float frame_ms = (frame->frame_end > 0 && frame->frame_start > 0)
-		? get_seconds_elapsed(frame->frame_start, frame->frame_end) * 1000.0f : 0.0f;
-	float fps = frame_ms > 0.0f ? 1000.0f / frame_ms : 0.0f;
-	ImGui::Text("%.2f ms  |  %.1f FPS%s", frame_ms, fps, global_profiler.paused ? "  [PAUSED]" : "");
-
+	const profiler_frame_t* frames = global_profiler.paused ? frozen_frames : global_profiler.frames;
+	i32 display_idx = pinned_frame >= 0 ? pinned_frame : global_profiler.displayed_frame;
+	const profiler_frame_t* frame = &frames[display_idx];
+	ImGui::Text("Frame %.3f ms  |  Before swap %.3f ms%s", profiler_frame_ms(frame, false),
+	            profiler_frame_ms(frame, true), global_profiler.paused ? "  [PAUSED]" : "");
 	ImGui::Separator();
-
-	// Frametime history graph
+	ImGui::TextUnformatted(hide_present ? "Pre-swap history (click to inspect)" : "Frame history (click to inspect)");
 	const float graph_height = 56.0f;
-	const float max_display_ms = 33.3f;
-	const float target_ms = 1000.0f / 60.0f;
-	// Frame pacing and timer sampling fluctuate slightly around the ideal refresh
-	// interval. Do not flag a clean vsync-paced frame as an overrun.
-	const float warning_ms = target_ms + 0.5f;
-
+	i32 refresh_rate = presenter_get_refresh_rate();
+	float target_ms = 1000.0f / (refresh_rate > 1 ? refresh_rate : 60);
+	float max_display_ms = MAX(10.0f, target_ms * 2.0f);
+	float warning_ms = target_ms + 0.5f;
 	ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
 	float canvas_w = ImGui::GetContentRegionAvail().x;
-	ImVec2 canvas_size = ImVec2(canvas_w, graph_height);
+	ImVec2 canvas_size(canvas_w, graph_height);
 	ImDrawList* draw_list = ImGui::GetWindowDrawList();
-
-	draw_list->AddRectFilled(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(20, 20, 20, 220));
-	draw_list->AddRect(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(80, 80, 80, 255));
-
-	float target_y = canvas_pos.y + canvas_size.y * (1.0f - target_ms / max_display_ms);
-	draw_list->AddLine(ImVec2(canvas_pos.x, target_y), ImVec2(canvas_pos.x + canvas_size.x, target_y), IM_COL32(80, 200, 80, 100), 1.0f);
-
-	const i32 buf_size = PROFILER_FRAME_BUFFER_SIZE;
-	float bar_w = canvas_w / (float)buf_size;
-
-	bool clicked_graph = false;
-	i32 clicked_frame_idx = -1;
-	ImVec2 mouse_pos = ImGui::GetIO().MousePos;
-	bool mouse_in_graph = mouse_pos.x >= canvas_pos.x && mouse_pos.x < canvas_pos.x + canvas_w &&
-	                      mouse_pos.y >= canvas_pos.y && mouse_pos.y < canvas_pos.y + canvas_size.y;
-
-	if (mouse_in_graph && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ImGui::IsWindowHovered()) {
-		clicked_graph = true;
-		float rel_x = (mouse_pos.x - canvas_pos.x) / canvas_w;
-		clicked_frame_idx = (i32)(rel_x * buf_size);
-		if (clicked_frame_idx < 0) clicked_frame_idx = 0;
-		if (clicked_frame_idx >= buf_size) clicked_frame_idx = buf_size - 1;
-	}
-
-	for (i32 i = 0; i < buf_size; ++i) {
-		const profiler_frame_t* f = &global_profiler.frames[i];
-		float ft = (f->frame_end > 0 && f->frame_start > 0)
-			? get_seconds_elapsed(f->frame_start, f->frame_end) * 1000.0f : 0.0f;
-
-		float bar_h = ft / max_display_ms * canvas_size.y;
-		if (bar_h > canvas_size.y) bar_h = canvas_size.y;
-
-		float x0 = canvas_pos.x + i * bar_w;
-		float x1 = x0 + (bar_w >= 2.0f ? bar_w - 1.0f : bar_w);
-		float y1 = canvas_pos.y + canvas_size.y;
-		float y0 = y1 - bar_h;
-
-		bool is_selected = (i == display_idx);
-		ImU32 color;
-		if (is_selected) {
-			color = IM_COL32(255, 255, 80, 255);
-		} else if (ft > target_ms * 1.5f) {
-			color = IM_COL32(220, 70, 70, 220);
-		} else if (ft > warning_ms) {
-			color = IM_COL32(220, 170, 60, 220);
-		} else {
-			color = IM_COL32(70, 170, 70, 220);
-		}
-
-		if (bar_h > 0.0f) {
-			draw_list->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), color);
+	draw_list->AddRectFilled(canvas_pos, ImVec2(canvas_pos.x + canvas_w, canvas_pos.y + graph_height), IM_COL32(20, 20, 20, 220));
+	float target_y = canvas_pos.y + graph_height * (1.0f - target_ms / max_display_ms);
+	draw_list->AddLine(ImVec2(canvas_pos.x, target_y), ImVec2(canvas_pos.x + canvas_w, target_y), IM_COL32(80, 200, 80, 100));
+	float bar_w = canvas_w / PROFILER_FRAME_BUFFER_SIZE;
+	for (i32 i = 0; i < PROFILER_FRAME_BUFFER_SIZE; ++i) {
+		float duration = profiler_frame_ms(&frames[i], hide_present);
+		float bar_h = MIN(duration / max_display_ms, 1.0f) * graph_height;
+		float x = canvas_pos.x + i * bar_w;
+		ImU32 color = i == display_idx ? IM_COL32(255, 255, 80, 255)
+			: duration > warning_ms ? IM_COL32(220, 100, 70, 220) : IM_COL32(70, 170, 70, 220);
+		if (bar_h > 0) {
+			draw_list->AddRectFilled(ImVec2(x, canvas_pos.y + graph_height - bar_h),
+			                        ImVec2(x + bar_w, canvas_pos.y + graph_height), color);
 		}
 	}
-
-	// Transparent button to capture interactions over the graph area
 	ImGui::InvisibleButton("##framegraph", canvas_size);
-
-	if (clicked_graph && clicked_frame_idx >= 0) {
-		pinned_frame = clicked_frame_idx;
-		global_profiler.paused = true;
+	if (ImGui::IsItemHovered() && canvas_w > 0) {
+		i32 index = CLAMP((i32)((ImGui::GetIO().MousePos.x - canvas_pos.x) / canvas_w * PROFILER_FRAME_BUFFER_SIZE),
+		                 0, PROFILER_FRAME_BUFFER_SIZE - 1);
+		ImGui::SetTooltip("Frame %.3f ms | Before swap %.3f ms\nDisplay budget %.2f ms\nClick to inspect",
+		                  profiler_frame_ms(&frames[index], false), profiler_frame_ms(&frames[index], true), target_ms);
+		if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && frames[index].frame_end) {
+			if (!global_profiler.paused) {
+				memcpy(frozen_frames, global_profiler.frames, sizeof(frozen_frames));
+			}
+			global_profiler.paused = true;
+			was_paused = true;
+			pinned_frame = index;
+			frames = frozen_frames;
+			display_idx = index;
+			frame = &frames[index];
+		}
 	}
 
-	if (ImGui::IsItemHovered()) {
-		float rel_x = (mouse_pos.x - canvas_pos.x) / canvas_w;
-		i32 hover_idx = (i32)(rel_x * buf_size);
-		if (hover_idx < 0) hover_idx = 0;
-		if (hover_idx >= buf_size) hover_idx = buf_size - 1;
-		const profiler_frame_t* hf = &global_profiler.frames[hover_idx];
-		float hft = (hf->frame_end > 0 && hf->frame_start > 0)
-			? get_seconds_elapsed(hf->frame_start, hf->frame_end) * 1000.0f : 0.0f;
-		ImGui::SetTooltip("Frame %d: %.2f ms (%.1f FPS)\nClick to inspect", hover_idx, hft, hft > 0.0f ? 1000.0f / hft : 0.0f);
-	}
-
-	if (!global_profiler.paused) pinned_frame = -1;
-
-	// Flamegraph
 	ImGui::Separator();
-	ImGui::TextUnformatted("Main Thread");
-
-	if (frame->frame_start > 0) {
-		float scale_max = (frame->frame_end > 0 && frame->frame_end > frame->frame_start)
-			? get_seconds_elapsed(frame->frame_start, frame->frame_end) * 1000.0f
-			: FLT_MAX;
-		ImGuiWidgetFlameGraph::PlotFlame("CPU",
-			profiler_flamegraph_getter,
-			(const void*)frame,
-			PROFILER_SECTION_COUNT,
-			0,
-			NULL,
-			0.0f,
-			scale_max,
-			ImVec2(ImGui::GetContentRegionAvail().x, 0.0f));
-	} else {
-		ImGui::TextDisabled("No frame data yet.");
+	ImGui::TextUnformatted("Main thread");
+	profiler_flamegraph_data_t graph = {};
+	graph.frame = frame;
+	graph.cutoff = frame->frame_end;
+	const profiler_section_t* present = &frame->sections[PROFILER_SECTION_PRESENT];
+	if (hide_present && present->start >= frame->frame_start && present->end > 0) {
+		graph.cutoff = present->start;
 	}
-
+	for (i32 i = 0; i < PROFILER_SECTION_COUNT; ++i) {
+		const profiler_section_t* section = &frame->sections[i];
+		if ((hide_present && i == PROFILER_SECTION_PRESENT) || section->start < frame->frame_start ||
+		    section->end <= section->start || section->start >= graph.cutoff) {
+			continue;
+		}
+		graph.sections[graph.count++] = i;
+	}
+	if (graph.count && frame->frame_end) {
+		ImGuiWidgetFlameGraph::PlotFlame("##main_thread_flame", profiler_flamegraph_getter, &graph, graph.count,
+			0, NULL, 0.0f, profiler_frame_ms(frame, hide_present), ImVec2(ImGui::GetContentRegionAvail().x, 0));
+	} else {
+		ImGui::TextDisabled("No completed frame data yet.");
+	}
+	// ImGui::TextDisabled("Flame graph shows the last span of repeated sections.");
+	if (ImGui::CollapsingHeader("Accumulated main-thread sections")) {
+		if (ImGui::BeginTable("profile_sections", 2, ImGuiTableFlags_RowBg)) {
+			for (i32 i = 0; i < PROFILER_SECTION_COUNT; ++i) {
+				if ((hide_present && i == PROFILER_SECTION_PRESENT) || frame->sections[i].elapsed_ms <= 0) {
+					continue;
+				}
+				ImGui::TableNextRow();
+				ImGui::TableNextColumn();
+				ImGui::TextUnformatted(profiler_section_names[i]);
+				ImGui::TableNextColumn();
+				ImGui::Text("%.3f ms", frame->sections[i].elapsed_ms);
+			}
+			ImGui::EndTable();
+		}
+		// ImGui::TextDisabled("Repeated spans are summed. Nested sections are inclusive.");
+	}
+	ImGui::Separator();
+	draw_profiler_statistics(frames, display_idx);
 	ImGui::End();
 }
 

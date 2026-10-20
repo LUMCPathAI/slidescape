@@ -23,6 +23,7 @@
 #include "platform.h"
 #include "viewer.h"
 #include "remote.h"
+#include "profiler.h"
 #include "remote_url.h"
 #include "stringutils.h"
 
@@ -383,7 +384,7 @@ static void remote_request_set_error(const remote_request_options_t* options,
 	if (options && options->out_error) *options->out_error = error;
 }
 
-http_response_t* remote_connection_request_http(
+static http_response_t* remote_connection_request_http_impl(
 	tls_connection_t* connection, const char* host, remote_http_method_t method,
 	const char* path, const char* accept, const char* content_type,
 	const void* body, size_t body_size, const char* extra_headers,
@@ -507,6 +508,19 @@ http_response_t* remote_connection_request_http(
 	}
 	http_response_t* response = http_response_parser_take_response(&parser);
 	http_response_parser_destroy(&parser);
+	return response;
+}
+
+http_response_t* remote_connection_request_http(
+	tls_connection_t* connection, const char* host, remote_http_method_t method,
+	const char* path, const char* accept, const char* content_type,
+	const void* body, size_t body_size, const char* extra_headers,
+	bool close_after_request, const remote_request_options_t* options) {
+	i64 profile_start = profiler_worker_io_begin();
+	http_response_t* response = remote_connection_request_http_impl(
+		connection, host, method, path, accept, content_type, body, body_size,
+		extra_headers, close_after_request, options);
+	profiler_worker_io_end(profile_start, response ? response->buffer.used_size : 0);
 	return response;
 }
 

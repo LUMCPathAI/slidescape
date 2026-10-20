@@ -4,6 +4,7 @@
   SPDX-License-Identifier: GPL-3.0-or-later
 */
 #include "source_io.h"
+#include "profiler.h"
 #include "platform.h"
 
 #if !WINDOWS
@@ -124,5 +125,8 @@ source_read_result_t source_file_read(const source_file_t* file, u64 offset, voi
 		file->offset > file->blob->size || file->size > file->blob->size - file->offset)
 		return SOURCE_READ_OUT_OF_BOUNDS;
 	if (!size) return SOURCE_READ_OK;
-	return file->blob->read(file->blob->context, file->offset + offset, dest, size);
+	i64 profile_start = profiler_worker_io_begin();
+	source_read_result_t result = file->blob->read(file->blob->context, file->offset + offset, dest, size);
+	profiler_worker_io_end(profile_start, result == SOURCE_READ_OK ? size : 0);
+	return result;
 }

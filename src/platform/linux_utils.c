@@ -25,6 +25,7 @@
   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+#include "profiler.h"
 #include "common.h"
 #include "platform.h"
 
@@ -101,6 +102,8 @@ void file_handle_close(file_handle_t file_handle) {
 }
 
 size_t file_handle_read_at_offset(void* dest, file_handle_t file_handle, u64 offset, size_t bytes_to_read) {
+	i64 profile_start = profiler_worker_io_begin();
 	size_t bytes_read = pread(file_handle, dest, bytes_to_read, offset);
+	profiler_worker_io_end(profile_start, bytes_read == (size_t)-1 ? 0 : bytes_read);
 	return bytes_read;
 }

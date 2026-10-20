@@ -12,7 +12,6 @@ add_executable(slidescape_tests
         test_memrw.cpp
         test_replay.cpp
         test_profiler.cpp
-        ../src/utils/profiler.c
         test_remote_url.cpp
         test_stb_sprintf.cpp
         test_slide_score.cpp

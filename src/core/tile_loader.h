@@ -52,6 +52,8 @@ typedef struct load_tile_task_t {
 	i32 generation;
 	task_group_t* task_group;
 	i32 refcount_to_decrement;
+	u64 profile_capture_id;
+	i64 profile_queued_clock;
 } load_tile_task_t;
 
 typedef struct tile_load_completion_task_t {
