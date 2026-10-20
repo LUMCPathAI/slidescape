@@ -1947,14 +1947,13 @@ int main() {
 
 	win32_init_cursor();
 	win32_init_main_window(app_state);
+	win32_init_input();
 
 	// Load OpenSlide in the background, we might not need it immediately.
 	thread_pool_submit_task(&global_thread_pool, load_openslide_task, NULL, 0);
 
 	// Load DICOM support in the background
 	thread_pool_submit_task(&global_thread_pool, load_dicom_task, NULL, 0);
-
-	win32_init_input();
 
 	is_program_running = true;
 

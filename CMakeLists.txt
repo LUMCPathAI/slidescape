@@ -202,6 +202,13 @@ endif()
 function(slidescape_enable_process_allocator target)
     if(SLIDESCAPE_USE_MIMALLOC)
         target_link_libraries(${target} PRIVATE mimalloc-obj)
+        if(MSVC)
+            # The static UCRT may pull in expand.obj even though the explicitly
+            # linked mimalloc object already provides the process-wide _expand
+            # override. Keep mimalloc's first definition. /FORCE disables
+            # incremental linking, so say that explicitly to avoid LNK4075.
+            target_link_options(${target} PRIVATE /FORCE:MULTIPLE /INCREMENTAL:NO)
+        endif()
     endif()
 endfunction()
 
@@ -632,8 +639,8 @@ if (WIN32)
     add_executable(slidescape         ${VIEWER_SOURCE_FILES} ${LIBRARY_SOURCE_FILES} resources/icon/icon.rc)
     add_executable(slidescape_console ${VIEWER_SOURCE_FILES} ${LIBRARY_SOURCE_FILES} resources/icon/icon.rc)
 
-    target_link_libraries(slidescape         PRIVATE user32 gdi32 winmm imm32 dwmapi ws2_32 psapi shlwapi crypt32)
-    target_link_libraries(slidescape_console PRIVATE user32 gdi32 winmm imm32 dwmapi ws2_32 psapi shlwapi crypt32)
+    target_link_libraries(slidescape         PRIVATE user32 gdi32 imm32 dwmapi ws2_32 psapi shlwapi crypt32)
+    target_link_libraries(slidescape_console PRIVATE user32 gdi32 imm32 dwmapi ws2_32 psapi shlwapi crypt32)
     slidescape_enable_process_allocator(slidescape_console)
 
     target_compile_definitions(slidescape_console PRIVATE DONT_REGISTER_FILETYPE_ASSOCIATIONS=1) # associate only non-console builds
@@ -735,7 +742,10 @@ endif()
 slidescape_enable_process_allocator(slidescape)
 target_link_libraries(slidescape PRIVATE slidescape_nongui slidescape_jpeg slidescape_tls)
 if (WIN32)
-    target_link_libraries(slidescape_console PRIVATE slidescape_nongui slidescape_jpeg slidescape_tls)
+    # Keep winmm after slidescape_nongui: GNU linkers resolve static archives in
+    # command-line order, and timerutils.c uses timeBeginPeriod from winmm.
+    target_link_libraries(slidescape PRIVATE winmm)
+    target_link_libraries(slidescape_console PRIVATE slidescape_nongui slidescape_jpeg slidescape_tls winmm)
 endif()
 # Route viewer logs through console.cpp; tools use stdio by default.
 target_compile_definitions(slidescape PRIVATE USE_CONSOLE_LOGGING=1)
