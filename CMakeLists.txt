@@ -508,6 +508,7 @@ set(SLIDESCAPE_NONGUI_BASE_FILES
         src/core/image_resize.c
         src/core/image_loader.c
         src/core/tile_cache.c
+        src/core/replay.c
         src/core/tile_buffer_pool.c
         src/core/tile_loader.c
         src/core/http_request.c
@@ -557,6 +558,7 @@ set(VIEWER_SOURCE_FILES
         platform/presenter.cpp
         platform/presenter_imgui_opengl_cached.cpp
         core/viewer.cpp
+        core/viewer_replay.cpp
         core/viewer_io_file.cpp
         core/viewer_options.c
         core/renderer_opengl.c

@@ -20,6 +20,7 @@
 
 #include <ctype.h>
 #include "viewer.h"
+#include "viewer_replay.h"
 #include "dicom_wsi.h"
 #include "stringutils.h"
 #include "listing.h"
@@ -513,6 +514,9 @@ bool viewer_load_new_image(app_state_t* app_state, file_info_t* file, directory_
 		unload_and_reinit_annotations(&app_state->scene.annotation_set);
 	}
 	load_next_image_as_overlay = false; // reset after use (don't keep stacking on more overlays unintendedly)
+	if (is_base_image) {
+		viewer_replay_record_open(file->full_filename);
+	}
 	image_t* image = load_image_from_file(app_state, file, directory, filetype_hint);
 	if (image->is_valid) {
 		add_image(app_state, image, is_base_image, !is_base_image);

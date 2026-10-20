@@ -219,6 +219,10 @@ typedef enum command_export_error_enum {
 typedef struct app_command_t app_command_t;
 struct app_command_t {
 	bool headless;
+	bool argument_error;
+	const char* replay_path;
+	const char* record_replay_path;
+	const char* profile_path;
 	bool exit_immediately;
 	command_enum command;
 	struct app_command_export_t {

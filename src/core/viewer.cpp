@@ -36,6 +36,7 @@
 
 #define VIEWER_IMPL
 #include "viewer.h"
+#include "viewer_replay.h"
 #include "listing.h"
 
 #define STBI_ASSERT(x) ASSERT(x)
@@ -157,6 +158,7 @@ void unload_all_images(app_state_t *app_state) {
 
 	i32 current_image_count = arrlen(app_state->loaded_images);
 	if (current_image_count > 0) {
+		viewer_replay_record_close();
 		ASSERT(app_state->loaded_images);
 		for (i32 i = 0; i < current_image_count; ++i) {
 			image_t* old_image = app_state->loaded_images[i];
@@ -1037,6 +1039,12 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 	// Note: the window might get resized, so need to update this every frame
 	app_state->client_viewport = RECT2I(0, 0, client_width, client_height);
 
+	viewer_replay_update(app_state);
+	static input_t playback_input;
+	if (viewer_replay_is_playing()) {
+		memset(&playback_input, 0, sizeof(playback_input));
+		input = &playback_input;
+	}
 	scene_t* scene = &app_state->scene;
 	ASSERT(app_state->initialized);
 	ASSERT(scene->initialized);
@@ -1071,6 +1079,10 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 
 	app_state->allow_idling_next_frame = true; // but we might set it to false later
 
+	if (viewer_replay_is_playing()) {
+		app_state->allow_idling_next_frame = false; // Timed playback must keep ticking.
+	}
+
 	recount_enabled_images(app_state);
 	i32 image_count = arrlen(app_state->loaded_images);
 
@@ -1079,6 +1091,7 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 	}
 
 	if (image_count == 0) {
+		viewer_replay_after_navigation(app_state);
 		scene->can_export_region = false;
 		if (app_state->is_window_title_set_for_image) {
 			reset_window_title(app_state->main_window);
@@ -1234,6 +1247,8 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 			}
 
 			init_zoom_state(&scene->zoom, desired_zoom_pos, 1.0f, base_image->mpp_x, base_image->mpp_y);
+			scene->zoom_target_state = scene->zoom;
+			scene->need_zoom_animation = false;
 			scene->camera.x = base_image->width_in_um / 2.0f;
 			scene->camera.y = base_image->height_in_um / 2.0f;
 			scene->rotation = base_image->initial_rotation;
@@ -1244,6 +1259,7 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 
 			scene->need_zoom_reset = false;
 		}
+		viewer_replay_apply_camera(app_state);
 		scene->is_mpp_known = base_image->is_mpp_known;
 
 		zoom_state_t old_zoom = scene->zoom;
@@ -1283,7 +1299,7 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 			float dlevel = 0.0f;
 			float residual_dlevel = scene->zoom_target_state.pos - scene->zoom.pos; // how much the zoom is lagging behind
 			float abs_residual_dlevel = fabs(residual_dlevel);
-			bool integer_zoom = true; // can override later
+			bool integer_zoom = !viewer_replay_is_playing(); // Replay supplies an explicit target.
 			bool use_view_animation = !use_fast_rendering;
 			bool32 used_mouse_to_zoom = false;
 
@@ -1792,6 +1808,8 @@ void viewer_update_and_render(app_state_t *app_state, input_t *input, i32 client
 		draw_selection_box(scene);
 		draw_scale_bar(&scene->scale_bar);
 	}
+
+	viewer_replay_after_navigation(app_state);
 
 	if (app_state->enabled_image_count <= 1) {
 		// Render everything at once

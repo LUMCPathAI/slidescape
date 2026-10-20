@@ -25,6 +25,7 @@
 #include "common.h"
 #include "platform.h"
 #include "viewer.h"
+#include "viewer_replay.h"
 #include "gui.h" // TODO: move
 #include "dicom.h"
 #include "presenter.h"
@@ -708,6 +709,9 @@ int main(int argc, const char** argv)
     g_argv = argv;
 
     app_command_t app_command = app_parse_commandline(argc, argv);
+	if (app_command.argument_error) {
+		return 1;
+	}
     if (app_command.exit_immediately) {
         app_command_execute_immediately(&app_command);
         exit(0);
@@ -717,7 +721,8 @@ int main(int argc, const char** argv)
     if (verbose_console) console_print("Starting up...\n");
 
 #if LINUX
-	if (argc > 1 && !app_command.headless) {
+	if (argc > 1 && !app_command.headless && !app_command.replay_path &&
+	    !app_command.record_replay_path && !app_command.profile_path) {
 		if (linux_forward_commandline_to_existing_instance(argc, argv)) {
 			return 0;
 		}
@@ -967,6 +972,9 @@ int main(int argc, const char** argv)
 #endif
 
     // Load a slide from the command line or through the OS (double-click / drag on executable, etc.)
+	if (!viewer_replay_init(app_state)) {
+		return viewer_replay_shutdown();
+	}
 	app_load_commandline_inputs(app_state);
 
     // Main loop
@@ -1090,5 +1098,5 @@ int main(int argc, const char** argv)
 	linux_destroy_single_instance_socket();
 #endif
 
-    return 0;
+    return viewer_replay_shutdown();
 }

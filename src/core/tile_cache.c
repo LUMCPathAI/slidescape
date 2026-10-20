@@ -1212,3 +1212,31 @@ u32 tile_cache_get_tile_status(image_t* image, i32 plane, i32 level, i32 tile_in
 	platform_mutex_unlock(&cache->lock);
 	return status;
 }
+
+
+tile_cache_memory_stats_t tile_cache_get_memory_stats(image_t* image) {
+	tile_cache_memory_stats_t result = {0};
+	tile_cache_t* cache = image ? image->tile_cache : NULL;
+	if (!cache) {
+		return result;
+	}
+	platform_mutex_lock(&cache->lock);
+	result.table_bytes = cache->entry_capacity * sizeof(*cache->entries);
+	result.entries = cache->entry_count;
+	for (size_t i = 0; i < cache->entry_capacity; ++i) {
+		tile_cache_entry_t* entry = cache->entries + i;
+		if (!entry->key) {
+			continue;
+		}
+		i32 level = (i32)(((entry->key - 1) >> 32) & 0xffff);
+		size_t bytes = tile_cache_pixel_size(image, level);
+		if (entry->value.texture) {
+			result.texture_bytes += bytes;
+		}
+		if (entry->value.pixels) {
+			result.cpu_bytes += bytes;
+		}
+	}
+	platform_mutex_unlock(&cache->lock);
+	return result;
+}

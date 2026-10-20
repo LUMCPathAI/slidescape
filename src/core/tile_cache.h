@@ -26,6 +26,16 @@ extern "C" {
 #include "image.h"
 #include "platform.h"
 
+typedef struct tile_cache_memory_stats_t {
+	u64 texture_bytes;
+	u64 cpu_bytes;
+	u64 table_bytes;
+	u64 entries;
+} tile_cache_memory_stats_t;
+
+// Diagnostic snapshot scans the table under its lock; sample sparingly.
+tile_cache_memory_stats_t tile_cache_get_memory_stats(image_t* image);
+
 typedef enum tile_cache_request_state_enum {
 	TILE_CACHE_UNREQUESTED,
 	TILE_CACHE_QUEUED,

@@ -10,6 +10,9 @@ add_executable(slidescape_tests
         test_mathutils.cpp
         test_source_io.cpp
         test_memrw.cpp
+        test_replay.cpp
+        test_profiler.cpp
+        ../src/utils/profiler.c
         test_remote_url.cpp
         test_stb_sprintf.cpp
         test_slide_score.cpp
@@ -43,7 +46,7 @@ endif()
 target_link_libraries(slidescape_tests PRIVATE slidescape_nongui slidescape_jpeg slidescape_archive_core)
 slidescape_enable_process_allocator(slidescape_tests)
 if (WIN32)
-        target_link_libraries(slidescape_tests PRIVATE winmm)
+        target_link_libraries(slidescape_tests PRIVATE winmm psapi)
 endif()
 
 add_test(NAME slidescape_tests COMMAND slidescape_tests)

@@ -113,6 +113,20 @@ app_command_t app_parse_commandline(int argc, const char** argv) {
 			} else {
 				console_print_error("--dicomweb-password expects a value\n");
 			}
+		} else if (strcmp(arg, "--replay") == 0 || strcmp(arg, "--record-replay") == 0 ||
+		           strcmp(arg, "--profile") == 0) {
+			if (++arg_index >= argc) {
+				console_print_error("%s expects a filename\n", arg);
+				app_command.argument_error = true;
+				break;
+			}
+			if (strcmp(arg, "--replay") == 0) {
+				app_command.replay_path = args[arg_index];
+			} else if (strcmp(arg, "--record-replay") == 0) {
+				app_command.record_replay_path = args[arg_index];
+			} else {
+				app_command.profile_path = args[arg_index];
+			}
 		} else if (strcmp(arg, "--headless") == 0) {
 			app_command.headless = true;
 		} else if (strcmp(arg, "--overlay") == 0) {
@@ -139,6 +153,17 @@ app_command_t app_parse_commandline(int argc, const char** argv) {
 
 
 
+	if ((app_command.replay_path && (app_command.record_replay_path || arrlen(app_command.inputs) || arrlen(app_command.overlay_inputs))) ||
+	    (app_command.headless && (app_command.replay_path || app_command.record_replay_path || app_command.profile_path))) {
+		console_print_error("Replay/profile options require the graphical viewer; playback cannot be combined with recording or input files.\n");
+		app_command.argument_error = true;
+	}
+	if (app_command.profile_path &&
+	    ((app_command.replay_path && strcmp(app_command.profile_path, app_command.replay_path) == 0) ||
+	     (app_command.record_replay_path && strcmp(app_command.profile_path, app_command.record_replay_path) == 0))) {
+		console_print_error("Profile and replay filenames must differ.\n");
+		app_command.argument_error = true;
+	}
 	return app_command;
 }
 

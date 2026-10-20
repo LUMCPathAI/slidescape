@@ -30,6 +30,7 @@
 #include "dicom.h"
 
 #include "viewer.h"
+#include "viewer_replay.h"
 
 //#define WIN32_LEAN_AND_MEAN
 //#define VC_EXTRALEAN
@@ -1895,6 +1896,9 @@ int main() {
 #endif
 
 	app_command_t app_command = app_parse_commandline(g_argc, g_argv);
+	if (app_command.argument_error) {
+		return 1;
+	}
 	if (app_command.exit_immediately) {
 		win32_init_headless_console();
 		app_command_execute_immediately(&app_command);
@@ -1907,7 +1911,8 @@ int main() {
 
 	// Don't open multiple instances of the program when opening a file -> switch to the existing instance
 	// (unless Shift is being held down)
-	if (g_argc > 1 && !app_command.headless && !(GetKeyState(VK_SHIFT) & 0x8000)) {
+	if (g_argc > 1 && !app_command.headless && !app_command.replay_path &&
+	    !app_command.record_replay_path && !app_command.profile_path && !(GetKeyState(VK_SHIFT) & 0x8000)) {
 		win32_check_already_running();
 	}
 
@@ -1952,6 +1957,9 @@ int main() {
 	presenter_init_viewer(app_state);
 
 	// Load a slide from the command line or through the OS (double-click / drag on executable, etc.)
+	if (!viewer_replay_init(app_state)) {
+		return viewer_replay_shutdown();
+	}
 	app_load_commandline_inputs(app_state);
 
 	win32_can_render_from_window_messages = true;
@@ -2004,5 +2012,5 @@ int main() {
 	viewer_save_options_sync(app_state);
 	gui_destroy_all_extra_drawlists();
 
-	return 0;
+	return viewer_replay_shutdown();
 }

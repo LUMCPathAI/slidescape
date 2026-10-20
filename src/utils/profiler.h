@@ -17,11 +17,11 @@
 */
 
 #pragma once
+#include "common.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-#include "common.h"
 
 #define PROFILER_FRAME_BUFFER_SIZE 256
 
@@ -33,6 +33,7 @@ extern "C" {
 	X(PROCESS_WSI_INPUT, "Process WSI input") \
 	X(DRAW_ANNOTATIONS, "Draw Annotations") \
 	X(RENDER_IMAGE, "Render Image") \
+	X(MEMORY_SAMPLE, "Memory sample") \
 	X(COMPLETION_QUEUE, "Completion Queue") \
 	X(TILE_LOADING, "Tile Loading") \
 	X(SCENE_RENDER, "Scene Render") \
@@ -73,6 +74,33 @@ typedef struct {
 extern profiler_state_t global_profiler;
 extern const char* profiler_section_names[];
 
+typedef struct profiler_metrics_t {
+	u64 resident_bytes;
+	u64 texture_bytes; // Estimated pixel storage, excluding driver overhead.
+	u64 cpu_tile_bytes;
+	u64 cache_table_bytes;
+	u64 cache_entries;
+	u64 tile_metadata_bytes;
+	u64 mrxs_index_bytes;
+	u64 pooled_bytes;
+	u32 image_count;
+	u32 replay_segment;
+	u32 replay_command;
+	float camera_x;
+	float camera_y;
+	float zoom;
+	i32 viewport_width;
+	i32 viewport_height;
+	float display_scale;
+} profiler_metrics_t;
+
+// Main-thread API. CSV capture continues even when the profiler UI is paused.
+bool profiler_start_capture(const char* path);
+bool profiler_stop_capture(void);
+bool profiler_is_capturing(void);
+bool profiler_memory_sample_due(void);
+u64 profiler_resident_bytes(void);
+void profiler_set_metrics(const profiler_metrics_t* metrics);
 void profiler_new_frame(void);
 void profiler_begin(i32 section);
 void profiler_end(i32 section);
