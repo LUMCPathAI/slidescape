@@ -987,7 +987,7 @@ static void load_available_series(dicomweb_remote_image_t* remote,
 			http_response_destroy(response);
 			break;
 		}
-		if (page_count > DICOMWEB_QIDO_BROWSER_RESULT_LIMIT - count) {
+		if (page_count > DICOMWEB_QIDO_BROWSER_RESULT_LIMIT - offset) {
 			http_response_destroy(response);
 			goto fail;
 		}
@@ -1004,16 +1004,25 @@ static void load_available_series(dicomweb_remote_image_t* remote,
 			http_response_destroy(response);
 			goto fail;
 		}
-		if (offset > 0 && strcmp(page[0].series_instance_uid,
+		char page_first_uid[65];
+		copy_cstring(page_first_uid, page[0].series_instance_uid,
+		             sizeof(page_first_uid));
+		if (offset > 0 && strcmp(page_first_uid,
 		                         previous_page_first_uid) == 0) {
 			http_response_destroy(response);
 			goto fail;
 		}
-		copy_cstring(previous_page_first_uid, page[0].series_instance_uid,
+		copy_cstring(previous_page_first_uid, page_first_uid,
 		             sizeof(previous_page_first_uid));
-		count += page_count;
+		i32 accepted_count = 0;
+		for (i32 i = 0; i < page_count; ++i) {
+			if (dicomweb_series_ref_is_supported_wsi(page + i)) {
+				series[count + accepted_count++] = page[i];
+			}
+		}
+		count += accepted_count;
 		http_response_destroy(response);
-		if (count >= DICOMWEB_QIDO_BROWSER_RESULT_LIMIT &&
+		if (offset + page_count >= DICOMWEB_QIDO_BROWSER_RESULT_LIMIT &&
 		    page_count == DICOMWEB_QIDO_PAGE_SIZE) goto fail;
 		if (page_count != DICOMWEB_QIDO_PAGE_SIZE) break;
 		offset += page_count;
@@ -1196,6 +1205,10 @@ static image_t* dicomweb_prepare_configured_series(
 		if (request_options && request_options->cancellation_generation &&
 		    *request_options->cancellation_generation != request_options->expected_generation) {
 			break;
+		}
+		if (!dicomweb_instance_ref_is_supported_wsi(refs + i)) {
+			++unsupported_instances;
+			continue;
 		}
 		/* QIDO already identifies label/overview instances. They are not pyramid
 		 * inputs, so avoid downloading their full metadata and ICC profiles. */

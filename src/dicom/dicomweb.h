@@ -118,6 +118,8 @@ i32 dicomweb_count_study_refs(const char* json, size_t json_size);
 i32 dicomweb_parse_series_refs(const char* json, size_t json_size,
                                dicomweb_series_ref_t* out, i32 capacity);
 i32 dicomweb_count_series_refs(const char* json, size_t json_size);
+bool dicomweb_series_ref_is_supported_wsi(const dicomweb_series_ref_t* series);
+bool dicomweb_instance_ref_is_supported_wsi(const dicomweb_instance_ref_t* instance);
 bool dicomweb_parse_multipart_frame(const u8* body, size_t body_size,
                                     const char* response_content_type,
                                     dicomweb_frame_t* out);

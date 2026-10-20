@@ -263,17 +263,20 @@ bool dicomweb_parse_instance_metadata(const char* json, size_t json_size,
 			}
 		}
 	}
-	const char* organization = scalar_string(first_value(dataset, "00209311"));
-	u64 expected_frames = ((u64)out->total_pixel_matrix_columns + out->columns - 1) / out->columns;
-	expected_frames *= ((u64)out->total_pixel_matrix_rows + out->rows - 1) / out->rows;
-	out->is_tiled_full = organization ? strcmp(organization, "TILED_FULL") == 0
-	                                  : expected_frames == (u64)out->number_of_frames;
-	out->is_mpp_known = read_pixel_spacing(dataset_value, &out->mpp_x, &out->mpp_y);
 	if (out->rows == 0 || out->columns == 0 || out->number_of_frames <= 0 ||
 	    out->total_pixel_matrix_columns == 0 || out->total_pixel_matrix_rows == 0) {
 		valid = false;
 	}
-	if (valid && !build_frame_map(dataset, out)) valid = false;
+	if (valid) {
+		const char* organization = scalar_string(first_value(dataset, "00209311"));
+		u64 expected_frames = ((u64)out->total_pixel_matrix_columns + out->columns - 1) /
+		                      out->columns;
+		expected_frames *= ((u64)out->total_pixel_matrix_rows + out->rows - 1) / out->rows;
+		out->is_tiled_full = organization ? strcmp(organization, "TILED_FULL") == 0
+		                                  : expected_frames == (u64)out->number_of_frames;
+		out->is_mpp_known = read_pixel_spacing(dataset_value, &out->mpp_x, &out->mpp_y);
+		if (!build_frame_map(dataset, out)) valid = false;
+	}
 	free(root);
 	if (!valid) dicomweb_instance_metadata_destroy(out);
 	return valid;
@@ -534,6 +537,15 @@ i32 dicomweb_count_study_refs(const char* json, size_t json_size) {
 
 i32 dicomweb_count_series_refs(const char* json, size_t json_size) {
 	return parse_qido_refs(json, json_size, NULL, 0, false);
+}
+
+bool dicomweb_series_ref_is_supported_wsi(const dicomweb_series_ref_t* series) {
+	return series && strcmp(series->modality, "SM") == 0;
+}
+
+bool dicomweb_instance_ref_is_supported_wsi(const dicomweb_instance_ref_t* instance) {
+	static const char wsi_sop_class_uid[] = "1.2.840.10008.5.1.4.1.1.77.1.6";
+	return instance && strcmp(instance->sop_class_uid, wsi_sop_class_uid) == 0;
 }
 
 static const u8* find_bytes(const u8* haystack, size_t haystack_size,

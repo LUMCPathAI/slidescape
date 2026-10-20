@@ -88,6 +88,19 @@ TEST_CASE("DICOMweb parses WSI DICOM JSON metadata") {
 	dicomweb_instance_metadata_destroy(&metadata);
 }
 
+TEST_CASE("DICOMweb rejects image metadata without WSI geometry") {
+	const char* json =
+		"[{"
+		"\"00080016\":{\"vr\":\"UI\",\"Value\":[\"1.2.840.10008.5.1.4.1.1.91.1\"]},"
+		"\"00080018\":{\"vr\":\"UI\",\"Value\":[\"1.2.3.4\"]},"
+		"\"0020000D\":{\"vr\":\"UI\",\"Value\":[\"1.2.3\"]},"
+		"\"0020000E\":{\"vr\":\"UI\",\"Value\":[\"1.2.3.1\"]}"
+		"}]";
+	dicomweb_instance_metadata_t metadata = {};
+	CHECK_FALSE(dicomweb_parse_instance_metadata(json, strlen(json), &metadata));
+	CHECK(metadata.frame_numbers == nullptr);
+}
+
 TEST_CASE("DICOMweb extracts a native frame from multipart related") {
 	const char* content_type =
 		"multipart/related; type=\"image/jpeg\"; boundary=frame-boundary";
@@ -478,6 +491,24 @@ TEST_CASE("DICOMweb parses archive study and series results") {
 	CHECK(strcmp(series[0].series_number, "3") == 0);
 	CHECK(strcmp(series[0].modality, "SM") == 0);
 	CHECK(strcmp(series[0].description, "H&E") == 0);
+}
+
+TEST_CASE("DICOMweb identifies supported WSI query results") {
+	dicomweb_series_ref_t series = {};
+	copy_cstring(series.modality, "SM", sizeof(series.modality));
+	CHECK(dicomweb_series_ref_is_supported_wsi(&series));
+	copy_cstring(series.modality, "SEG", sizeof(series.modality));
+	CHECK_FALSE(dicomweb_series_ref_is_supported_wsi(&series));
+
+	dicomweb_instance_ref_t instance = {};
+	copy_cstring(instance.sop_class_uid, "1.2.840.10008.5.1.4.1.1.77.1.6",
+	             sizeof(instance.sop_class_uid));
+	CHECK(dicomweb_instance_ref_is_supported_wsi(&instance));
+	copy_cstring(instance.sop_class_uid, "1.2.840.10008.5.1.4.1.1.66.4",
+	             sizeof(instance.sop_class_uid));
+	CHECK_FALSE(dicomweb_instance_ref_is_supported_wsi(&instance));
+	instance.sop_class_uid[0] = '\0';
+	CHECK_FALSE(dicomweb_instance_ref_is_supported_wsi(&instance));
 }
 
 TEST_CASE("DICOMweb counts query results independently of caller capacity") {
