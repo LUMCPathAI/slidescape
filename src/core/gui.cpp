@@ -670,12 +670,12 @@ static void draw_slide_tray_window(app_state_t* app_state) {
 				                      : remote_series->description[0]
 				                        ? remote_series->description
 				                        : remote_series->series_instance_uid;
-				bool show_description = remote_series->description[0] &&
-				                        strcmp(primary, remote_series->description) != 0;
 				snprintf(remote_label, sizeof(remote_label), "%s%s%s##remote_series_%d",
 				         primary,
-				         show_description ? " - " : "",
-				         show_description ? remote_series->description : "", i);
+				         remote_series->description[0] ? " - " : "",
+				         remote_series->description[0] &&
+				         strcmp(primary, remote_series->description) != 0
+				         ? remote_series->description : "", i);
 				label = remote_label;
 			} else if (is_slide_score) {
 				snprintf(slide_score_label, sizeof(slide_score_label),

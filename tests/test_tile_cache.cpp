@@ -6,6 +6,8 @@
 #include "tile_loader.h"
 #include "work_queue.h"
 
+#include <initializer_list>
+
 typedef struct tile_cache_test_image_t {
 	image_t image;
 	tile_t geometry;

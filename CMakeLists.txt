@@ -14,7 +14,6 @@ option(BUILD_SLIDESCAPE_BENCHMARKS "Build standalone Slidescape microbenchmarks"
 option(USE_JPEG_SIMD "Use SIMD code for libjpeg-turbo" ON)
 option(USE_ADDRESS_SANITIZER "Use address sanitizer" OFF)
 
-option(SLIDESCAPE_MSVC_STATIC_RUNTIME "Use the static MSVC runtime (/MT or /MTd)" OFF)
 set(SLIDESCAPE_MIMALLOC_SUPPORTED OFF)
 if((WIN32 AND MSVC) OR APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(SLIDESCAPE_MIMALLOC_SUPPORTED ON)
@@ -32,15 +31,12 @@ endif()
 if(SLIDESCAPE_USE_MIMALLOC AND USE_ADDRESS_SANITIZER AND NOT MSVC)
     message(FATAL_ERROR "SLIDESCAPE_USE_MIMALLOC is incompatible with USE_ADDRESS_SANITIZER; disable mimalloc for sanitizer builds")
 endif()
-if(SLIDESCAPE_USE_MIMALLOC)
-    if(MSVC)
-        set(SLIDESCAPE_MSVC_STATIC_RUNTIME ON)
-    endif()
-endif()
-if(MSVC AND SLIDESCAPE_MSVC_STATIC_RUNTIME)
-    # Link the runtime library statically, with or without debug symbols depending on the configuration
+if(MSVC AND SLIDESCAPE_USE_MIMALLOC)
+    # A Windows static mimalloc override requires the release static CRT (/MT),
+    # even in a Debug configuration. /MTd can return debug-heap allocations
+    # from CRT helpers that are not valid inputs to mimalloc's free override.
     # see: https://cmake.org/cmake/help/latest/variable/CMAKE_MSVC_RUNTIME_LIBRARY.html#variable:CMAKE_MSVC_RUNTIME_LIBRARY
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
 
 if (APPLE)
@@ -202,13 +198,6 @@ endif()
 function(slidescape_enable_process_allocator target)
     if(SLIDESCAPE_USE_MIMALLOC)
         target_link_libraries(${target} PRIVATE mimalloc-obj)
-        if(MSVC)
-            # The static UCRT may pull in expand.obj even though the explicitly
-            # linked mimalloc object already provides the process-wide _expand
-            # override. Keep mimalloc's first definition. /FORCE disables
-            # incremental linking, so say that explicitly to avoid LNK4075.
-            target_link_options(${target} PRIVATE /FORCE:MULTIPLE /INCREMENTAL:NO)
-        endif()
     endif()
 endfunction()
 

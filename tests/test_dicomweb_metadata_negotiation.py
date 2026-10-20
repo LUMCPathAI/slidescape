@@ -21,6 +21,7 @@ def metadata(index):
     size = 4 >> index
     return {
         '00080008': tag('CS', 'DERIVED', 'PRIMARY', 'VOLUME', 'RESAMPLED'),
+        '00080016': tag('UI', '1.2.840.10008.5.1.4.1.1.77.1.6'),
         '00080018': tag('UI', INSTANCES[index]),
         '0020000D': tag('UI', STUDY), '0020000E': tag('UI', SERIES),
         '00280002': tag('US', 3), '00280004': tag('CS', 'RGB'),
