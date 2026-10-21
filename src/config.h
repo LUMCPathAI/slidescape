@@ -10,9 +10,6 @@
 
 #define NO_TIMER_INITIALIZED_RUNTIME_CHECK
 
-// ltalloc is disabled on all platforms. It has caused allocator corruption in
-// multithreaded code, including reproducible failures in the Windows test suite.
-
 #define USE_OPENGL_DEBUG_CONTEXT DO_DEBUG
 
 #define USE_MULTIPLE_OPENGL_CONTEXTS 0
@@ -23,5 +20,5 @@
 #define LIBISYNTAX_THREAD_POOL_SHARED_WITH_SLIDESCAPE
 
 #define APP_TITLE "Slidescape"
-#define APP_VERSION "0.49"
+#define APP_VERSION "0.50"
 

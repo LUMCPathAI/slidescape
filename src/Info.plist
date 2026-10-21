@@ -15,17 +15,17 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleLongVersionString</key>
-	<string>0.49</string>
+	<string>0.50</string>
 	<key>CFBundleName</key>
 	<string>Slidescape</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.49</string>
+	<string>0.50</string>
 	<key>CFBundleSignature</key>
 	<string>????</string>
 	<key>CFBundleVersion</key>
-	<string>0.49</string>
+	<string>0.50</string>
 	<key>CSResourcesFileMapped</key>
 	<true/>
 	<key>NSSupportsSuddenTermination</key>
