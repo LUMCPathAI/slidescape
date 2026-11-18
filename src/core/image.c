@@ -1075,6 +1075,64 @@ bool init_image_from_stbi(image_t* image, bool is_overlay) {
     return image->is_valid;
 }
 
+static void image_load_openslide_associated_image(openslide_t* osr, const char* name, simple_image_t* associated_image) {
+	i64 width = 0;
+	i64 height = 0;
+	openslide.get_associated_image_dimensions(osr, name, &width, &height);
+	const char* error = openslide.get_error(osr);
+	if (error) {
+		console_print_error("OpenSlide associated image '%s': %s\n", name, error);
+		return;
+	}
+	// Missing associated images have dimensions of -1. Keep sizes wide until validated.
+	if (width <= 0 || height <= 0) {
+		return;
+	}
+	if (width > INT32_MAX || height > INT32_MAX || (u64)width > SIZE_MAX / sizeof(u32) / (u64)height) {
+		console_print_error("OpenSlide associated image '%s' is too large\n", name);
+		return;
+	}
+
+	size_t pixel_count = (size_t)width * (size_t)height;
+	u32* pixels = malloc(pixel_count * sizeof(u32));
+	if (!pixels) {
+		console_print_error("Could not allocate OpenSlide associated image '%s'\n", name);
+		return;
+	}
+	openslide.read_associated_image(osr, name, pixels);
+	error = openslide.get_error(osr);
+	if (error) {
+		console_print_error("OpenSlide associated image '%s': %s\n", name, error);
+		free(pixels);
+		return;
+	}
+
+	// OpenSlide returns native-endian premultiplied ARGB; simple images use straight RGBA bytes.
+	for (size_t i = 0; i < pixel_count; ++i) {
+		u32 pixel = pixels[i];
+		u32 alpha = pixel >> 24;
+		u8* rgba = (u8*)(pixels + i);
+		if (alpha > 0) {
+			rgba[0] = (u8)((((pixel >> 16) & 0xFF) * 255 + alpha / 2) / alpha);
+			rgba[1] = (u8)((((pixel >> 8) & 0xFF) * 255 + alpha / 2) / alpha);
+			rgba[2] = (u8)(((pixel & 0xFF) * 255 + alpha / 2) / alpha);
+		} else {
+			rgba[0] = 0;
+			rgba[1] = 0;
+			rgba[2] = 0;
+		}
+		rgba[3] = (u8)alpha;
+	}
+
+	// The image owns this allocation; the viewer uploads/frees it like other simple images.
+	associated_image->pixels = (u8*)pixels;
+	associated_image->width = (i32)width;
+	associated_image->height = (i32)height;
+	associated_image->channels = 4;
+	associated_image->channels_in_file = 4;
+	associated_image->is_valid = true;
+}
+
 // TODO: solve issue on macOS with OpenSlide backend, not all tiles displaying properly (Retina screen related maybe?)
 
 void init_image_from_openslide(image_t* image, bool is_overlay) {
@@ -1191,7 +1249,34 @@ void init_image_from_openslide(image_t* image, bool is_overlay) {
 
     }
     ASSERT(image->level_count > 0);
-    image->is_valid = true;
+	const char* const* associated_names = openslide.get_associated_image_names(wsi->osr);
+	if (associated_names) {
+		for (const char* const* name = associated_names; *name != NULL; ++name) {
+			if (strcmp(*name, "macro") == 0) {
+				image_load_openslide_associated_image(wsi->osr, *name, &image->macro_image);
+			} else if (strcmp(*name, "label") == 0) {
+				image_load_openslide_associated_image(wsi->osr, *name, &image->label_image);
+			}
+			if (openslide.get_error(wsi->osr)) {
+				break;
+			}
+		}
+	}
+
+	// OpenSlide supplies no associated-image calibration; approximate placement as in the MRXS backend.
+	if (image->macro_image.is_valid) {
+		image->macro_image.mpp = image->width_in_um / (float)image->macro_image.width;
+		image->macro_image.world_pos = V2F(0.0f, 0.0f);
+	}
+	if (image->label_image.is_valid) {
+		image->label_image.mpp = image->macro_image.is_valid ? image->macro_image.mpp : image->mpp_x;
+		image->label_image.world_pos = V2F(0.0f, 0.0f);
+		if (image->macro_image.is_valid) {
+			image->label_image.world_pos.x = image->macro_image.width * image->macro_image.mpp;
+		}
+	}
+	// OpenSlide errors are terminal, including failures while decoding associated images.
+	image->is_valid = openslide.get_error(wsi->osr) == NULL;
 
 }
 

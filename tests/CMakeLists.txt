@@ -10,6 +10,7 @@ add_executable(slidescape_tests
         test_mathutils.cpp
         test_source_io.cpp
         test_memrw.cpp
+        test_openslide.cpp
         test_replay.cpp
         test_profiler.cpp
         test_remote_url.cpp
