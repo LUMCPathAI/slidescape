@@ -61,7 +61,7 @@ Example: an input filename of "1.isyntax" with a postfix of ".exported" will gen
 --roi <name of annotation>
 Specifies the name of the region of interest (ROI) annotation in the associated annotation file.
 The region to export will be set to a rectangle-shaped area bounded/encompassed by the specified annotation's coordinates.
-An annotation file with the same name as the input WSI file is required to be present. Supported sidecar extensions are .geojson, .json and .xml.
+An annotation file with the same name as the input WSI file is required to be present. Supported annotation formats are GeoJSON (.geojson, .json) and ASAP XML (.xml).
 Example: slidescape_console.exe 1.mrxs 2.mrxs --export --roi "Annotation 0"
 
 --first-roi
@@ -75,5 +75,34 @@ Enables saving of annotations within the region of interest (ROI), as specified 
 If there any annotations are visible within the ROI, a new annotation file will be created for the output WSI containing those annotations.
 
 
-To iterate over all WSI files with a particular extension in a folder (e.g. .isyntax), you can use a batch script like so:
-for %%f in (.\*isyntax) do slidescape_console.exe %%f --export --first-roi
+To iterate over all WSI files with a particular extension in a folder (e.g. .isyntax), you can use batch scripts.
+
+
+Example batch script for converting all WSIs in a folder to TIFF format:
+
+@echo off
+
+REM This script converts all WSIs with the specified filename extension in the current folder to an output TIFF file.
+
+set INPUT_EXT=isyntax
+set JPEG_QUALITY=90
+set POSTFIX=".exported"
+
+FOR /R %%f in (.\*%INPUT_EXT%) do (
+  slidescape_console.exe "%%f" --export --quality %JPEG_QUALITY% --postfix %POSTFIX%
+)
+
+
+Example batch script for cropping all WSIs with associated XMLs in a folder:
+
+@echo off
+
+REM This script crops all WSI files in the current folder (with the ROI defined by the first annotation in the associated XML) to an output TIFF file.
+
+set INPUT_EXT=mrxs
+set JPEG_QUALITY=90
+set POSTFIX=".cropped"
+
+FOR /R %%f in (.\*xml) do (
+  slidescape_console.exe "%%~nf.%INPUT_EXT%" --export --first-roi --quality %JPEG_QUALITY% --postfix %POSTFIX%
+)
