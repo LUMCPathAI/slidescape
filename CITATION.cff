@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use Slidescape in your research, please cite it using the metadata below."
+title: "Slidescape: a whole-slide image viewer for digital pathology"
+type: software
+authors:
+  - family-names: Valkema
+    given-names: Pieter
+    orcid: "https://orcid.org/0000-0001-7189-4441"
+repository-code: "https://github.com/LUMCPathAI/slidescape"
+url: "https://github.com/LUMCPathAI/slidescape"
+abstract: >-
+  Slidescape is a fast, self-contained, cross-platform desktop viewer for
+  whole-slide images in digital pathology. It natively reads tiled TIFF/BigTIFF,
+  Philips iSyntax, 3DHISTECH MRXS and DICOM images (with optional OpenSlide
+  support for other vendor formats), creates and edits annotations in
+  ASAP-compatible XML and QuPath-compatible GeoJSON formats, and can convert,
+  crop and resample slides to pyramidal TIFF from a graphical interface or a
+  headless command-line interface.
+keywords:
+  - digital pathology
+  - whole-slide imaging
+  - image viewer
+  - annotation
+  - iSyntax
+  - DICOM
+license: GPL-3.0-or-later
+version: "0.50"
+date-released: "2026-10-21"
