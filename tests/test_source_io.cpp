@@ -4,6 +4,7 @@
 #include "mrxs.h"
 #include "image_loader.h"
 #include "tile_cache.h"
+#include "tile_buffer_pool.h"
 #include "test_temp.h"
 #include "archive_ingest.h"
 #include "archive_instance_provider.h"
@@ -269,6 +270,77 @@ struct source_test_file {
 	}
 	~source_test_file() { if (*path) remove(path); }
 };
+
+TEST_CASE("KFB retains the first single-tile level and pads sparse edge tiles") {
+	std::vector<u8> bytes(92);
+	memcpy(bytes.data(), "\xf1\x01\xee\xee" "KFB\0", 8);
+	memcpy(bytes.data() + 32, "JPEG", 4);
+	put(bytes, 16, 4, 4);
+	put(bytes, 20, 17, 4);
+	put(bytes, 24, 33, 4);
+	put(bytes, 28, 40, 4);
+	put(bytes, 88, 16, 4);
+
+	struct {
+		u32 x, y, width, height;
+		float scale;
+		u64 offset, length;
+	} records[] = {
+		{0, 0, 16, 16, 40.0f},
+		{32, 16, 1, 1, 40.0f},
+		{0, 0, 16, 8, 20.0f},
+		{0, 0, 8, 4, 10.0f},
+	};
+	for (auto& record : records) {
+		u8 pixels[16 * 16 * 4] = {};
+		u8* jpeg = nullptr;
+		jpeg_encode_image(pixels, record.width, record.height, 90, &jpeg, &record.length);
+		REQUIRE(jpeg);
+		record.offset = bytes.size();
+		bytes.insert(bytes.end(), jpeg, jpeg + record.length);
+		free(jpeg);
+	}
+	u64 index_start = bytes.size();
+	put(bytes, 68, index_start, 8);
+	for (const auto& record : records) {
+		size_t offset = bytes.size();
+		bytes.resize(offset + 64);
+		put(bytes, offset, 0xeeee04f1, 4);
+		put(bytes, offset + 4, record.x, 4);
+		put(bytes, offset + 8, record.y, 4);
+		put(bytes, offset + 12, record.width, 4);
+		put(bytes, offset + 16, record.height, 4);
+		u32 scale;
+		memcpy(&scale, &record.scale, sizeof(scale));
+		put(bytes, offset + 20, scale, 4);
+		put(bytes, offset + 32, record.length, 4);
+		put(bytes, offset + 36, record.offset - index_start, 8);
+	}
+	source_test_file temp(bytes);
+	file_info_t file = viewer_get_file_info(temp.path);
+	REQUIRE(file.is_image);
+	REQUIRE(file.type == VIEWER_FILE_TYPE_KFB);
+	image_t* image = image_load_from_file(&file, nullptr, nullptr);
+	REQUIRE(image);
+	REQUIRE(image->is_valid);
+	REQUIRE(image->backend == IMAGE_BACKEND_KFB);
+	REQUIRE(image->level_count == 2);
+	CHECK(image->level_images[1].width_in_pixels == 16);
+	CHECK(image->level_images[1].height_in_pixels == 8);
+	CHECK(image->level_images[1].tile_count == 1);
+	CHECK(image->level_images[0].tiles[1].is_empty);
+
+	constexpr size_t tile_bytes = 16 * 16 * 4;
+	u8* tile = kfb_decode_tile_to_bgra(&image->kfb, 0, 5);
+	REQUIRE(tile);
+	CHECK(tile[0] == 0);
+	CHECK(tile[3] == 255);
+	CHECK(tile[4] == 255);
+	CHECK(tile[16 * 4] == 255);
+	tile_buffer_release(tile, tile_bytes);
+	image_destroy(image);
+	free(image);
+}
 
 static bool collect_entry(void* context, const source_entry_t* entry) {
 	((std::vector<std::string>*)context)->push_back(std::string(entry->path) + (entry->is_directory ? "/" : ""));

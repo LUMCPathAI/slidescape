@@ -159,6 +159,7 @@ include_directories("${CMAKE_SOURCE_DIR}/src/dicom")
 include_directories("${CMAKE_SOURCE_DIR}/src/imgui")
 include_directories("${CMAKE_SOURCE_DIR}/src/isyntax")
 include_directories("${CMAKE_SOURCE_DIR}/src/mrxs")
+include_directories("${CMAKE_SOURCE_DIR}/src/kfb")
 include_directories("${CMAKE_SOURCE_DIR}/src/platform")
 include_directories("${CMAKE_SOURCE_DIR}/src/tiff")
 include_directories("${CMAKE_SOURCE_DIR}/src/utils")
@@ -533,6 +534,7 @@ set(SLIDESCAPE_NONGUI_BASE_FILES
         src/isyntax/isyntax_streamer.c
         src/isyntax/libisyntax.c
         src/mrxs/mrxs.c
+        src/kfb/kfb.c
 )
 if (WIN32)
     list(APPEND SLIDESCAPE_NONGUI_BASE_FILES src/platform/win32_utils.c)

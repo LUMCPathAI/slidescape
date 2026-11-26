@@ -833,10 +833,12 @@ TEST_CASE("transparent OpenSlide reads are empty only when the decoder reports n
 		fixture.image.plane_count = 1;
 		fixture.image.level_images[0].x_tile_side_in_um = 1;
 		fixture.image.level_images[0].y_tile_side_in_um = 1;
+		fixture.image.level_images[0].downsample_factor = 1.0;
 		fixture.image.openslide_wsi.osr = (openslide_t*)(error ? "synthetic read failure" : nullptr);
 		load_tile_task_t task = {}; task.image = &fixture.image;
 		openslide_api saved = openslide;
 		openslide.read_region = cache_test_openslide_read;
+		openslide.get_level_downsample = nullptr;
 		openslide.get_error = cache_test_openslide_error;
 		load_tile_func(0, &task);
 		openslide = saved;

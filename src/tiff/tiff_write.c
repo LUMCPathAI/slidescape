@@ -120,6 +120,7 @@ typedef struct image_draft_t {
     bounds2i source_level0_bounds;
     i32 source_plane;
     i32 source_base_level;
+    double source_downsample;
     float base_downsample_factor_x;
     float base_downsample_factor_y;
     memrw_t tag_buffer;
@@ -243,13 +244,14 @@ static void construct_base_tile_with_resampling(image_draft_t* draft, image_draf
             supertile_need_destroy = true;
         }
 
-        float supertile_y = draft->source_level0_bounds.top + draft->supertile_height * (tile->tile_y << draft->source_base_level);
-        i32 supertile_read_y = (i32)floorf(supertile_y) - 4;
-        float supertile_offset_y = supertile_y - (float)supertile_read_y;
-
-        float supertile_x = draft->source_level0_bounds.left + draft->supertile_width * (tile->tile_x << draft->source_base_level);
-        i32 supertile_read_x = (i32)floorf(supertile_x) - 4;
-        float supertile_offset_x = supertile_x - (float)supertile_read_x;
+        double supertile_y = draft->source_level0_bounds.top / draft->source_downsample +
+                             (double)draft->supertile_height * tile->tile_y;
+        double supertile_x = draft->source_level0_bounds.left / draft->source_downsample +
+                             (double)draft->supertile_width * tile->tile_x;
+        i32 supertile_read_y = (i32)floor(supertile_y) - 4;
+        i32 supertile_read_x = (i32)floor(supertile_x) - 4;
+        float supertile_offset_y = (float)(supertile_y - supertile_read_y);
+        float supertile_offset_x = (float)(supertile_x - supertile_read_x);
 
         if (image_read_region(draft->source_image, draft->source_plane, draft->source_base_level, supertile_read_x, supertile_read_y,
                               draft->supertile_width_read, draft->supertile_height_read, supertile.pixels,
@@ -687,6 +689,7 @@ bool export_cropped_bigtiff_with_resample(app_state_t* app_state, image_t* image
 
     float downsample_factor_x = 1.0f;
     float downsample_factor_y = 1.0f;
+    double source_downsample = 1.0;
     i32 source_base_level = 0;
     if (need_resize) {
         // Only resize if the target resolution is actually different, otherwise don't bother.
@@ -697,25 +700,27 @@ bool export_cropped_bigtiff_with_resample(app_state_t* app_state, image_t* image
         }
         float largest_downsample_factor = MAX(downsample_factor_x, downsample_factor_y);
         ASSERT(largest_downsample_factor > 0.0f);
-        if (largest_downsample_factor < 0.25f) {
-            float source_mpp_x = image->mpp_x;
-            float source_mpp_y = image->mpp_y;
-            do {
-                source_mpp_x *= 2.0f;
-                source_mpp_y *= 2.0f;
-                ++source_base_level;
-                downsample_factor_x = source_mpp_x / target_mpp.x;
-                downsample_factor_y = source_mpp_y / target_mpp.y;
-                largest_downsample_factor = MAX(downsample_factor_x, downsample_factor_y);
-            } while (largest_downsample_factor < 0.25f);
+        for (i32 level = 1; level < image->level_count && largest_downsample_factor < 0.25f; ++level) {
+            if (!image->level_images[level].exists) {
+                continue;
+            }
+            source_base_level = level;
+            source_downsample = image->level_images[level].downsample_factor;
+            downsample_factor_x = source_downsample * image->mpp_x / target_mpp.x;
+            downsample_factor_y = source_downsample * image->mpp_y / target_mpp.y;
+            largest_downsample_factor = MAX(downsample_factor_x, downsample_factor_y);
         }
     }
 
-    i32 target_level0_width_in_pixels = (level0_bounds.right - level0_bounds.left) >> source_base_level;
-    i32 target_level0_height_in_pixels = (level0_bounds.bottom - level0_bounds.top) >> source_base_level;
+    i32 target_level0_width_in_pixels = level0_bounds.right - level0_bounds.left;
+    i32 target_level0_height_in_pixels = level0_bounds.bottom - level0_bounds.top;
     if (need_resize) {
-        target_level0_width_in_pixels = roundf((float)target_level0_width_in_pixels * downsample_factor_x);
-        target_level0_height_in_pixels = roundf((float)target_level0_height_in_pixels * downsample_factor_y);
+        target_level0_width_in_pixels = round(target_level0_width_in_pixels * ((double)image->mpp_x / target_mpp.x));
+        target_level0_height_in_pixels = round(target_level0_height_in_pixels * ((double)image->mpp_y / target_mpp.y));
+    }
+    if (target_level0_width_in_pixels <= 0 || target_level0_height_in_pixels <= 0) {
+        console_print_error("Error exporting BigTIFF: the output region is smaller than one pixel.\n");
+        return false;
     }
 
     image_draft_t draft = {};
@@ -735,6 +740,7 @@ bool export_cropped_bigtiff_with_resample(app_state_t* app_state, image_t* image
     draft.source_level0_bounds = level0_bounds;
     draft.source_plane = plane;
     draft.source_base_level = source_base_level;
+    draft.source_downsample = source_downsample;
     draft.base_downsample_factor_x = downsample_factor_x;
     draft.base_downsample_factor_y = downsample_factor_y;
     draft.supertile_width = (float)draft.tile_width / draft.base_downsample_factor_x;
@@ -748,8 +754,9 @@ bool export_cropped_bigtiff_with_resample(app_state_t* app_state, image_t* image
         draft_level->level = i;
 
         // Calculate dimensions for the current downsampling i
-        draft_level->width_in_pixels = draft.base_width >> i;
-        draft_level->height_in_pixels = draft.base_height >> i;
+        i32 rounding = (1 << i) - 1;
+        draft_level->width_in_pixels = ((i64)draft.base_width + rounding) >> i;
+        draft_level->height_in_pixels = ((i64)draft.base_height + rounding) >> i;
 
         draft_level->width_in_tiles = (draft_level->width_in_pixels + (draft.tile_width - 1)) / draft.tile_width;
         draft_level->height_in_tiles = (draft_level->height_in_pixels + (draft.tile_height - 1)) / draft.tile_height;
@@ -774,14 +781,9 @@ bool export_cropped_bigtiff_with_resample(app_state_t* app_state, image_t* image
 
         // Don't bother adding more levels if everything already fits within a single tile
         if (draft_level->tile_count <= 1) {
-            draft.level_count = i;
+            draft.level_count = i + 1;
             break;
         }
-    }
-
-    if (draft.level_count <= 0) {
-        fatal_error("invalid level count");
-        return false;
     }
 
     // To construct the pyramid, we'll construct the base level first, then afterwards propagate its contents

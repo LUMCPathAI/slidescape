@@ -489,12 +489,20 @@ static void load_tile_impl(i32 logical_thread_index, void* userdata) {
 	} else if (image->backend == IMAGE_BACKEND_OPENSLIDE) {
 		wsi_t* wsi = &image->openslide_wsi;
 		i32 wsi_file_level = level_image->pyramid_image_index;
-		i64 x = (tile_x * level_image->tile_width) << level;
-		i64 y = (tile_y * level_image->tile_height) << level;
-		openslide.read_region(wsi->osr, (u32*)temp_memory, x, y, wsi_file_level, level_image->tile_width, level_image->tile_height);
-		const char* read_error = openslide.get_error(wsi->osr);
-		if (read_error) {
-			console_print_error("OpenSlide tile read failed: %s\n", read_error);
+		double tile_x_in_pixels = (double)tile_x * level_image->tile_width;
+		double tile_y_in_pixels = (double)tile_y * level_image->tile_height;
+		double level0_x = round(tile_x_in_pixels * level_image->downsample_factor);
+		double level0_y = round(tile_y_in_pixels * level_image->downsample_factor);
+		double coordinate_limit = -(double)INT64_MIN;
+		if (level0_x < coordinate_limit && level0_y < coordinate_limit) {
+			openslide.read_region(wsi->osr, (u32*)temp_memory, (i64)level0_x, (i64)level0_y, wsi_file_level,
+			                      level_image->tile_width, level_image->tile_height);
+			const char* read_error = openslide.get_error(wsi->osr);
+			if (read_error) {
+				console_print_error("OpenSlide tile read failed: %s\n", read_error);
+				failed = true;
+			}
+		} else {
 			failed = true;
 		}
 
@@ -527,6 +535,9 @@ static void load_tile_impl(i32 logical_thread_index, void* userdata) {
 		} else {
 			failed = true;
 		}
+	} else if (image->backend == IMAGE_BACKEND_KFB) {
+		temp_memory = kfb_decode_tile_to_bgra(&image->kfb, level, tile_index);
+		failed = temp_memory == NULL;
 	} else {
 		console_print_error("thread %d: tile level %d, tile %d (%d, %d): unsupported image type\n",
 		                    logical_thread_index, level, tile_index, tile_x, tile_y);

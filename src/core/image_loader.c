@@ -110,12 +110,14 @@ void load_openslide_wsi(wsi_t* wsi, const char* filename, bool openslide_loading
 			level->tile_width = WSI_TILE_DIM;
 			level->tile_height = WSI_TILE_DIM;
 
-			float raw_downsample_factor = openslide.get_level_downsample(wsi->osr, i);
-			float raw_downsample_level = log2f(raw_downsample_factor);
-			i32 downsample_level = (i32)roundf(raw_downsample_level);
-
-			level->downsample_level = downsample_level;
-			level->downsample_factor = exp2f(level->downsample_level);
+			double downsample_factor = openslide.get_level_downsample(wsi->osr, i);
+			if (!(downsample_factor > 0.0) || !isfinite(downsample_factor)) {
+				console_print_error("OpenSlide returned an invalid downsample for level %d\n", i);
+				unload_openslide_wsi(wsi);
+				return;
+			}
+			level->downsample_level = (i32)round(log2(downsample_factor));
+			level->downsample_factor = downsample_factor;
 			wsi->max_downsample_level = MAX(level->downsample_level, wsi->max_downsample_level);
 			level->um_per_pixel_x = level->downsample_factor * wsi->mpp_x;
 			level->um_per_pixel_y = level->downsample_factor * wsi->mpp_y;
@@ -147,6 +149,9 @@ static viewer_file_type_enum viewer_determine_file_type(file_info_t* file) {
 	if (file->is_regular_file) {
 		if (strcasecmp(file->filename_in_directory, "Slidedat.ini") == 0) {
 			return VIEWER_FILE_TYPE_MRXS;
+		} else if (strcasecmp(file->ext, "kfb") == 0 ||
+		           kfb_has_signature(file->header, MIN(file->filesize, sizeof(file->header)))) {
+			return VIEWER_FILE_TYPE_KFB;
 		} else if (strlen(file->ext) == 0) {
 			if (is_file_a_dicom_file(file->header, MIN(file->filesize, sizeof(file->header)))) {
 				return VIEWER_FILE_TYPE_DICOM;
@@ -234,6 +239,7 @@ file_info_t viewer_get_file_info(const char* filename) {
 						case VIEWER_FILE_TYPE_SIMPLE_IMAGE:
 						case VIEWER_FILE_TYPE_DICOM:
 						case VIEWER_FILE_TYPE_ISYNTAX:
+						case VIEWER_FILE_TYPE_KFB:
 							file.is_image = true;
 							break;
 					}
@@ -478,6 +484,14 @@ image_t* image_load_from_file(file_info_t* file, directory_info_t* directory, im
 			init_image_from_tiff(image, is_overlay, parent_image);
 		} else {
 			image->is_valid = false;
+		}
+	} else if (file->type == VIEWER_FILE_TYPE_KFB) {
+		image->type = IMAGE_TYPE_WSI;
+		image->backend = IMAGE_BACKEND_KFB;
+		if (kfb_open(&image->kfb, filename, IMAGE_PYRAMID_MAX_LEVELS)) {
+			init_image_from_kfb(image);
+		} else {
+			console_print_error("Could not open KFB slide: %s\n", filename);
 		}
 	} else if (file->type == VIEWER_FILE_TYPE_ISYNTAX) {
 		// Try to open as iSyntax

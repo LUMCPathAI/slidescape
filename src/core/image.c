@@ -58,6 +58,8 @@ const char* get_image_backend_name(image_t* image) {
         result = "DICOM";
     } else if (image->backend == IMAGE_BACKEND_MRXS) {
         result = "MRXS";
+    } else if (image->backend == IMAGE_BACKEND_KFB) {
+        result = "KFB";
     } else if (image->backend == IMAGE_BACKEND_SLIDE_SCORE) {
         result = "Slide Score";
     } else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
@@ -83,6 +85,8 @@ const char* get_image_descriptive_type_name(image_t* image) {
             result = "WSI (DICOM)";
         } else if (image->backend == IMAGE_BACKEND_MRXS) {
             result = "WSI (MRXS)";
+        } else if (image->backend == IMAGE_BACKEND_KFB) {
+            result = "WSI (KFB)";
         } else if (image->backend == IMAGE_BACKEND_SLIDE_SCORE) {
             result = "WSI (Slide Score)";
         } else if (image->backend == IMAGE_BACKEND_DICOMWEB) {
@@ -1016,6 +1020,87 @@ bool init_image_from_mrxs(image_t* image, bool is_overlay) {
 	return image->is_valid;
 }
 
+static void image_load_kfb_associated_image(const kfb_t* kfb, const kfb_jpeg_t* jpeg, simple_image_t* image) {
+	u8* pixels = kfb_decode_associated_image_to_rgba(kfb, jpeg);
+	if (pixels) {
+		image->pixels = pixels;
+		image->width = jpeg->width;
+		image->height = jpeg->height;
+		image->channels = 4;
+		image->channels_in_file = 3;
+		image->is_valid = true;
+	}
+}
+
+bool init_image_from_kfb(image_t* image) {
+	const kfb_t* kfb = &image->kfb;
+	image->plane_count = 1;
+	image->level_count = kfb->level_count;
+	image->tile_width = kfb->tile_size;
+	image->tile_height = kfb->tile_size;
+	image->width_in_pixels = kfb->width;
+	image->height_in_pixels = kfb->height;
+	float coarsest_tile_span = ldexpf((float)kfb->tile_size, kfb->level_count - 1);
+	float max_span = MAX(coarsest_tile_span, (float)MAX(kfb->width, kfb->height));
+	image->is_mpp_known = kfb->mpp > 0.0f && isfinite(kfb->mpp * max_span);
+	image->mpp_x = image->mpp_y = image->is_mpp_known ? kfb->mpp : 1.0f;
+	image->width_in_um = kfb->width * image->mpp_x;
+	image->height_in_um = kfb->height * image->mpp_y;
+	image->clip_rects[0] = RECT2F(0, 0, image->width_in_um, image->height_in_um);
+	image->clip_rect_count = 1;
+
+	for (i32 i = 0; i < kfb->level_count; ++i) {
+		const kfb_level_t* kfb_level = kfb->levels + i;
+		level_image_t* level = image->level_images + i;
+		level->downsample_factor = ldexpf(1.0f, i);
+		level->um_per_pixel_x = image->mpp_x * level->downsample_factor;
+		level->um_per_pixel_y = image->mpp_y * level->downsample_factor;
+		level->tile_width = level->tile_height = kfb->tile_size;
+		level->x_tile_side_in_um = kfb->tile_size * level->um_per_pixel_x;
+		level->y_tile_side_in_um = kfb->tile_size * level->um_per_pixel_y;
+		if (!kfb_level->tiles) {
+			continue;
+		}
+		level->pyramid_image_index = i;
+		level->width_in_pixels = kfb_level->width;
+		level->height_in_pixels = kfb_level->height;
+		level->width_in_tiles = kfb_level->columns;
+		level->height_in_tiles = kfb_level->rows;
+		level->tile_count = (u64)kfb_level->columns * kfb_level->rows;
+		if (level->tile_count > SIZE_MAX / sizeof(*level->tiles)) {
+			return false;
+		}
+		level->tiles = calloc((size_t)level->tile_count, sizeof(*level->tiles));
+		if (!level->tiles) {
+			return false;
+		}
+		for (u32 index = 0; index < level->tile_count; ++index) {
+			tile_t* tile = level->tiles + index;
+			tile->tile_index = index;
+			tile->tile_x = index % kfb_level->columns;
+			tile->tile_y = index / kfb_level->columns;
+			tile->is_empty = kfb_level->tiles[index].length == 0;
+		}
+		level->exists = true;
+	}
+
+	image_load_kfb_associated_image(kfb, &kfb->macro_image, &image->macro_image);
+	if (!image->macro_image.is_valid) {
+		image_load_kfb_associated_image(kfb, &kfb->thumbnail_image, &image->macro_image);
+	}
+	image_load_kfb_associated_image(kfb, &kfb->label_image, &image->label_image);
+	if (image->macro_image.is_valid) {
+		image->macro_image.mpp = image->width_in_um / image->macro_image.width;
+	}
+	if (image->label_image.is_valid) {
+		image->label_image.mpp = image->macro_image.is_valid ? image->macro_image.mpp : image->mpp_x;
+		image->label_image.world_pos.x = image->macro_image.width * image->macro_image.mpp;
+	}
+	image->is_freshly_loaded = true;
+	image->is_valid = true;
+	return true;
+}
+
 bool init_image_from_stbi(image_t* image, bool is_overlay) {
     image->type = IMAGE_TYPE_WSI;
     image->backend = IMAGE_BACKEND_STBI;
@@ -1380,23 +1465,48 @@ static bool image_read_region_impl(image_t* image, i32 plane, i32 level, i32 x, 
             return false;
         } break;
         case IMAGE_BACKEND_OPENSLIDE: {
+            const level_image_t* level_image = image->level_images + level;
+            u64 pixel_count = (u64)w * h;
+            if (!level_image->exists || pixel_count > SIZE_MAX / sizeof(u32)) {
+                return false;
+            }
+
+            double level0_x = x * level_image->downsample_factor;
+            double level0_y = y * level_image->downsample_factor;
+            // OpenSlide truncates negative padding to whole level pixels, so round outward.
+            level0_x = x < 0 ? floor(level0_x) : round(level0_x);
+            level0_y = y < 0 ? floor(level0_y) : round(level0_y);
+            double coordinate_limit = -(double)INT64_MIN;
+            if (level0_x <= -coordinate_limit || level0_x >= coordinate_limit ||
+                level0_y <= -coordinate_limit || level0_y >= coordinate_limit) {
+                return false;
+            }
+
             intermediate_pixel_format = PIXEL_FORMAT_U8_BGRA;
             if (desired_pixel_format == intermediate_pixel_format) {
-                intermediate_pixel_buffer = (uint32_t*) dest;
+                intermediate_pixel_buffer = dest;
             } else {
-                intermediate_pixel_buffer = malloc(w * h * sizeof(uint32_t));
+                intermediate_pixel_buffer = malloc((size_t)pixel_count * sizeof(u32));
+                if (!intermediate_pixel_buffer) {
+                    return false;
+                }
             }
-            openslide.read_region(image->openslide_wsi.osr, intermediate_pixel_buffer, x, y, level, w, h);
+            openslide_t* osr = image->openslide_wsi.osr;
+            openslide.read_region(osr, intermediate_pixel_buffer, (i64)level0_x, (i64)level0_y,
+                                  level_image->pyramid_image_index, w, h);
+            if (openslide.get_error(osr)) {
+                if (intermediate_pixel_buffer != dest) {
+                    free(intermediate_pixel_buffer);
+                }
+                return false;
+            }
 
             // Check for (partially) empty tiles
-            u32 pixel_count = w * h;
             u32* pixels = (u32*)intermediate_pixel_buffer;
-            u32 nonempty_pixel_count = 0;
             u32 image_background_color = image->is_background_black ? 0 /*black*/ : 0xFFFFFFFF; // white
-            for (i32 i = 0; i < pixel_count; ++i) {
+            for (u64 i = 0; i < pixel_count; ++i) {
                 // Fill in any empty pixels with the background color.
                 u32 p = pixels[i];
-                nonempty_pixel_count += (p > 0);
                 pixels[i] = p ? p : image_background_color;
             }
         } break;
@@ -1405,6 +1515,7 @@ static bool image_read_region_impl(image_t* image, i32 plane, i32 level, i32 x, 
 		case IMAGE_BACKEND_DICOMWEB:
 		case IMAGE_BACKEND_SSI:
         case IMAGE_BACKEND_MRXS:
+		case IMAGE_BACKEND_KFB:
         case IMAGE_BACKEND_STBI: {
 			level_image_t* level_image = image->level_images + level;
 			ASSERT(level_image->exists);
@@ -1952,6 +2063,8 @@ void image_destroy(image_t* image) {
 				dicom_destroy(&image->dicom);
 			} else if (image->backend == IMAGE_BACKEND_MRXS) {
 				mrxs_destroy(&image->mrxs);
+			} else if (image->backend == IMAGE_BACKEND_KFB) {
+				kfb_destroy(&image->kfb);
 			} else if (image->backend == IMAGE_BACKEND_SLIDE_SCORE) {
 				slide_score_remote_image_destroy(&image->slide_score);
 			} else if (image->backend == IMAGE_BACKEND_DICOMWEB) {

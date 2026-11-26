@@ -36,6 +36,7 @@ typedef enum viewer_file_type_enum {
 	VIEWER_FILE_TYPE_XML,
 	VIEWER_FILE_TYPE_JSON,
 	VIEWER_FILE_TYPE_ZIP,
+	VIEWER_FILE_TYPE_KFB,
 } viewer_file_type_enum;
 
 typedef struct file_info_t {

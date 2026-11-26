@@ -253,7 +253,9 @@ int app_command_execute(app_state_t* app_state) {
 			if (load_generic_file(app_state, filename, 0)) {
 				if (arrlen(app_state->loaded_images) > 0) {
 					image_t* image = app_state->loaded_images[0];
-					if (image->backend == IMAGE_BACKEND_TIFF || image->backend == IMAGE_BACKEND_OPENSLIDE || image->backend == IMAGE_BACKEND_DICOM || image->backend == IMAGE_BACKEND_ISYNTAX) {
+					if (image->backend == IMAGE_BACKEND_TIFF || image->backend == IMAGE_BACKEND_OPENSLIDE ||
+					    image->backend == IMAGE_BACKEND_DICOM || image->backend == IMAGE_BACKEND_ISYNTAX ||
+					    image->backend == IMAGE_BACKEND_KFB) {
 						u32 export_flags = 0;
 						// TODO: allow configuration
 						if (command->export_command.with_annotations) {

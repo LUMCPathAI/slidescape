@@ -24,6 +24,7 @@
 
 // backends
 #include "mrxs.h"
+#include "kfb.h"
 #include "openslide_api.h"
 #include "tiff.h"
 #include "isyntax.h"
@@ -66,10 +67,11 @@ typedef struct {
     float x_tile_side_in_um;
     float y_tile_side_in_um;
     i32 downsample_level;
-    float downsample_factor;
+    double downsample_factor;
 } wsi_level_t;
 
-#define WSI_MAX_LEVELS 16
+#define IMAGE_PYRAMID_MAX_LEVELS 24
+#define WSI_MAX_LEVELS IMAGE_PYRAMID_MAX_LEVELS
 
 typedef struct wsi_t {
     i64 width;
@@ -91,8 +93,6 @@ typedef struct wsi_t {
 
 
 
-#define IMAGE_PYRAMID_MAX_LEVELS 16
-
 typedef enum {
     IMAGE_TYPE_NONE,
 //	IMAGE_TYPE_SIMPLE,
@@ -111,6 +111,7 @@ typedef enum {
     IMAGE_BACKEND_SLIDE_SCORE,
     IMAGE_BACKEND_DICOMWEB,
     IMAGE_BACKEND_SSI,
+    IMAGE_BACKEND_KFB,
 } image_backend_enum;
 
 typedef struct tile_t {
@@ -139,7 +140,7 @@ typedef struct {
     float y_tile_side_in_um;
     float um_per_pixel_x;
     float um_per_pixel_y;
-    float downsample_factor;
+    double downsample_factor;
     v2f origin_offset;
     i32 pyramid_image_index;
     bool exists;
@@ -185,6 +186,7 @@ typedef struct image_t {
         wsi_t openslide_wsi;
         dicom_series_t dicom;
         mrxs_t mrxs;
+        kfb_t kfb;
         slide_score_remote_image_t slide_score;
         dicomweb_remote_image_t dicomweb;
 		ssi_remote_image_t ssi;
@@ -261,11 +263,13 @@ bool init_image_from_dicom(image_t* image, bool is_overlay);
 bool init_image_from_dicomweb(image_t* image, bool is_overlay);
 bool init_image_from_ssi(image_t* image, bool is_overlay);
 bool init_image_from_mrxs(image_t* image, bool is_overlay);
+bool init_image_from_kfb(image_t* image);
 bool init_image_from_stbi(image_t* image, bool is_overlay);
 void init_image_from_openslide(image_t* image, bool is_overlay);
 void unload_openslide_wsi(wsi_t* wsi);
 bool image_initialize_runtime(image_t* image);
 void image_set_ssi_close_callback(void (*callback)(ssi_remote_image_t* remote));
+// The origin (x, y) and dimensions (w, h) are in pixels at the requested pyramid level.
 bool image_read_region(image_t* image, i32 plane, i32 level, i32 x, i32 y, i32 w, i32 h, void* dest, pixel_format_enum desired_pixel_format);
 void begin_level_image_indexing(image_t* image, level_image_t* level_image, i32 scale);
 void image_select_plane(image_t* image, i32 plane);

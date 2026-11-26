@@ -11,6 +11,11 @@ struct openslide_test_handle_t {
 	bool no_names = false;
 	const char* error = NULL;
 	i32 closes = 0;
+	i32 region_level = -1;
+	i64 region_x = 0;
+	i64 region_y = 0;
+	i64 region_w = 0;
+	i64 region_h = 0;
 };
 
 static i32 openslide_test_associated_index(const char* name) {
@@ -56,6 +61,18 @@ static void WINAPI openslide_test_close(openslide_t* osr) {
 	++((openslide_test_handle_t*)osr)->closes;
 }
 
+static void WINAPI openslide_test_region(openslide_t* osr, u32* pixels, i64 x, i64 y, i32 level, i64 w, i64 h) {
+	openslide_test_handle_t* handle = (openslide_test_handle_t*)osr;
+	handle->region_level = level;
+	handle->region_x = x;
+	handle->region_y = y;
+	handle->region_w = w;
+	handle->region_h = h;
+	for (i64 i = 0; i < w * h; ++i) {
+		pixels[i] = 0xff112233;
+	}
+}
+
 struct openslide_test_image_t {
 	openslide_api saved_api = openslide;
 	openslide_test_handle_t handle;
@@ -68,6 +85,7 @@ struct openslide_test_image_t {
 		openslide.read_associated_image = openslide_test_read;
 		openslide.get_error = openslide_test_error;
 		openslide.close = openslide_test_close;
+		openslide.read_region = openslide_test_region;
 		wsi_t* wsi = &image.openslide_wsi;
 		wsi->osr = (openslide_t*)&handle;
 		wsi->width = 512;
@@ -97,6 +115,33 @@ struct openslide_test_image_t {
 		openslide = saved_api;
 	}
 };
+
+TEST_CASE_FIXTURE(openslide_test_image_t, "OpenSlide translates a region origin using the cached file downsample") {
+	handle.no_names = true;
+	wsi_t* wsi = &image.openslide_wsi;
+	wsi->level_count = 2;
+	wsi->max_downsample_level = 2;
+	wsi->levels[1] = wsi->levels[0];
+	wsi->levels[1].downsample_level = 2;
+	constexpr double downsample = 3.25000001;
+	wsi->levels[1].downsample_factor = downsample;
+	init_image_from_openslide(&image, false);
+	REQUIRE(image_initialize_runtime(&image));
+
+	const i32 level = 2;
+	CHECK(image.level_images[level].downsample_factor == downsample);
+	u32 pixels[6] = {};
+	REQUIRE(image_read_region(&image, 0, level, 7, -1, 3, 2, pixels, PIXEL_FORMAT_U8_BGRA));
+	CHECK(handle.region_level == 1);
+	CHECK(handle.region_x == 23);
+	CHECK(handle.region_y == -4);
+	CHECK(handle.region_w == 3);
+	CHECK(handle.region_h == 2);
+	CHECK(pixels[5] == 0xff112233);
+
+	REQUIRE(image_read_region(&image, 0, level, 1500000001, 0, 1, 1, pixels, PIXEL_FORMAT_U8_BGRA));
+	CHECK(handle.region_x == INT64_C(4875000018));
+}
 
 TEST_CASE_FIXTURE(openslide_test_image_t, "OpenSlide label and macro images use the viewer's RGBA buffers") {
 	handle.width[0] = 4;

@@ -462,6 +462,7 @@ void win32_set_file_type_associations() {
 				if (!win32_registry_set_value_if_changed(hkey, ".vms", REG_SZ, NULL, 0, &associations_changed)) goto fail_SupportedTypes;
 				if (!win32_registry_set_value_if_changed(hkey, ".scn", REG_SZ, NULL, 0, &associations_changed)) goto fail_SupportedTypes;
 				if (!win32_registry_set_value_if_changed(hkey, ".mrxs", REG_SZ, NULL, 0, &associations_changed)) goto fail_SupportedTypes;
+				if (!win32_registry_set_value_if_changed(hkey, ".kfb", REG_SZ, NULL, 0, &associations_changed)) goto fail_SupportedTypes;
 				if (!win32_registry_set_value_if_changed(hkey, ".bif", REG_SZ, NULL, 0, &associations_changed)) goto fail_SupportedTypes;
 				RegCloseKey(hkey);
 			} else {
@@ -579,6 +580,7 @@ void win32_set_file_type_associations() {
 
 		// Create the filetype associations
 		if (!win32_registry_add_to_open_with_list("isyntax", &associations_changed)) return;
+		if (!win32_registry_add_to_open_with_list("kfb", &associations_changed)) return;
 		if (!win32_registry_add_to_open_with_list("i2syntax", &associations_changed)) return;
 		if (!win32_registry_add_to_open_with_list("tiff", &associations_changed)) return;
 		if (!win32_registry_add_to_open_with_list("tif", &associations_changed)) return;

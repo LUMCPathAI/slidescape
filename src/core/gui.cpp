@@ -1843,6 +1843,7 @@ void draw_export_region_dialog(app_state_t* app_state) {
 					case IMAGE_BACKEND_DICOM:
 					case IMAGE_BACKEND_ISYNTAX:
 					case IMAGE_BACKEND_MRXS:
+					case IMAGE_BACKEND_KFB:
 					case IMAGE_BACKEND_TIFF: {
 						u32 export_flags = 0;
 						if (display_export_annotations_checkbox) {

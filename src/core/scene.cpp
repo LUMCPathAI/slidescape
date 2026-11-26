@@ -240,7 +240,8 @@ void scene_determine_if_export_is_possible(scene_t* scene, image_t* image) {
 		// Determine whether exporting a region is possible, and precalculate the (level 0) pixel bounds for exporting.
 		ASSERT(image->mpp_x > 0.0f && image->mpp_y > 0.0f);
 		// TODO: add image backend structs
-		if (image->backend == IMAGE_BACKEND_TIFF || image->backend == IMAGE_BACKEND_OPENSLIDE || image->backend == IMAGE_BACKEND_DICOM || image->backend == IMAGE_BACKEND_ISYNTAX || image->backend == IMAGE_BACKEND_MRXS) {
+		if (image->backend == IMAGE_BACKEND_TIFF || image->backend == IMAGE_BACKEND_OPENSLIDE || image->backend == IMAGE_BACKEND_DICOM ||
+		    image->backend == IMAGE_BACKEND_ISYNTAX || image->backend == IMAGE_BACKEND_MRXS || image->backend == IMAGE_BACKEND_KFB) {
 			if (scene->has_selection_box) {
 				rect2f recanonicalized_selection_box = rect2f_recanonicalize(&scene->selection_box);
 				bounds2f selection_bounds = rect2f_to_bounds(recanonicalized_selection_box);

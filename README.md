@@ -15,6 +15,7 @@ The viewer has built-in support for:
 * Tiled TIFF and BigTIFF (including generic and Philips TIFF variants).
 * Philips iSyntax.
 * 3DHISTECH/MIRAX (.mrxs).
+* KFBio (.kfb).
 * DICOM.
 * Simple images (JPEG, PNG).
 
