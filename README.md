@@ -3,7 +3,7 @@
 Slidescape is a whole-slide image viewer for digital pathology.
 
 ## Download
-The latest binaries can be downloaded on GitHub from the [releases](https://github.com/amspath/slidescape/releases) section
+The latest binaries can be downloaded on GitHub from the [releases](https://github.com/LUMCPathAI/slidescape/releases) section
 for Windows, Linux and macOS.
 
 
@@ -209,4 +209,4 @@ it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 
-See [LICENSE.txt](https://github.com/amspath/slidescape/blob/master/LICENSE.txt) for more information.
+See [LICENSE.txt](https://github.com/LUMCPathAI/slidescape/blob/master/LICENSE.txt) for more information.
